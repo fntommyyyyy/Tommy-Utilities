@@ -495,7 +495,14 @@ class StorageService {
   getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
   setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
 
-  close() { this.db.close(); }
+  // FIX: chiusura sicura (non fallisce se chiamata due volte, es. SIGINT ripetuto)
+  close() {
+    try {
+      if (this.db && this.db.open) this.db.close();
+    } catch (err) {
+      console.error('❌ close error:', err);
+    }
+  }
 }
 
 module.exports = StorageService;
