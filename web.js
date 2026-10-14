@@ -1,4 +1,4 @@
-// web.js — Dashboard web completa (tutte le pagine in un unico file)
+// web.js — Dashboard web completa con tutte le pagine
 const express = require('express');
 const session = require('express-session');
 const axios = require('axios');
@@ -56,7 +56,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '2.0.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '3.0.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
@@ -126,10 +126,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // --- MOD LOGS ---
   app.get('/api/logs/all', requireAuth, (req, res) => {
-    try {
-      const rows = storage.db.prepare('SELECT * FROM mod_logs ORDER BY id DESC LIMIT 500').all();
-      res.json(rows);
-    } catch (e) { res.json([]); }
+    try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
   });
   app.get('/api/logs/:userId', requireAuth, (req, res) => {
     res.json(storage.getLogsForUser(req.params.userId));
@@ -139,10 +136,58 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/api/notes/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
   });
+  app.delete('/api/notes/:id', requireAuth, (req, res) => {
+    try {
+      const ok = storage.deleteNoteById(parseInt(req.params.id));
+      res.json({ ok });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
 
   // --- CONFIG ---
   app.get('/api/config/:guildId', requireAuth, (req, res) => {
     res.json(storage.getGuildConfig(req.params.guildId));
+  });
+  app.post('/api/config/:guildId', requireAuth, (req, res) => {
+    const { autoroleId, logChannelId } = req.body || {};
+    const guildId = req.params.guildId;
+    try {
+      if (autoroleId !== undefined) {
+        if (autoroleId) storage.setAutorole(guildId, autoroleId);
+        else storage.clearAutorole(guildId);
+      }
+      if (logChannelId !== undefined) {
+        if (logChannelId) storage.setLogChannel(guildId, logChannelId);
+        else storage.clearLogChannel(guildId);
+      }
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // --- WELCOME ---
+  app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
+    res.json(storage.getWelcomeConfig(req.params.guildId) || {});
+  });
+  app.post('/api/welcome/:guildId', requireAuth, (req, res) => {
+    const { channelId, message, embedEnabled } = req.body || {};
+    const guildId = req.params.guildId;
+    try {
+      if (channelId !== undefined) {
+        if (channelId) storage.setWelcomeChannel(guildId, channelId);
+        else storage.disableWelcome(guildId);
+      }
+      if (message !== undefined && message !== null) {
+        storage.setWelcomeMessage(guildId, message);
+      }
+      if (embedEnabled !== undefined) {
+        const current = storage.getWelcomeConfig(guildId);
+        storage.setWelcomeConfig(guildId, {
+          channelId: current?.channel_id ?? null,
+          message: current?.message ?? null,
+          embedEnabled
+        });
+      }
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   // --- TICKET ---
@@ -160,6 +205,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
       }
     }
     res.json(tickets);
+  });
+  app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
+    try {
+      const ch = await client.channels.fetch(req.params.channelId).catch(() => null);
+      if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
+      await ch.delete('Chiuso dalla dashboard web');
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   // --- COMANDI CUSTOM ---
@@ -188,12 +241,23 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { res.json({ byType: [], byDay: [] }); }
   });
 
+  // --- GUILD INFO (per la pagina Config) ---
+  app.get('/api/guilds', requireAuth, (req, res) => {
+    const guilds = client.guilds.cache.map(g => ({
+      id: g.id, name: g.name,
+      roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
+      channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
+    }));
+    res.json(guilds);
+  });
+
   // ==================== PAGINE HTML ====================
   app.get('/dashboard', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'dashboard')));
   app.get('/modlogs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'modlogs')));
   app.get('/notes', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'notes')));
   app.get('/tickets', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'tickets')));
   app.get('/commands', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'commands')));
+  app.get('/config', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'config')));
   app.get('/charts', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'charts')));
 
   // ==================== AVVIO ====================
@@ -213,7 +277,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
 }
 
 // ============================================================
-// ============== HTML — TUTTE LE PAGINE IN UNA ===============
+// ================= HTML — TUTTE LE PAGINE ===================
 // ============================================================
 function renderLayout(user, page) {
   const name = user.global_name || user.username;
@@ -227,6 +291,7 @@ function renderLayout(user, page) {
     notes: renderNotesContent(),
     tickets: renderTicketsContent(),
     commands: renderCommandsContent(),
+    config: renderConfigContent(),
     charts: renderChartsContent()
   };
 
@@ -262,22 +327,28 @@ function renderLayout(user, page) {
   button.danger { background: #ed4245; }
   button.danger:hover { background: #c93b3e; }
   button.small { padding: 5px 10px; font-size: 12px; }
+  button.secondary { background: #444; }
+  button.secondary:hover { background: #555; }
   input, select, textarea { background: #1a1a1a; border: 1px solid #444; color: #eee; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 10px; font-family: inherit; }
   .form-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
   .form-row input, .form-row select { flex: 1; min-width: 150px; }
+  .form-row > button { margin-top: 0; }
   .loading { color: #888; font-style: italic; }
   a { color: #5865F2; text-decoration: none; }
   .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .filter-bar select, .filter-bar input { max-width: 250px; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
-  .badge.kick { background: #faa61a; color: #000; }
+  .badge.kick, .badge.warn { background: #faa61a; color: #000; }
   .badge.ban { background: #ed4245; color: #fff; }
-  .badge.warn { background: #faa61a; color: #000; }
   .badge.timeout { background: #5865F2; color: #fff; }
   .badge.default { background: #444; color: #eee; }
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
   @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } }
   .chart-box { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
+  .config-block { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .config-block h3 { font-size: 16px; margin-bottom: 12px; color: #bbb; }
+  .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
+  .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -296,6 +367,7 @@ function renderLayout(user, page) {
     <a href="/notes" class="${page === 'notes' ? 'active' : ''}">📝 Note</a>
     <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
     <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
+    <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
     <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
   </nav>
 
@@ -323,7 +395,7 @@ function renderDashboardContent() {
       <input type="text" id="bl-reason" placeholder="Motivo">
       <button onclick="addBL()">Aggiungi</button>
     </div>
-    <div id="bl-msg" style="margin-top:8px;font-size:13px;"></div>
+    <div id="bl-msg"></div>
   </div>
 
   <div class="section">
@@ -356,21 +428,19 @@ function renderDashboardContent() {
     const username = document.getElementById('bl-username').value.trim();
     const reason = document.getElementById('bl-reason').value.trim();
     const msg = document.getElementById('bl-msg');
-    if (!userId || !username || !reason) { msg.textContent = '❌ Compila tutti i campi'; msg.style.color = '#ed4245'; return; }
+    if (!userId || !username || !reason) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
     const res = await fetch('/api/blacklist', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userId, username, reason })
     });
     const data = await res.json();
     if (res.ok) {
-      msg.textContent = '✅ Aggiunto'; msg.style.color = '#00FF00';
+      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
       document.getElementById('bl-userId').value = '';
       document.getElementById('bl-username').value = '';
       document.getElementById('bl-reason').value = '';
       loadBlacklist(); loadStats();
-    } else {
-      msg.textContent = '❌ ' + (data.error || 'Errore'); msg.style.color = '#ed4245';
-    }
+    } else { msg.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>'; }
   }
   async function removeBL(userId) {
     if (!confirm('Rimuovere ' + userId + ' dalla blacklist?')) return;
@@ -405,11 +475,15 @@ function renderModlogsContent() {
   </div>
 
   <script>
+  let allLogs = [];
   async function loadLogs() {
+    if (!allLogs.length) {
+      const res = await fetch('/api/logs/all');
+      allLogs = await res.json();
+    }
     const type = document.getElementById('filter-type').value;
     const userId = document.getElementById('filter-user').value.trim();
-    const res = await fetch('/api/logs/all');
-    let logs = await res.json();
+    let logs = allLogs;
     if (type) logs = logs.filter(l => l.type === type);
     if (userId) logs = logs.filter(l => (l.target_id || '').includes(userId));
     const el = document.getElementById('logs-content');
@@ -443,15 +517,22 @@ function renderNotesContent() {
     const notes = await res.json();
     const el = document.getElementById('notes-content');
     if (!notes.length) { el.innerHTML = '<p class="loading">Nessuna nota.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th></tr></thead><tbody>' +
+    el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
       notes.map(n => '<tr>' +
         '<td>' + n.id + '</td>' +
         '<td>' + n.user_id + '</td>' +
         '<td>' + n.author_tag + '</td>' +
         '<td>' + n.content + '</td>' +
         '<td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td>' +
+        '<td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td>' +
       '</tr>').join('') +
       '</tbody></table>';
+  }
+  async function deleteNote(id) {
+    if (!confirm('Eliminare la nota #' + id + '?')) return;
+    const res = await fetch('/api/notes/' + id, { method: 'DELETE' });
+    if (res.ok) loadNotes();
+    else alert('Errore durante l\\'eliminazione');
   }
   loadNotes();
   </script>`;
@@ -462,6 +543,7 @@ function renderTicketsContent() {
   return `
   <div class="section">
     <h2>🎫 Ticket Aperti</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:14px;">Il pulsante Chiudi cancella il canale del ticket su Discord.</p>
     <div id="tickets-content" class="loading">Caricamento...</div>
   </div>
 
@@ -471,13 +553,23 @@ function renderTicketsContent() {
     const tickets = await res.json();
     const el = document.getElementById('tickets-content');
     if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th></tr></thead><tbody>' +
+    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente (ID)</th><th></th></tr></thead><tbody>' +
       tickets.map(t => '<tr>' +
         '<td>' + t.guild + '</td>' +
         '<td>#' + t.channel + '</td>' +
         '<td>' + t.userId + '</td>' +
+        '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
       '</tr>').join('') +
       '</tbody></table>';
+  }
+  async function closeTicket(channelId) {
+    if (!confirm('Chiudere ed eliminare questo ticket? Il canale verrà cancellato su Discord.')) return;
+    const res = await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
+    if (res.ok) loadTickets();
+    else {
+      const data = await res.json();
+      alert('Errore: ' + (data.error || 'sconosciuto'));
+    }
   }
   loadTickets();
   setInterval(loadTickets, 15000);
@@ -494,7 +586,7 @@ function renderCommandsContent() {
       <input type="text" id="cmd-response" placeholder="Risposta">
       <button onclick="addCmd()">Aggiungi</button>
     </div>
-    <div id="cmd-msg" style="margin-top:8px;font-size:13px;"></div>
+    <div id="cmd-msg"></div>
   </div>
 
   <div class="section">
@@ -520,17 +612,17 @@ function renderCommandsContent() {
     const name = document.getElementById('cmd-name').value.trim();
     const response = document.getElementById('cmd-response').value.trim();
     const msg = document.getElementById('cmd-msg');
-    if (!name || !response) { msg.textContent = '❌ Compila tutti i campi'; msg.style.color = '#ed4245'; return; }
+    if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
     const res = await fetch('/api/commands', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, response })
     });
     if (res.ok) {
-      msg.textContent = '✅ Aggiunto'; msg.style.color = '#00FF00';
+      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
       document.getElementById('cmd-name').value = '';
       document.getElementById('cmd-response').value = '';
       loadCmds();
-    } else { msg.textContent = '❌ Errore'; msg.style.color = '#ed4245'; }
+    } else { msg.innerHTML = '<span class="error">❌ Errore</span>'; }
   }
   async function removeCmd(name) {
     if (!confirm('Eliminare il comando -' + name + '?')) return;
@@ -538,6 +630,122 @@ function renderCommandsContent() {
     loadCmds();
   }
   loadCmds();
+  </script>`;
+}
+
+// ---------- CONFIG ----------
+function renderConfigContent() {
+  return `
+  <div class="section">
+    <h2>⚙️ Configurazione Server</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:14px;">Seleziona un server per configurare autorole, canale log e welcome.</p>
+    <select id="guild-select" onchange="loadGuildConfig()"></select>
+  </div>
+
+  <div id="config-content"></div>
+
+  <script>
+  let guildsData = [];
+
+  async function loadGuilds() {
+    const res = await fetch('/api/guilds');
+    guildsData = await res.json();
+    const sel = document.getElementById('guild-select');
+    sel.innerHTML = guildsData.map(g => '<option value="' + g.id + '">' + g.name + '</option>').join('');
+    if (guildsData.length) loadGuildConfig();
+  }
+
+  async function loadGuildConfig() {
+    const guildId = document.getElementById('guild-select').value;
+    const guild = guildsData.find(g => g.id === guildId);
+    if (!guild) return;
+
+    const [configRes, welcomeRes] = await Promise.all([
+      fetch('/api/config/' + guildId),
+      fetch('/api/welcome/' + guildId)
+    ]);
+    const config = await configRes.json();
+    const welcome = await welcomeRes.json();
+
+    const content = document.getElementById('config-content');
+    content.innerHTML = \`
+      <div class="section">
+        <div class="config-block">
+          <h3>🎭 Autorole</h3>
+          <select id="cfg-autorole">
+            <option value="">— Nessuno —</option>
+            \${guild.roles.map(r => '<option value="' + r.id + '" ' + (config.autorole_id === r.id ? 'selected' : '') + '>' + r.name + '</option>').join('')}
+          </select>
+          <button onclick="saveAutorole('\\\${guildId}')">Salva</button>
+          <div id="autorole-msg"></div>
+        </div>
+
+        <div class="config-block">
+          <h3>📋 Canale Log Moderazione</h3>
+          <select id="cfg-logchannel">
+            <option value="">— Nessuno —</option>
+            \${guild.channels.map(c => '<option value="' + c.id + '" ' + (config.log_channel_id === c.id ? 'selected' : '') + '>#' + c.name + '</option>').join('')}
+          </select>
+          <button onclick="saveLogChannel('\\\${guildId}')">Salva</button>
+          <div id="logchannel-msg"></div>
+        </div>
+
+        <div class="config-block">
+          <h3>👋 Welcome</h3>
+          <label style="font-size:13px;color:#888;">Canale di benvenuto</label>
+          <select id="cfg-welcomechannel">
+            <option value="">— Disattivato —</option>
+            \${guild.channels.map(c => '<option value="' + c.id + '" ' + (welcome.channel_id === c.id ? 'selected' : '') + '>#' + c.name + '</option>').join('')}
+          </select>
+          <label style="font-size:13px;color:#888;">Messaggio (usa {user}, {username}, {server}, {memberCount})</label>
+          <textarea id="cfg-welcomemessage" rows="3" placeholder="Benvenuto {user} in {server}!">\${welcome.message || ''}</textarea>
+          <label style="font-size:13px;color:#888;">
+            <input type="checkbox" id="cfg-welcomeembed" style="width:auto;margin-right:6px;" \${welcome.embed_enabled ? 'checked' : ''}>
+            Usa formato embed
+          </label>
+          <br><button onclick="saveWelcome('\\\${guildId}')">Salva</button>
+          <div id="welcome-msg"></div>
+        </div>
+      </div>
+    \`;
+  }
+
+  async function saveAutorole(guildId) {
+    const autoroleId = document.getElementById('cfg-autorole').value || null;
+    const res = await fetch('/api/config/' + guildId, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ autoroleId })
+    });
+    document.getElementById('autorole-msg').innerHTML = res.ok
+      ? '<span class="success">✅ Salvato</span>'
+      : '<span class="error">❌ Errore</span>';
+  }
+
+  async function saveLogChannel(guildId) {
+    const logChannelId = document.getElementById('cfg-logchannel').value || null;
+    const res = await fetch('/api/config/' + guildId, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ logChannelId })
+    });
+    document.getElementById('logchannel-msg').innerHTML = res.ok
+      ? '<span class="success">✅ Salvato</span>'
+      : '<span class="error">❌ Errore</span>';
+  }
+
+  async function saveWelcome(guildId) {
+    const channelId = document.getElementById('cfg-welcomechannel').value || null;
+    const message = document.getElementById('cfg-welcomemessage').value;
+    const embedEnabled = document.getElementById('cfg-welcomeembed').checked;
+    const res = await fetch('/api/welcome/' + guildId, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId, message, embedEnabled })
+    });
+    document.getElementById('welcome-msg').innerHTML = res.ok
+      ? '<span class="success">✅ Salvato</span>'
+      : '<span class="error">❌ Errore</span>';
+  }
+
+  loadGuilds();
   </script>`;
 }
 
