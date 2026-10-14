@@ -2662,11 +2662,16 @@ process.on('unhandledRejection', (err) => log.err('unhandledRejection', err));
 process.on('uncaughtException', (err) => log.err('uncaughtException', err));
 
 // ==================== STARTUP ====================
+let webServer = null;
+
 (async () => {
   try {
     // 1) LOGIN PRIMA — priorità assoluta al bot online
     await client.login(TOKEN);
     log.ok('✅ Bot online');
+
+    // 1b) Avvia il web server (dashboard)
+    webServer = createWebServer({ storage, client, log, botStartTime });
 
     // 2) Registrazione comandi DOPO — non bloccante
     //    Se Discord è in rate limit, fallisce ma il bot resta online
@@ -2678,10 +2683,3 @@ process.on('uncaughtException', (err) => log.err('uncaughtException', err));
     process.exit(1);
   }
 })();
-
-process.on('SIGINT', () => {
-  log.warn('Shutdown...');
-  if (typeof storage.close === 'function') storage.close();
-  client.destroy();
-  process.exit(0);
-});
