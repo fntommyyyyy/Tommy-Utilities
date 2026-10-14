@@ -1,791 +1,435 @@
-// web.js — Dashboard web completa con tutte le pagine
-const express = require('express');
-const session = require('express-session');
-const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
+const Database = require('better-sqlite3');
 
-function createWebServer({ storage, client, log, botStartTime }) {
-  const app = express();
-  const PORT = parseInt(process.env.PORT) || 3000;
-  const HOST = process.env.WEB_HOST || '0.0.0.0';
+class StorageService {
+  constructor(dbPath = './data/bot.db') {
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  app.set('trust proxy', 1);
-
-  const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
-  const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
-  const DASHBOARD_URL = (process.env.DASHBOARD_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
-  const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questo-segreto-ora';
-  const ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
-
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
-  app.use(session({
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    proxy: true,
-    cookie: {
-      secure: process.env.NODE_ENV === 'production',
-      httpOnly: true,
-      sameSite: 'none',
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    }
-  }));
-
-  function requireAuth(req, res, next) {
-    if (!req.session.user) {
-      if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
-      return res.redirect('/auth/login');
-    }
-    if (!ADMIN_IDS.includes(req.session.user.id)) {
-      if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Non autorizzato' });
-      return res.status(403).send('Non sei autorizzato.');
-    }
-    next();
+    this.db = new Database(dbPath);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this._migrate();
+    this._prepare();
   }
 
-  // ==================== PUBBLICI ====================
-  app.get('/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      uptime: Math.floor((Date.now() - botStartTime) / 1000),
-      guilds: client.guilds.cache.size,
-      ping: client.ws.ping,
-      timestamp: new Date().toISOString()
-    });
-  });
-
-  app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '3.0.0', loggedIn: !!req.session.user });
-  });
-
-  // ==================== OAUTH2 ====================
-  app.get('/auth/login', (req, res) => {
-    if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('OAuth2 non configurato.');
-    const redirectUri = `${DASHBOARD_URL}/auth/callback`;
-    const params = new URLSearchParams({
-      client_id: CLIENT_ID, redirect_uri: redirectUri,
-      response_type: 'code', scope: 'identify'
-    });
-    res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
-  });
-
-  app.get('/auth/callback', async (req, res) => {
-    const { code } = req.query;
-    if (!code) return res.status(400).send('Codice mancante');
-    const redirectUri = `${DASHBOARD_URL}/auth/callback`;
-    try {
-      const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
-        new URLSearchParams({
-          client_id: CLIENT_ID, client_secret: CLIENT_SECRET,
-          grant_type: 'authorization_code', code, redirect_uri: redirectUri
-        }),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  _migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS custom_commands (
+        name TEXT PRIMARY KEY,
+        response TEXT NOT NULL,
+        created_at TEXT NOT NULL
       );
-      const userRes = await axios.get('https://discord.com/api/users/@me', {
-        headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }
+
+      CREATE TABLE IF NOT EXISTS mod_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        target_id TEXT,
+        target TEXT,
+        moderator TEXT,
+        reason TEXT,
+        duration TEXT,
+        channel TEXT,
+        timestamp TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mod_logs_target ON mod_logs(target_id);
+
+      CREATE TABLE IF NOT EXISTS blacklist (
+        user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        moderator_id TEXT NOT NULL,
+        moderator_tag TEXT NOT NULL,
+        added_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS guild_config (
+        guild_id TEXT PRIMARY KEY,
+        autorole_id TEXT,
+        log_channel_id TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS member_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        author_tag TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_notes_user ON member_notes(guild_id, user_id);
+
+      CREATE TABLE IF NOT EXISTS welcome_config (
+        guild_id TEXT PRIMARY KEY,
+        channel_id TEXT,
+        message TEXT,
+        embed_enabled INTEGER DEFAULT 1,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS reaction_roles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_rr_message ON reaction_roles(guild_id, message_id);
+
+      CREATE TABLE IF NOT EXISTS autoresponses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        response TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_ar_trigger ON autoresponses(guild_id, trigger);
+
+      CREATE TABLE IF NOT EXISTS birthdays (
+        user_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        day INTEGER NOT NULL,
+        month INTEGER NOT NULL,
+        year INTEGER,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        remind_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_remind_at ON reminders(remind_at);
+
+      CREATE TABLE IF NOT EXISTS personal_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pnotes_user ON personal_notes(guild_id, user_id);
+
+      CREATE TABLE IF NOT EXISTS cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        moderator_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        reason TEXT,
+        duration TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cases_user ON cases(guild_id, user_id);
+
+      CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        reporter_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_reports_guild ON reports(guild_id, status);
+    `);
+  }
+
+  _prepare() {
+    this._allCmds = this.db.prepare('SELECT name, response FROM custom_commands');
+    this._getCmd = this.db.prepare('SELECT response FROM custom_commands WHERE name = ?');
+    this._upsertCmd = this.db.prepare(`
+      INSERT INTO custom_commands (name, response, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET response = excluded.response
+    `);
+    this._delCmd = this.db.prepare('DELETE FROM custom_commands WHERE name = ?');
+
+    this._insertLog = this.db.prepare(`
+      INSERT INTO mod_logs (type, target_id, target, moderator, reason, duration, channel, timestamp)
+      VALUES (@type, @targetId, @target, @moderator, @reason, @duration, @channel, @timestamp)
+    `);
+    this._logsByTarget = this.db.prepare('SELECT * FROM mod_logs WHERE target_id = ? ORDER BY id DESC');
+    this._countLogs = this.db.prepare('SELECT COUNT(*) as c FROM mod_logs');
+    this._countByType = this.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type');
+    this._trimLogs = this.db.prepare(`
+      DELETE FROM mod_logs WHERE id NOT IN (
+        SELECT id FROM mod_logs ORDER BY id DESC LIMIT 5000
+      )
+    `);
+
+    this._blGet = this.db.prepare('SELECT * FROM blacklist WHERE user_id = ?');
+    this._blAll = this.db.prepare('SELECT * FROM blacklist ORDER BY added_at DESC');
+    this._blInsert = this.db.prepare(`
+      INSERT INTO blacklist (user_id, username, reason, moderator_id, moderator_tag, added_at)
+      VALUES (@userId, @username, @reason, @moderatorId, @moderatorTag, @addedAt)
+    `);
+    this._blDelete = this.db.prepare('DELETE FROM blacklist WHERE user_id = ?');
+    this._blCount = this.db.prepare('SELECT COUNT(*) as c FROM blacklist');
+
+    this._getConfig = this.db.prepare('SELECT * FROM guild_config WHERE guild_id = ?');
+    this._upsertConfig = this.db.prepare(`
+      INSERT INTO guild_config (guild_id, autorole_id, log_channel_id, updated_at)
+      VALUES (@guildId, @autoroleId, @logChannelId, @updatedAt)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        autorole_id = excluded.autorole_id,
+        log_channel_id = excluded.log_channel_id,
+        updated_at = excluded.updated_at
+    `);
+
+    this._insertNote = this.db.prepare(`
+      INSERT INTO member_notes (guild_id, user_id, author_id, author_tag, content, created_at)
+      VALUES (@guildId, @userId, @authorId, @authorTag, @content, @createdAt)
+    `);
+    this._notesForUser = this.db.prepare('SELECT * FROM member_notes WHERE guild_id = ? AND user_id = ? ORDER BY id DESC');
+    this._getNote = this.db.prepare('SELECT * FROM member_notes WHERE id = ? AND guild_id = ?');
+    this._deleteNote = this.db.prepare('DELETE FROM member_notes WHERE id = ? AND guild_id = ?');
+    this._countNotes = this.db.prepare('SELECT COUNT(*) as c FROM member_notes WHERE guild_id = ?');
+
+    this._getWelcome = this.db.prepare(`
+      SELECT guild_id, channel_id, message,
+             COALESCE(embed_enabled, 1) AS embed_enabled,
+             updated_at
+      FROM welcome_config WHERE guild_id = ?
+    `);
+    this._setWelcome = this.db.prepare(`
+      INSERT INTO welcome_config (guild_id, channel_id, message, embed_enabled, updated_at)
+      VALUES (@guildId, @channelId, @message, COALESCE(@embedEnabled, 1), @updatedAt)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        channel_id = COALESCE(@channelId, channel_id),
+        message = COALESCE(@message, message),
+        embed_enabled = COALESCE(@embedEnabled, embed_enabled),
+        updated_at = @updatedAt
+    `);
+    this._disableWelcome = this.db.prepare(
+      'UPDATE welcome_config SET channel_id = NULL, updated_at = ? WHERE guild_id = ?'
+    );
+
+    this._rrInsert = this.db.prepare(`
+      INSERT INTO reaction_roles (guild_id, message_id, channel_id, emoji, role_id, created_at)
+      VALUES (@guildId, @messageId, @channelId, @emoji, @roleId, @createdAt)
+    `);
+    this._rrByMessage = this.db.prepare('SELECT * FROM reaction_roles WHERE guild_id = ? AND message_id = ?');
+    this._rrByEmoji = this.db.prepare('SELECT * FROM reaction_roles WHERE guild_id = ? AND message_id = ? AND emoji = ?');
+    this._rrDelete = this.db.prepare('DELETE FROM reaction_roles WHERE id = ? AND guild_id = ?');
+    this._rrDeleteByMessage = this.db.prepare('DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ?');
+
+    this._arInsert = this.db.prepare(`
+      INSERT INTO autoresponses (guild_id, trigger, response, created_at)
+      VALUES (@guildId, @trigger, @response, @createdAt)
+    `);
+    this._arAll = this.db.prepare('SELECT * FROM autoresponses WHERE guild_id = ? ORDER BY id DESC');
+    this._arByTrigger = this.db.prepare('SELECT * FROM autoresponses WHERE guild_id = ? AND trigger = ?');
+    this._arDelete = this.db.prepare('DELETE FROM autoresponses WHERE id = ? AND guild_id = ?');
+
+    this._bdSet = this.db.prepare(`
+      INSERT INTO birthdays (user_id, guild_id, day, month, year, updated_at)
+      VALUES (@userId, @guildId, @day, @month, @year, @updatedAt)
+      ON CONFLICT(user_id) DO UPDATE SET
+        guild_id = excluded.guild_id,
+        day = excluded.day,
+        month = excluded.month,
+        year = excluded.year,
+        updated_at = excluded.updated_at
+    `);
+    this._bdGet = this.db.prepare('SELECT * FROM birthdays WHERE user_id = ? AND guild_id = ?');
+    this._bdToday = this.db.prepare('SELECT * FROM birthdays WHERE guild_id = ? AND day = ? AND month = ?');
+    this._bdAll = this.db.prepare('SELECT * FROM birthdays WHERE guild_id = ? ORDER BY month, day');
+    this._bdDelete = this.db.prepare('DELETE FROM birthdays WHERE user_id = ? AND guild_id = ?');
+
+    this._remInsert = this.db.prepare(`
+      INSERT INTO reminders (user_id, guild_id, channel_id, content, remind_at, created_at)
+      VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
+    `);
+    this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ?');
+    this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
+    this._remByUser = this.db.prepare('SELECT * FROM reminders WHERE user_id = ? AND guild_id = ? ORDER BY remind_at ASC');
+
+    this._pnInsert = this.db.prepare(`
+      INSERT INTO personal_notes (user_id, guild_id, content, created_at)
+      VALUES (@userId, @guildId, @content, @createdAt)
+    `);
+    this._pnByUser = this.db.prepare('SELECT * FROM personal_notes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC');
+    this._pnDelete = this.db.prepare('DELETE FROM personal_notes WHERE id = ? AND user_id = ?');
+
+    this._caseInsert = this.db.prepare(`
+      INSERT INTO cases (guild_id, user_id, moderator_id, action, reason, duration, status, created_at, updated_at)
+      VALUES (@guildId, @userId, @moderatorId, @action, @reason, @duration, 'active', @now, @now)
+    `);
+    this._caseGet = this.db.prepare('SELECT * FROM cases WHERE id = ? AND guild_id = ?');
+    this._caseByUser = this.db.prepare('SELECT * FROM cases WHERE guild_id = ? AND user_id = ? ORDER BY id DESC');
+    this._caseUpdate = this.db.prepare(`
+      UPDATE cases SET reason = COALESCE(@reason, reason),
+                       status = COALESCE(@status, status),
+                       updated_at = @now
+      WHERE id = @id AND guild_id = @guildId
+    `);
+    this._caseDelete = this.db.prepare('DELETE FROM cases WHERE id = ? AND guild_id = ?');
+
+    this._repInsert = this.db.prepare(`
+      INSERT INTO reports (guild_id, reporter_id, target_id, reason, status, created_at)
+      VALUES (@guildId, @reporterId, @targetId, @reason, 'open', @createdAt)
+    `);
+    this._repAllOpen = this.db.prepare("SELECT * FROM reports WHERE guild_id = ? AND status = 'open' ORDER BY id DESC");
+    this._repSetStatus = this.db.prepare('UPDATE reports SET status = ? WHERE id = ? AND guild_id = ?');
+
+    this._logCounter = 0;
+  }
+
+  loadCommands() { return Object.fromEntries(this._allCmds.all().map(r => [r.name, r.response])); }
+  getCommand(name) { return this._getCmd.get(name)?.response ?? null; }
+  saveCommand(name, response) { this._upsertCmd.run(name, response, new Date().toISOString()); }
+  deleteCommand(name) { return this._delCmd.run(name).changes > 0; }
+
+  saveLog(entry) {
+    try {
+      this._insertLog.run({
+        type: entry.type || 'N/A',
+        targetId: entry.targetId || null, target: entry.target || null,
+        moderator: entry.moderator || null, reason: entry.reason || null,
+        duration: entry.duration || null, channel: entry.channel || null,
+        timestamp: new Date().toISOString()
       });
-      const user = userRes.data;
-      if (!ADMIN_IDS.includes(user.id)) return res.status(403).send('Non autorizzato.');
-      req.session.user = {
-        id: user.id, username: user.username,
-        global_name: user.global_name || user.username, avatar: user.avatar
-      };
-      req.session.save(() => res.redirect('/dashboard'));
-    } catch (err) {
-      log.err('OAuth', err.response?.data || err.message);
-      res.status(500).send('Errore login');
-    }
-  });
-
-  app.get('/auth/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
-  app.get('/auth/me', (req, res) => res.json({ user: req.session.user || null }));
-
-  // ==================== API ====================
-  app.get('/api/stats', requireAuth, (req, res) => {
-    const s = storage.getStats();
-    res.json({
-      logs: s.total, blacklist: s.blacklist,
-      guilds: client.guilds.cache.size, ping: client.ws.ping,
-      uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType
-    });
-  });
-
-  // --- BLACKLIST ---
-  app.get('/api/blacklist', requireAuth, (req, res) => res.json(storage.getAllBlacklist()));
-  app.post('/api/blacklist', requireAuth, (req, res) => {
-    const { userId, username, reason } = req.body || {};
-    if (!userId || !username || !reason) return res.status(400).json({ error: 'Campi mancanti' });
-    if (storage.isBlacklisted(userId)) return res.status(409).json({ error: 'Già in blacklist' });
-    storage.addToBlacklist(userId, username, reason, req.session.user.id, req.session.user.username);
-    res.json({ ok: true });
-  });
-  app.delete('/api/blacklist/:userId', requireAuth, (req, res) => {
-    res.json({ ok: storage.removeFromBlacklist(req.params.userId) });
-  });
-
-  // --- MOD LOGS ---
-  app.get('/api/logs/all', requireAuth, (req, res) => {
-    try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
-  });
-  app.get('/api/logs/:userId', requireAuth, (req, res) => {
-    res.json(storage.getLogsForUser(req.params.userId));
-  });
-
-  // --- NOTE ---
-  app.get('/api/notes/all', requireAuth, (req, res) => {
-    try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
-  });
-  app.delete('/api/notes/:id', requireAuth, (req, res) => {
-    try {
-      const ok = storage.deleteNoteById(parseInt(req.params.id));
-      res.json({ ok });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  // --- CONFIG ---
-  app.get('/api/config/:guildId', requireAuth, (req, res) => {
-    res.json(storage.getGuildConfig(req.params.guildId));
-  });
-  app.post('/api/config/:guildId', requireAuth, (req, res) => {
-    const { autoroleId, logChannelId } = req.body || {};
-    const guildId = req.params.guildId;
-    try {
-      if (autoroleId !== undefined) {
-        if (autoroleId) storage.setAutorole(guildId, autoroleId);
-        else storage.clearAutorole(guildId);
-      }
-      if (logChannelId !== undefined) {
-        if (logChannelId) storage.setLogChannel(guildId, logChannelId);
-        else storage.clearLogChannel(guildId);
-      }
-      res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  // --- WELCOME ---
-  app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
-    res.json(storage.getWelcomeConfig(req.params.guildId) || {});
-  });
-  app.post('/api/welcome/:guildId', requireAuth, (req, res) => {
-    const { channelId, message, embedEnabled } = req.body || {};
-    const guildId = req.params.guildId;
-    try {
-      if (channelId !== undefined) {
-        if (channelId) storage.setWelcomeChannel(guildId, channelId);
-        else storage.disableWelcome(guildId);
-      }
-      if (message !== undefined && message !== null) {
-        storage.setWelcomeMessage(guildId, message);
-      }
-      if (embedEnabled !== undefined) {
-        const current = storage.getWelcomeConfig(guildId);
-        storage.setWelcomeConfig(guildId, {
-          channelId: current?.channel_id ?? null,
-          message: current?.message ?? null,
-          embedEnabled
-        });
-      }
-      res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  // --- TICKET ---
-  app.get('/api/tickets', requireAuth, (req, res) => {
-    const tickets = [];
-    for (const guild of client.guilds.cache.values()) {
-      for (const ch of guild.channels.cache.values()) {
-        if (ch.name && ch.name.startsWith('ticket-')) {
-          tickets.push({
-            guild: guild.name, guildId: guild.id,
-            channel: ch.name, channelId: ch.id,
-            userId: ch.name.replace('ticket-', '')
-          });
-        }
-      }
-    }
-    res.json(tickets);
-  });
-  app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
-    try {
-      const ch = await client.channels.fetch(req.params.channelId).catch(() => null);
-      if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
-      await ch.delete('Chiuso dalla dashboard web');
-      res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  // --- COMANDI CUSTOM ---
-  app.get('/api/commands', requireAuth, (req, res) => {
-    const cmds = storage.loadCommands();
-    res.json(Object.entries(cmds).map(([name, response]) => ({ name, response })));
-  });
-  app.post('/api/commands', requireAuth, (req, res) => {
-    const { name, response } = req.body || {};
-    if (!name || !response) return res.status(400).json({ error: 'Campi mancanti' });
-    storage.saveCommand(name.toLowerCase(), response);
-    res.json({ ok: true });
-  });
-  app.delete('/api/commands/:name', requireAuth, (req, res) => {
-    res.json({ ok: storage.deleteCommand(req.params.name.toLowerCase()) });
-  });
-
-  // --- GRAFICI ---
-  app.get('/api/charts', requireAuth, (req, res) => {
-    try {
-      const byType = storage.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type').all();
-      const byDay = storage.db.prepare(
-        "SELECT substr(timestamp,1,10) as day, COUNT(*) as c FROM mod_logs GROUP BY day ORDER BY day DESC LIMIT 30"
-      ).all();
-      res.json({ byType, byDay });
-    } catch (e) { res.json({ byType: [], byDay: [] }); }
-  });
-
-  // --- GUILD INFO (per la pagina Config) ---
-  app.get('/api/guilds', requireAuth, (req, res) => {
-    const guilds = client.guilds.cache.map(g => ({
-      id: g.id, name: g.name,
-      roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
-      channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
-    }));
-    res.json(guilds);
-  });
-
-  // ==================== PAGINE HTML ====================
-  app.get('/dashboard', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'dashboard')));
-  app.get('/modlogs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'modlogs')));
-  app.get('/notes', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'notes')));
-  app.get('/tickets', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'tickets')));
-  app.get('/commands', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'commands')));
-  app.get('/config', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'config')));
-  app.get('/charts', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'charts')));
-
-  // ==================== AVVIO ====================
-  const server = app.listen(PORT, HOST, () => {
-    log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
-    log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
-  });
-
-  server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      log.warn(`Porta ${PORT} occupata, provo ${PORT + 1}...`);
-      server.listen(PORT + 1, HOST);
-    } else log.err('Web server', err);
-  });
-
-  return server;
-}
-
-// ============================================================
-// ================= HTML — TUTTE LE PAGINE ===================
-// ============================================================
-function renderLayout(user, page) {
-  const name = user.global_name || user.username;
-  const avatar = user.avatar
-    ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64`
-    : `https://cdn.discordapp.com/embed/avatars/0.png`;
-
-  const pages = {
-    dashboard: renderDashboardContent(),
-    modlogs: renderModlogsContent(),
-    notes: renderNotesContent(),
-    tickets: renderTicketsContent(),
-    commands: renderCommandsContent(),
-    config: renderConfigContent(),
-    charts: renderChartsContent()
-  };
-
-  return `<!DOCTYPE html>
-<html lang="it">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dashboard - ${page}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #1a1a1a; color: #eee; padding: 24px; }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 1px solid #333; }
-  h1 { font-size: 22px; }
-  .user { display: flex; align-items: center; gap: 12px; }
-  .user img { width: 40px; height: 40px; border-radius: 50%; }
-  nav { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
-  nav a { padding: 8px 14px; background: #252525; border: 1px solid #333; border-radius: 6px; color: #bbb; font-size: 14px; }
-  nav a:hover { background: #2f2f2f; }
-  nav a.active { background: #5865F2; color: white; border-color: #5865F2; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 28px; }
-  .card { background: #252525; border: 1px solid #333; border-radius: 10px; padding: 18px; }
-  .card h2 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
-  .card .value { font-size: 28px; font-weight: bold; color: #5865F2; }
-  .section { background: #252525; border: 1px solid #333; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
-  .section h2 { font-size: 18px; margin-bottom: 14px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #333; font-size: 14px; }
-  th { color: #888; font-size: 11px; text-transform: uppercase; }
-  button { background: #5865F2; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #4752c4; }
-  button.danger { background: #ed4245; }
-  button.danger:hover { background: #c93b3e; }
-  button.small { padding: 5px 10px; font-size: 12px; }
-  button.secondary { background: #444; }
-  button.secondary:hover { background: #555; }
-  input, select, textarea { background: #1a1a1a; border: 1px solid #444; color: #eee; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 10px; font-family: inherit; }
-  .form-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
-  .form-row input, .form-row select { flex: 1; min-width: 150px; }
-  .form-row > button { margin-top: 0; }
-  .loading { color: #888; font-style: italic; }
-  a { color: #5865F2; text-decoration: none; }
-  .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
-  .filter-bar select, .filter-bar input { max-width: 250px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
-  .badge.kick, .badge.warn { background: #faa61a; color: #000; }
-  .badge.ban { background: #ed4245; color: #fff; }
-  .badge.timeout { background: #5865F2; color: #fff; }
-  .badge.default { background: #444; color: #eee; }
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } }
-  .chart-box { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
-  .config-block { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .config-block h3 { font-size: 16px; margin-bottom: 12px; color: #bbb; }
-  .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
-  .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
-</style>
-</head>
-<body>
-  <header>
-    <h1>🤖 Dashboard Bot</h1>
-    <div class="user">
-      <img src="${avatar}" alt="">
-      <span>${name}</span>
-      <a href="/auth/logout"><button class="danger">Logout</button></a>
-    </div>
-  </header>
-
-  <nav>
-    <a href="/dashboard" class="${page === 'dashboard' ? 'active' : ''}">📊 Dashboard</a>
-    <a href="/modlogs" class="${page === 'modlogs' ? 'active' : ''}">📋 Mod Logs</a>
-    <a href="/notes" class="${page === 'notes' ? 'active' : ''}">📝 Note</a>
-    <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
-    <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
-    <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
-    <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
-  </nav>
-
-  ${pages[page] || '<p>Pagina non trovata</p>'}
-</body>
-</html>`;
-}
-
-// ---------- DASHBOARD ----------
-function renderDashboardContent() {
-  return `
-  <div class="grid">
-    <div class="card"><h2>Log Totali</h2><div class="value" id="stat-logs">...</div></div>
-    <div class="card"><h2>Blacklist</h2><div class="value" id="stat-bl">...</div></div>
-    <div class="card"><h2>Server</h2><div class="value" id="stat-guilds">...</div></div>
-    <div class="card"><h2>Ping</h2><div class="value" id="stat-ping">...</div></div>
-    <div class="card"><h2>Uptime</h2><div class="value" id="stat-uptime">...</div></div>
-  </div>
-
-  <div class="section">
-    <h2>➕ Aggiungi alla Blacklist</h2>
-    <div class="form-row">
-      <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)">
-      <input type="text" id="bl-username" placeholder="Username">
-      <input type="text" id="bl-reason" placeholder="Motivo">
-      <button onclick="addBL()">Aggiungi</button>
-    </div>
-    <div id="bl-msg"></div>
-  </div>
-
-  <div class="section">
-    <h2>🚫 Blacklist Globale</h2>
-    <div id="blacklist-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  async function loadStats() {
-    const res = await fetch('/api/stats'); if (!res.ok) return;
-    const s = await res.json();
-    document.getElementById('stat-logs').textContent = s.logs;
-    document.getElementById('stat-bl').textContent = s.blacklist;
-    document.getElementById('stat-guilds').textContent = s.guilds;
-    document.getElementById('stat-ping').textContent = s.ping + 'ms';
-    const h = Math.floor(s.uptime/3600), m = Math.floor((s.uptime%3600)/60);
-    document.getElementById('stat-uptime').textContent = h + 'h ' + m + 'm';
+      if (++this._logCounter % 100 === 0) this._trimLogs.run();
+    } catch (err) { console.error('❌ saveLog error:', err); }
   }
-  async function loadBlacklist() {
-    const res = await fetch('/api/blacklist');
-    const list = await res.json();
-    const el = document.getElementById('blacklist-content');
-    if (!list.length) { el.innerHTML = '<p class="loading">Nessun utente in blacklist.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
-      list.map(e => '<tr><td>' + e.username + '<br><small style="color:#666">' + e.user_id + '</small></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td><td><button class="danger small" onclick="removeBL(\\'' + e.user_id + '\\')">Rimuovi</button></td></tr>').join('') +
-      '</tbody></table>';
-  }
-  async function addBL() {
-    const userId = document.getElementById('bl-userId').value.trim();
-    const username = document.getElementById('bl-username').value.trim();
-    const reason = document.getElementById('bl-reason').value.trim();
-    const msg = document.getElementById('bl-msg');
-    if (!userId || !username || !reason) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await fetch('/api/blacklist', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId, username, reason })
-    });
-    const data = await res.json();
-    if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
-      document.getElementById('bl-userId').value = '';
-      document.getElementById('bl-username').value = '';
-      document.getElementById('bl-reason').value = '';
-      loadBlacklist(); loadStats();
-    } else { msg.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>'; }
-  }
-  async function removeBL(userId) {
-    if (!confirm('Rimuovere ' + userId + ' dalla blacklist?')) return;
-    await fetch('/api/blacklist/' + userId, { method: 'DELETE' });
-    loadBlacklist(); loadStats();
-  }
-  loadStats(); loadBlacklist();
-  setInterval(loadStats, 10000);
-  </script>`;
-}
-
-// ---------- MOD LOGS ----------
-function renderModlogsContent() {
-  return `
-  <div class="section">
-    <h2>📋 Mod Logs</h2>
-    <div class="filter-bar">
-      <select id="filter-type" onchange="loadLogs()">
-        <option value="">Tutti i tipi</option>
-        <option value="Kick">Kick</option>
-        <option value="Ban">Ban</option>
-        <option value="Warn">Warn</option>
-        <option value="Timeout">Timeout</option>
-        <option value="Clear">Clear</option>
-        <option value="Purge">Purge</option>
-        <option value="Lock">Lock</option>
-        <option value="Unlock">Unlock</option>
-      </select>
-      <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()">
-    </div>
-    <div id="logs-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  let allLogs = [];
-  async function loadLogs() {
-    if (!allLogs.length) {
-      const res = await fetch('/api/logs/all');
-      allLogs = await res.json();
-    }
-    const type = document.getElementById('filter-type').value;
-    const userId = document.getElementById('filter-user').value.trim();
-    let logs = allLogs;
-    if (type) logs = logs.filter(l => l.type === type);
-    if (userId) logs = logs.filter(l => (l.target_id || '').includes(userId));
-    const el = document.getElementById('logs-content');
-    if (!logs.length) { el.innerHTML = '<p class="loading">Nessun log trovato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
-      logs.map(l => '<tr>' +
-        '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
-        '<td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td>' +
-        '<td>' + (l.target || '-') + '</td>' +
-        '<td>' + (l.moderator || '-') + '</td>' +
-        '<td>' + (l.reason || '-') + '</td>' +
-        '<td>' + (l.duration || '-') + '</td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
-  }
-  loadLogs();
-  </script>`;
-}
-
-// ---------- NOTE ----------
-function renderNotesContent() {
-  return `
-  <div class="section">
-    <h2>📝 Note Staff</h2>
-    <div id="notes-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  async function loadNotes() {
-    const res = await fetch('/api/notes/all');
-    const notes = await res.json();
-    const el = document.getElementById('notes-content');
-    if (!notes.length) { el.innerHTML = '<p class="loading">Nessuna nota.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      notes.map(n => '<tr>' +
-        '<td>' + n.id + '</td>' +
-        '<td>' + n.user_id + '</td>' +
-        '<td>' + n.author_tag + '</td>' +
-        '<td>' + n.content + '</td>' +
-        '<td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td>' +
-        '<td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
-  }
-  async function deleteNote(id) {
-    if (!confirm('Eliminare la nota #' + id + '?')) return;
-    const res = await fetch('/api/notes/' + id, { method: 'DELETE' });
-    if (res.ok) loadNotes();
-    else alert('Errore durante l\\'eliminazione');
-  }
-  loadNotes();
-  </script>`;
-}
-
-// ---------- TICKET ----------
-function renderTicketsContent() {
-  return `
-  <div class="section">
-    <h2>🎫 Ticket Aperti</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Il pulsante Chiudi cancella il canale del ticket su Discord.</p>
-    <div id="tickets-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  async function loadTickets() {
-    const res = await fetch('/api/tickets');
-    const tickets = await res.json();
-    const el = document.getElementById('tickets-content');
-    if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente (ID)</th><th></th></tr></thead><tbody>' +
-      tickets.map(t => '<tr>' +
-        '<td>' + t.guild + '</td>' +
-        '<td>#' + t.channel + '</td>' +
-        '<td>' + t.userId + '</td>' +
-        '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
-  }
-  async function closeTicket(channelId) {
-    if (!confirm('Chiudere ed eliminare questo ticket? Il canale verrà cancellato su Discord.')) return;
-    const res = await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
-    if (res.ok) loadTickets();
-    else {
-      const data = await res.json();
-      alert('Errore: ' + (data.error || 'sconosciuto'));
-    }
-  }
-  loadTickets();
-  setInterval(loadTickets, 15000);
-  </script>`;
-}
-
-// ---------- COMANDI CUSTOM ----------
-function renderCommandsContent() {
-  return `
-  <div class="section">
-    <h2>➕ Aggiungi Comando Custom</h2>
-    <div class="form-row">
-      <input type="text" id="cmd-name" placeholder="Nome (es. regole)">
-      <input type="text" id="cmd-response" placeholder="Risposta">
-      <button onclick="addCmd()">Aggiungi</button>
-    </div>
-    <div id="cmd-msg"></div>
-  </div>
-
-  <div class="section">
-    <h2>🔧 Comandi Custom</h2>
-    <div id="commands-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  async function loadCmds() {
-    const res = await fetch('/api/commands');
-    const cmds = await res.json();
-    const el = document.getElementById('commands-content');
-    if (!cmds.length) { el.innerHTML = '<p class="loading">Nessun comando custom.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
-      cmds.map(c => '<tr>' +
-        '<td><code>-' + c.name + '</code></td>' +
-        '<td>' + c.response + '</td>' +
-        '<td><button class="danger small" onclick="removeCmd(\\'' + c.name + '\\')">Elimina</button></td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
-  }
-  async function addCmd() {
-    const name = document.getElementById('cmd-name').value.trim();
-    const response = document.getElementById('cmd-response').value.trim();
-    const msg = document.getElementById('cmd-msg');
-    if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await fetch('/api/commands', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, response })
-    });
-    if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
-      document.getElementById('cmd-name').value = '';
-      document.getElementById('cmd-response').value = '';
-      loadCmds();
-    } else { msg.innerHTML = '<span class="error">❌ Errore</span>'; }
-  }
-  async function removeCmd(name) {
-    if (!confirm('Eliminare il comando -' + name + '?')) return;
-    await fetch('/api/commands/' + name, { method: 'DELETE' });
-    loadCmds();
-  }
-  loadCmds();
-  </script>`;
-}
-
-// ---------- CONFIG ----------
-function renderConfigContent() {
-  return `
-  <div class="section">
-    <h2>⚙️ Configurazione Server</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Seleziona un server per configurare autorole, canale log e welcome.</p>
-    <select id="guild-select" onchange="loadGuildConfig()"></select>
-  </div>
-
-  <div id="config-content"></div>
-
-  <script>
-  let guildsData = [];
-
-  async function loadGuilds() {
-    const res = await fetch('/api/guilds');
-    guildsData = await res.json();
-    const sel = document.getElementById('guild-select');
-    sel.innerHTML = guildsData.map(g => '<option value="' + g.id + '">' + g.name + '</option>').join('');
-    if (guildsData.length) loadGuildConfig();
+  getLogsForUser(userId) { return this._logsByTarget.all(userId); }
+  getAllLogs(limit = 500) { return this.db.prepare('SELECT * FROM mod_logs ORDER BY id DESC LIMIT ?').all(limit); }
+  getStats() {
+    return { total: this._countLogs.get().c, byType: this._countByType.all(), blacklist: this._blCount.get().c };
   }
 
-  async function loadGuildConfig() {
-    const guildId = document.getElementById('guild-select').value;
-    const guild = guildsData.find(g => g.id === guildId);
-    if (!guild) return;
+  isBlacklisted(userId) { return !!this._blGet.get(userId); }
+  getBlacklistEntry(userId) { return this._blGet.get(userId) || null; }
+  getAllBlacklist() { return this._blAll.all(); }
+  addToBlacklist(userId, username, reason, moderatorId, moderatorTag) {
+    if (this.isBlacklisted(userId)) return false;
+    this._blInsert.run({ userId, username, reason, moderatorId, moderatorTag, addedAt: new Date().toISOString() });
+    return true;
+  }
+  removeFromBlacklist(userId) { return this._blDelete.run(userId).changes > 0; }
 
-    const [configRes, welcomeRes] = await Promise.all([
-      fetch('/api/config/' + guildId),
-      fetch('/api/welcome/' + guildId)
-    ]);
-    const config = await configRes.json();
-    const welcome = await welcomeRes.json();
-
-    const content = document.getElementById('config-content');
-    content.innerHTML = \`
-      <div class="section">
-        <div class="config-block">
-          <h3>🎭 Autorole</h3>
-          <select id="cfg-autorole">
-            <option value="">— Nessuno —</option>
-            \${guild.roles.map(r => '<option value="' + r.id + '" ' + (config.autorole_id === r.id ? 'selected' : '') + '>' + r.name + '</option>').join('')}
-          </select>
-          <button onclick="saveAutorole('\\\${guildId}')">Salva</button>
-          <div id="autorole-msg"></div>
-        </div>
-
-        <div class="config-block">
-          <h3>📋 Canale Log Moderazione</h3>
-          <select id="cfg-logchannel">
-            <option value="">— Nessuno —</option>
-            \${guild.channels.map(c => '<option value="' + c.id + '" ' + (config.log_channel_id === c.id ? 'selected' : '') + '>#' + c.name + '</option>').join('')}
-          </select>
-          <button onclick="saveLogChannel('\\\${guildId}')">Salva</button>
-          <div id="logchannel-msg"></div>
-        </div>
-
-        <div class="config-block">
-          <h3>👋 Welcome</h3>
-          <label style="font-size:13px;color:#888;">Canale di benvenuto</label>
-          <select id="cfg-welcomechannel">
-            <option value="">— Disattivato —</option>
-            \${guild.channels.map(c => '<option value="' + c.id + '" ' + (welcome.channel_id === c.id ? 'selected' : '') + '>#' + c.name + '</option>').join('')}
-          </select>
-          <label style="font-size:13px;color:#888;">Messaggio (usa {user}, {username}, {server}, {memberCount})</label>
-          <textarea id="cfg-welcomemessage" rows="3" placeholder="Benvenuto {user} in {server}!">\${welcome.message || ''}</textarea>
-          <label style="font-size:13px;color:#888;">
-            <input type="checkbox" id="cfg-welcomeembed" style="width:auto;margin-right:6px;" \${welcome.embed_enabled ? 'checked' : ''}>
-            Usa formato embed
-          </label>
-          <br><button onclick="saveWelcome('\\\${guildId}')">Salva</button>
-          <div id="welcome-msg"></div>
-        </div>
-      </div>
-    \`;
+  getGuildConfig(guildId) {
+    return this._getConfig.get(guildId) || { guild_id: guildId, autorole_id: null, log_channel_id: null };
+  }
+  setAutorole(guildId, roleId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: roleId, logChannelId: current.log_channel_id, updatedAt: new Date().toISOString() });
+  }
+  clearAutorole(guildId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: null, logChannelId: current.log_channel_id, updatedAt: new Date().toISOString() });
+  }
+  setLogChannel(guildId, channelId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: current.autorole_id, logChannelId: channelId, updatedAt: new Date().toISOString() });
+  }
+  clearLogChannel(guildId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: current.autorole_id, logChannelId: null, updatedAt: new Date().toISOString() });
   }
 
-  async function saveAutorole(guildId) {
-    const autoroleId = document.getElementById('cfg-autorole').value || null;
-    const res = await fetch('/api/config/' + guildId, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoroleId })
-    });
-    document.getElementById('autorole-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
+  addNote(guildId, userId, authorId, authorTag, content) {
+    const res = this._insertNote.run({ guildId, userId, authorId, authorTag, content, createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
   }
+  getNotesForUser(guildId, userId) { return this._notesForUser.all(guildId, userId); }
+  getNote(guildId, noteId) { return this._getNote.get(noteId, guildId) || null; }
+  deleteNote(guildId, noteId) { return this._deleteNote.run(noteId, guildId).changes > 0; }
+  countNotes(guildId) { return this._countNotes.get(guildId).c; }
+  getAllNotes() { return this.db.prepare('SELECT * FROM member_notes ORDER BY id DESC LIMIT 500').all(); }
+  deleteNoteById(id) { return this.db.prepare('DELETE FROM member_notes WHERE id = ?').run(id).changes > 0; }
 
-  async function saveLogChannel(guildId) {
-    const logChannelId = document.getElementById('cfg-logchannel').value || null;
-    const res = await fetch('/api/config/' + guildId, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ logChannelId })
-    });
-    document.getElementById('logchannel-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
-  }
-
-  async function saveWelcome(guildId) {
-    const channelId = document.getElementById('cfg-welcomechannel').value || null;
-    const message = document.getElementById('cfg-welcomemessage').value;
-    const embedEnabled = document.getElementById('cfg-welcomeembed').checked;
-    const res = await fetch('/api/welcome/' + guildId, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelId, message, embedEnabled })
-    });
-    document.getElementById('welcome-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
-  }
-
-  loadGuilds();
-  </script>`;
-}
-
-// ---------- GRAFICI ----------
-function renderChartsContent() {
-  return `
-  <div class="section">
-    <h2>📊 Statistiche Visuali</h2>
-    <div class="charts-grid">
-      <div class="chart-box"><canvas id="chart-types"></canvas></div>
-      <div class="chart-box"><canvas id="chart-days"></canvas></div>
-    </div>
-  </div>
-
-  <script>
-  async function loadCharts() {
-    const res = await fetch('/api/charts');
-    const data = await res.json();
-    const colors = ['#5865F2','#ed4245','#faa61a','#00FF00','#9B59B6','#1ABC9C'];
-
-    new Chart(document.getElementById('chart-types'), {
-      type: 'doughnut',
-      data: {
-        labels: data.byType.map(t => t.type),
-        datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }]
-      },
-      options: { plugins: { title: { display: true, text: 'Azioni per tipo', color: '#eee' }, legend: { labels: { color: '#eee' } } } }
-    });
-
-    new Chart(document.getElementById('chart-days'), {
-      type: 'line',
-      data: {
-        labels: data.byDay.map(d => d.day).reverse(),
-        datasets: [{ label: 'Azioni', data: data.byDay.map(d => d.c).reverse(), borderColor: '#5865F2', backgroundColor: 'rgba(88,101,242,0.2)', fill: true }]
-      },
-      options: { plugins: { title: { display: true, text: 'Azioni negli ultimi 30 giorni', color: '#eee' }, legend: { labels: { color: '#eee' } } }, scales: { x: { ticks: { color: '#888' } }, y: { ticks: { color: '#888' } } } }
+  getWelcomeConfig(guildId) { return this._getWelcome.get(guildId) || null; }
+  setWelcomeConfig(guildId, { channelId, message, embedEnabled }) {
+    this._setWelcome.run({
+      guildId, channelId: channelId || null, message: message || null,
+      embedEnabled: (embedEnabled === undefined) ? null : (embedEnabled === false ? 0 : 1),
+      updatedAt: new Date().toISOString()
     });
   }
-  loadCharts();
-  </script>`;
+  disableWelcome(guildId) { return this._disableWelcome.run(new Date().toISOString(), guildId).changes > 0; }
+  setWelcomeChannel(guildId, channelId) {
+    const current = this.getWelcomeConfig(guildId);
+    this.setWelcomeConfig(guildId, { channelId, message: current?.message ?? null, embedEnabled: current?.embed_enabled });
+  }
+  setWelcomeMessage(guildId, message) {
+    const current = this.getWelcomeConfig(guildId);
+    this.setWelcomeConfig(guildId, { channelId: current?.channel_id ?? null, message, embedEnabled: current?.embed_enabled });
+  }
+
+  addReactionRole(guildId, messageId, channelId, emoji, roleId) {
+    this._rrInsert.run({ guildId, messageId, channelId, emoji, roleId, createdAt: new Date().toISOString() });
+  }
+  getReactionRolesForMessage(guildId, messageId) { return this._rrByMessage.all(guildId, messageId); }
+  getReactionRoleByEmoji(guildId, messageId, emoji) { return this._rrByEmoji.get(guildId, messageId, emoji) || null; }
+  deleteReactionRole(guildId, id) { return this._rrDelete.run(id, guildId).changes > 0; }
+  deleteReactionRolesForMessage(guildId, messageId) { return this._rrDeleteByMessage.run(guildId, messageId).changes > 0; }
+
+  addAutoresponse(guildId, trigger, response) {
+    this._arInsert.run({ guildId, trigger: trigger.toLowerCase(), response, createdAt: new Date().toISOString() });
+  }
+  getAllAutoresponses(guildId) { return this._arAll.all(guildId); }
+  getAutoresponseByTrigger(guildId, trigger) { return this._arByTrigger.get(guildId, trigger.toLowerCase()) || null; }
+  deleteAutoresponse(guildId, id) { return this._arDelete.run(id, guildId).changes > 0; }
+
+  setBirthday(userId, guildId, day, month, year) {
+    this._bdSet.run({ userId, guildId, day, month, year: year || null, updatedAt: new Date().toISOString() });
+  }
+  getBirthday(userId, guildId) { return this._bdGet.get(userId, guildId) || null; }
+  getBirthdaysToday(guildId, day, month) { return this._bdToday.all(guildId, day, month); }
+  getAllBirthdays(guildId) { return this._bdAll.all(guildId); }
+  deleteBirthday(userId, guildId) { return this._bdDelete.run(userId, guildId).changes > 0; }
+
+  addReminder(userId, guildId, channelId, content, remindAt) {
+    const res = this._remInsert.run({ userId, guildId, channelId, content, remindAt: remindAt.toISOString(), createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
+  }
+  getDueReminders(now = new Date()) { return this._remDue.all(now.toISOString()); }
+  deleteReminder(id) { return this._remDelete.run(id).changes > 0; }
+  getRemindersForUser(userId, guildId) { return this._remByUser.all(userId, guildId); }
+
+  addPersonalNote(userId, guildId, content) {
+    const res = this._pnInsert.run({ userId, guildId, content, createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
+  }
+  getPersonalNotes(userId, guildId) { return this._pnByUser.all(userId, guildId); }
+  deletePersonalNote(id, userId) { return this._pnDelete.run(id, userId).changes > 0; }
+
+  addCase(guildId, userId, moderatorId, action, reason, duration) {
+    const now = new Date().toISOString();
+    const res = this._caseInsert.run({ guildId, userId, moderatorId, action, reason, duration, now });
+    return res.lastInsertRowid;
+  }
+  getCase(guildId, id) { return this._caseGet.get(id, guildId) || null; }
+  getCasesForUser(guildId, userId) { return this._caseByUser.all(guildId, userId); }
+  updateCase(guildId, id, { reason, status }) {
+    this._caseUpdate.run({ id, guildId, reason: reason || null, status: status || null, now: new Date().toISOString() });
+  }
+  deleteCase(guildId, id) { return this._caseDelete.run(id, guildId).changes > 0; }
+
+  addReport(guildId, reporterId, targetId, reason) {
+    const res = this._repInsert.run({ guildId, reporterId, targetId, reason, createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
+  }
+  getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
+  setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
+
+  close() {
+    try { if (this.db && this.db.open) this.db.close(); }
+    catch (err) { console.error('❌ close error:', err); }
+  }
 }
 
-module.exports = { createWebServer };
+module.exports = StorageService;
