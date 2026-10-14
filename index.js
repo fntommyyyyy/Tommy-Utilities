@@ -16,6 +16,7 @@ const {
 } = require('discord.js');
 
 const StorageService = require('./storage');
+const { createWebServer } = require('./web');
 
 // ==================== VALIDAZIONE ENV ====================
 const TOKEN = (process.env.DISCORD_TOKEN || process.env.TOKEN || '').trim();
