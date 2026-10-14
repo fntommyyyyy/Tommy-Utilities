@@ -8,6 +8,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const PORT = parseInt(process.env.PORT) || 3000;
   const HOST = process.env.WEB_HOST || '0.0.0.0';
 
+  // FIX 1: Railway è dietro un reverse proxy → Express deve fidarsi per i cookie secure
+  app.set('trust proxy', 1);
+
   const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
   const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
   const DASHBOARD_URL = (process.env.DASHBOARD_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
@@ -21,10 +24,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    // FIX 2: necessario perché Express si fida del proxy
+    proxy: true,
     cookie: {
       secure: process.env.NODE_ENV === 'production',
       httpOnly: true,
-      sameSite: 'lax',
+      // FIX 3: 'lax' blocca il cookie sul redirect cross-site da discord.com → railway.app
+      sameSite: 'none',
       maxAge: 7 * 24 * 60 * 60 * 1000
     }
   }));
@@ -67,9 +73,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
     if (!CLIENT_ID || !CLIENT_SECRET) {
       return res.status(500).send('OAuth2 non configurato (mancano CLIENT_ID o DISCORD_CLIENT_SECRET).');
     }
+    // FIX 4: log del redirect_uri per debug
+    const redirectUri = `${DASHBOARD_URL}/auth/callback`;
+    log.info(`OAuth login → redirect_uri=${redirectUri}`);
+
     const params = new URLSearchParams({
       client_id: CLIENT_ID,
-      redirect_uri: `${DASHBOARD_URL}/auth/callback`,
+      redirect_uri: redirectUri,
       response_type: 'code',
       scope: 'identify'
     });
@@ -80,6 +90,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const { code } = req.query;
     if (!code) return res.status(400).send('Codice mancante');
 
+    const redirectUri = `${DASHBOARD_URL}/auth/callback`;
+    log.info(`OAuth callback → code ricevuto, redirect_uri=${redirectUri}`);
+
     try {
       const tokenRes = await axios.post(
         'https://discord.com/api/oauth2/token',
@@ -88,7 +101,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
           client_secret: CLIENT_SECRET,
           grant_type: 'authorization_code',
           code,
-          redirect_uri: `${DASHBOARD_URL}/auth/callback`
+          redirect_uri: redirectUri
         }),
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
       );
@@ -100,6 +113,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const user = userRes.data;
 
       if (!ADMIN_IDS.includes(user.id)) {
+        log.warn(`OAuth: utente ${user.id} (${user.username}) non in DASHBOARD_ADMIN_IDS`);
         return res.status(403).send('Non sei autorizzato ad accedere alla dashboard.');
       }
 
@@ -110,10 +124,18 @@ function createWebServer({ storage, client, log, botStartTime }) {
         avatar: user.avatar
       };
 
-      res.redirect('/dashboard');
+      // FIX 5: salva la sessione PRIMA di redirect per evitare race condition
+      req.session.save((err) => {
+        if (err) {
+          log.err('OAuth session.save', err);
+          return res.status(500).send('Errore salvataggio sessione');
+        }
+        log.ok(`OAuth login riuscito per ${user.username} (${user.id})`);
+        res.redirect('/dashboard');
+      });
     } catch (err) {
       log.err('OAuth2 callback', err.response?.data || err.message);
-      res.status(500).send('Errore durante il login');
+      res.status(500).send('Errore durante il login: ' + (err.response?.data?.error || err.message));
     }
   });
 
@@ -179,8 +201,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
   // ==================== AVVIO ====================
   const server = app.listen(PORT, HOST, () => {
     log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
+    log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
     if (ADMIN_IDS.length === 0) {
       log.warn('⚠️  DASHBOARD_ADMIN_IDS vuoto: nessuno potrà accedere alla dashboard');
+    } else {
+      log.info(`   Admin autorizzati: ${ADMIN_IDS.length}`);
+    }
+    if (!CLIENT_SECRET) {
+      log.warn('⚠️  DISCORD_CLIENT_SECRET mancante: il login OAuth2 non funzionerà');
     }
   });
 
