@@ -1,4 +1,4 @@
-// web.js — Dashboard web completa con tutte le pagine
+// web.js — Dashboard web con accesso basato su ruolo Discord
 const express = require('express');
 const session = require('express-session');
 const axios = require('axios');
@@ -14,8 +14,30 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
   const DASHBOARD_URL = (process.env.DASHBOARD_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
   const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questo-segreto-ora';
-  const ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '')
+  const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
+
+  // Ruoli autorizzati ad accedere alla dashboard
+  const DASHBOARD_ROLES = ['Senior Admin'];
+
+  // Controlla se l'utente ha un ruolo autorizzato in almeno un server
+  async function isAuthorizedByRole(userId) {
+    // Fallback: sempre autorizzato se in DASHBOARD_ADMIN_IDS
+    if (ENV_ADMIN_IDS.includes(userId)) return true;
+
+    try {
+      for (const guild of client.guilds.cache.values()) {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (!member) continue;
+        if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) {
+          return true;
+        }
+      }
+    } catch (err) {
+      log.err('isAuthorizedByRole', err);
+    }
+    return false;
+  }
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
@@ -32,14 +54,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
   }));
 
+  // ==================== MIDDLEWARE ====================
   function requireAuth(req, res, next) {
     if (!req.session.user) {
       if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
       return res.redirect('/auth/login');
     }
-    if (!ADMIN_IDS.includes(req.session.user.id)) {
+    if (!req.session.user.dashboardAuthorized) {
       if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Non autorizzato' });
-      return res.status(403).send('Non sei autorizzato.');
+      return res.status(403).send('Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.');
     }
     next();
   }
@@ -86,10 +109,23 @@ function createWebServer({ storage, client, log, botStartTime }) {
         headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }
       });
       const user = userRes.data;
-      if (!ADMIN_IDS.includes(user.id)) return res.status(403).send('Non autorizzato.');
+
+      // ===== CONTROLLO RUOLO =====
+      const authorized = await isAuthorizedByRole(user.id);
+      if (!authorized) {
+        log.warn(`OAuth: utente ${user.id} (${user.username}) senza ruolo autorizzato`);
+        return res.status(403).send(
+          'Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.'
+        );
+      }
+      log.ok(`OAuth login riuscito per ${user.username} (${user.id})`);
+
       req.session.user = {
-        id: user.id, username: user.username,
-        global_name: user.global_name || user.username, avatar: user.avatar
+        id: user.id,
+        username: user.username,
+        global_name: user.global_name || user.username,
+        avatar: user.avatar,
+        dashboardAuthorized: true
       };
       req.session.save(() => res.redirect('/dashboard'));
     } catch (err) {
@@ -111,7 +147,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     });
   });
 
-  // --- BLACKLIST ---
   app.get('/api/blacklist', requireAuth, (req, res) => res.json(storage.getAllBlacklist()));
   app.post('/api/blacklist', requireAuth, (req, res) => {
     const { userId, username, reason } = req.body || {};
@@ -124,7 +159,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ ok: storage.removeFromBlacklist(req.params.userId) });
   });
 
-  // --- MOD LOGS ---
   app.get('/api/logs/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
   });
@@ -132,7 +166,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json(storage.getLogsForUser(req.params.userId));
   });
 
-  // --- NOTE ---
   app.get('/api/notes/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
   });
@@ -143,7 +176,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  // --- CONFIG ---
   app.get('/api/config/:guildId', requireAuth, (req, res) => {
     res.json(storage.getGuildConfig(req.params.guildId));
   });
@@ -163,7 +195,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  // --- WELCOME ---
   app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
     res.json(storage.getWelcomeConfig(req.params.guildId) || {});
   });
@@ -190,7 +221,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  // --- TICKET ---
   app.get('/api/tickets', requireAuth, (req, res) => {
     const tickets = [];
     for (const guild of client.guilds.cache.values()) {
@@ -215,7 +245,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  // --- COMANDI CUSTOM ---
   app.get('/api/commands', requireAuth, (req, res) => {
     const cmds = storage.loadCommands();
     res.json(Object.entries(cmds).map(([name, response]) => ({ name, response })));
@@ -230,7 +259,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ ok: storage.deleteCommand(req.params.name.toLowerCase()) });
   });
 
-  // --- GRAFICI ---
   app.get('/api/charts', requireAuth, (req, res) => {
     try {
       const byType = storage.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type').all();
@@ -241,7 +269,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { res.json({ byType: [], byDay: [] }); }
   });
 
-  // --- GUILD INFO (per la pagina Config) ---
   app.get('/api/guilds', requireAuth, (req, res) => {
     const guilds = client.guilds.cache.map(g => ({
       id: g.id, name: g.name,
@@ -264,6 +291,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const server = app.listen(PORT, HOST, () => {
     log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
     log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
+    log.info(`   Ruoli autorizzati: ${DASHBOARD_ROLES.join(', ')}`);
+    if (ENV_ADMIN_IDS.length) log.info(`   Fallback admin IDs: ${ENV_ADMIN_IDS.length}`);
   });
 
   server.on('error', (err) => {
