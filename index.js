@@ -85,6 +85,22 @@ function isAdmin(member) {
   return member.roles?.cache?.some(r => ADMIN_ROLES.includes(r.name)) ?? false;
 }
 
+// Nome leggibile di chi esegue un'azione (GuildMember o User)
+function actorName(executor) {
+  if (!executor) return 'N/A';
+  return executor.user ? executor.user.tag : (executor.username ?? 'N/A');
+}
+
+// FIX: controllo gerarchia lato esecutore.
+// true se l'esecutore può agire sul bersaglio (il proprietario del server può sempre,
+// nessuno può agire sul proprietario, altrimenti serve un ruolo strettamente più alto).
+function outranks(executor, targetMember, guild) {
+  if (!executor || !targetMember) return true;
+  if (guild.ownerId === executor.id) return true;
+  if (targetMember.id === guild.ownerId) return false;
+  return executor.roles.highest.position > targetMember.roles.highest.position;
+}
+
 function extractUserId(input) {
   if (!input) return null;
   const str = String(input).trim();
@@ -114,6 +130,12 @@ function calculatePages(total, perPage) {
 function getPaginatedSlice(arr, page, perPage) {
   const start = page * perPage;
   return arr.slice(start, start + perPage);
+}
+
+// FIX: true per qualsiasi interazione rispondibile (slash, bottoni...), false per i messaggi prefisso.
+// Prima si usava isChatInputCommand(), che per i bottoni restituiva false.
+function isInteractionSource(source) {
+  return typeof source.isRepliable === 'function' && source.isRepliable();
 }
 
 const cooldowns = new Map();
@@ -256,7 +278,8 @@ const ticketCooldowns = new Map();
 
 async function createTicket(source, user) {
   const guild = source.guild;
-  const isSlash = typeof source.isChatInputCommand === 'function' && source.isChatInputCommand();
+  // FIX: i bottoni sono interazioni → rispondono con reply/followUp, non con channel.send
+  const isSlash = isInteractionSource(source);
 
   const botMember = guild.members.me;
   if (!botMember.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
@@ -365,7 +388,8 @@ async function createTicket(source, user) {
 
 async function closeTicket(source, user) {
   const channel = source.channel;
-  const isSlash = typeof source.isChatInputCommand === 'function' && source.isChatInputCommand();
+  // FIX: come sopra, vale anche per il bottone "Chiudi Ticket"
+  const isSlash = isInteractionSource(source);
 
   if (!isTicketChannel(channel)) {
     return safeReplySource(source, {
@@ -729,8 +753,14 @@ async function removeBlacklist(source, targetUser, moderator, isSlash) {
   const results = await Promise.allSettled(
     clientRef.guilds.cache.map(async (guild) => {
       try {
-        const bans = await guild.bans.fetch();
-        if (bans.has(targetUser.id)) {
+        // FIX: si scarica solo il ban dell'utente invece di tutta la lista ban del server.
+        let ban = null;
+        try {
+          ban = await guild.bans.fetch(targetUser.id);
+        } catch (e) {
+          if (e.code !== 10026) throw e; // 10026 = Unknown Ban (utente non bannato)
+        }
+        if (ban) {
           await guild.members.unban(targetUser.id, `[BLACKLIST RIMOSSA] ${moderator.username}`);
           await ModLogModule.logUserAction(guild, {
             type: 'Blacklist Unban',
@@ -1163,8 +1193,18 @@ const CommandLogic = {
       return { success: false, message: '❌ Non posso espellere me stesso!' };
     if (member.roles.highest.position >= botMember.roles.highest.position)
       return { success: false, message: '❌ Non posso espellere un utente con ruolo più alto!' };
+    // FIX: l'esecutore non può espellere chi ha un ruolo uguale o superiore al suo
+    if (!outranks(executor, member, guild))
+      return { success: false, message: '❌ Non puoi espellere un utente con ruolo uguale o superiore al tuo!' };
 
     await member.kick(reason);
+    // FIX: l'azione ora viene registrata nei modlogs
+    await ModLogModule.logUserAction(guild, {
+      type: 'Kick', title: 'Kick', targetId,
+      target: `${member.user.tag} (${targetId})`,
+      moderator: `${actorName(executor)} (${executor.id})`,
+      reason
+    });
     return { success: true, message: `✅ Utente ${member.user.tag} (${targetId}) è stato espulso. Motivo: ${reason}` };
   },
 
@@ -1183,8 +1223,18 @@ const CommandLogic = {
     const member = await this.getUserFromId(guild, targetId);
     if (member && !member.bannable)
       return { success: false, message: '❌ Non posso bannare questo utente!' };
+    // FIX: l'esecutore non può bannare chi ha un ruolo uguale o superiore al suo
+    if (member && !outranks(executor, member, guild))
+      return { success: false, message: '❌ Non puoi bannare un utente con ruolo uguale o superiore al tuo!' };
 
     await guild.members.ban(targetId, { reason });
+    // FIX: l'azione ora viene registrata nei modlogs
+    await ModLogModule.logUserAction(guild, {
+      type: 'Ban', title: 'Ban', targetId,
+      target: member ? `${member.user.tag} (${targetId})` : targetId,
+      moderator: `${actorName(executor)} (${executor.id})`,
+      reason
+    });
     return { success: true, message: `✅ Utente con ID ${targetId} è stato bannato. Motivo: ${reason}` };
   },
 
@@ -1202,6 +1252,12 @@ const CommandLogic = {
       const ban = await guild.bans.fetch(targetId);
       if (!ban) return { success: false, message: '❌ Utente non bannato!' };
       await guild.bans.remove(targetId);
+      // FIX: l'azione ora viene registrata nei modlogs
+      await ModLogModule.logUserAction(guild, {
+        type: 'Unban', title: 'Unban', targetId,
+        target: `${ban.user.tag} (${targetId})`,
+        moderator: `${actorName(executor)} (${executor.id})`
+      });
       return { success: true, message: `✅ Utente ${ban.user.tag} (${targetId}) è stato sbannato.` };
     } catch (error) {
       if (error.code === 10026) return { success: false, message: '❌ Utente non trovato o non bannato.' };
@@ -1221,6 +1277,13 @@ const CommandLogic = {
 
     try {
       const deleted = await channel.bulkDelete(amount, true);
+      // FIX: l'azione ora viene registrata nei modlogs
+      await ModLogModule.logUserAction(channel.guild, {
+        type: 'Clear', title: 'Clear Messaggi',
+        moderator: `${actorName(executor)} (${executor.id})`,
+        channel: channel.name,
+        reason: `Cancellati ${deleted.size} messaggi`
+      });
       return { success: true, message: `🧹 Cancellati ${deleted.size} messaggi` };
     } catch (error) {
       if (error.code === 50034)
@@ -1297,6 +1360,9 @@ const CommandLogic = {
       return { success: false, message: '❌ Non ho il permesso "Gestisci Ruoli"!' };
     if (role.position >= botMember.roles.highest.position)
       return { success: false, message: '❌ Non posso assegnare un ruolo più alto o uguale al mio!' };
+    // FIX: l'esecutore non può assegnare ruoli più alti o uguali al suo (evita l'escalation di privilegi)
+    if (guild.ownerId !== executor.id && role.position >= executor.roles.highest.position)
+      return { success: false, message: '❌ Non puoi assegnare un ruolo più alto o uguale al tuo!' };
     if (member.roles.cache.has(roleIdMatch))
       return { success: false, message: `❌ L'utente ha già il ruolo ${role.name}!` };
 
@@ -1321,6 +1387,11 @@ const CommandLogic = {
     const botMember = guild.members.me;
     if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles))
       return { success: false, message: '❌ Non ho il permesso "Gestisci Ruoli"!' };
+    // FIX: controlli di gerarchia (prima mancavano in rimozione)
+    if (role.position >= botMember.roles.highest.position)
+      return { success: false, message: '❌ Non posso rimuovere un ruolo più alto o uguale al mio!' };
+    if (guild.ownerId !== executor.id && role.position >= executor.roles.highest.position)
+      return { success: false, message: '❌ Non puoi rimuovere un ruolo più alto o uguale al tuo!' };
     if (!member.roles.cache.has(roleIdMatch))
       return { success: false, message: `❌ L'utente non ha il ruolo ${role.name}!` };
 
@@ -1357,6 +1428,13 @@ const CommandLogic = {
 
     await channel.permissionOverwrites.edit(everyone, { SendMessages: false });
     const name = executor.user ? executor.user.tag : executor.username;
+    // FIX: l'azione ora viene registrata nei modlogs
+    await ModLogModule.logUserAction(channel.guild, {
+      type: 'Lock', title: 'Canale Bloccato',
+      moderator: `${name} (${executor.id})`,
+      channel: channel.name,
+      reason
+    });
     return { success: true, message: `🔒 Canale bloccato! Motivo: ${reason} - Da: ${name}` };
   },
 
@@ -1375,6 +1453,12 @@ const CommandLogic = {
 
     await channel.permissionOverwrites.delete(everyone);
     const name = executor.user ? executor.user.tag : executor.username;
+    // FIX: l'azione ora viene registrata nei modlogs
+    await ModLogModule.logUserAction(channel.guild, {
+      type: 'Unlock', title: 'Canale Sbloccato',
+      moderator: `${name} (${executor.id})`,
+      channel: channel.name
+    });
     return { success: true, message: `🔓 Canale sbloccato! Da: ${name}` };
   }
 };
@@ -1864,6 +1948,9 @@ async function handlePrefixCommand(message) {
         // FIX: controllo gerarchia esplicito
         if (!m.moderatable)
           return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso timeout questo utente.')] });
+        // FIX: l'esecutore non può mettere in timeout chi ha un ruolo uguale o superiore al suo
+        if (!outranks(member, m, guild))
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi timeout un utente con ruolo uguale o superiore al tuo.')] });
         const reason = args.slice(2).join(' ') || 'Nessun motivo specificato';
         try { await m.timeout(seconds * 1000, reason); }
         catch { return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso timeout questo utente.')] }); }
@@ -2241,6 +2328,9 @@ async function handleSlashCommand(interaction) {
       // FIX: controllo gerarchia esplicito
       if (!m.moderatable)
         return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non posso timeout questo utente.')], ephemeral: true });
+      // FIX: l'esecutore non può mettere in timeout chi ha un ruolo uguale o superiore al suo
+      if (!outranks(member, m, guild))
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non puoi timeout un utente con ruolo uguale o superiore al tuo.')], ephemeral: true });
       try { await m.timeout(seconds * 1000, reason); }
       catch { return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non posso timeout questo utente.')], ephemeral: true }); }
       const durata = formatDuration(seconds);
