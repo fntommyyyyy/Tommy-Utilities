@@ -1,7 +1,10 @@
-// web.js — Dashboard web con accesso basato su ruolo Discord + Pagina Utente
+// web.js — Dashboard web completa con Ricerca, Export CSV, Access Logs, Session persistente
 const express = require('express');
 const session = require('express-session');
+const FileStore = require('session-file-store')(session);
 const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
 
 function createWebServer({ storage, client, log, botStartTime }) {
   const app = express();
@@ -37,7 +40,18 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
+
+  // ===== SESSION STORE PERSISTENTE (dentro il volume) =====
+  const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
+  try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
+
   app.use(session({
+    store: new FileStore({
+      path: SESSION_DIR,
+      ttl: 7 * 24 * 60 * 60,
+      retries: 0,
+      logFn: () => {}
+    }),
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
@@ -75,7 +89,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '3.1.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '4.0.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
@@ -114,6 +128,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
         );
       }
       log.ok(`OAuth login riuscito per ${user.username} (${user.id})`);
+
+      // ===== LOG ACCESSO =====
+      try {
+        const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'sconosciuto';
+        const ua = (req.headers['user-agent'] || '').slice(0, 300);
+        storage.saveDashboardAccess(user.id, user.username, ip, ua);
+      } catch (e) { log.err('saveDashboardAccess', e); }
 
       req.session.user = {
         id: user.id,
@@ -273,7 +294,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json(guilds);
   });
 
-  // --- UTENTE (nuova) ---
+  // --- UTENTE ---
   app.get('/api/user/:userId', requireAuth, (req, res) => {
     const userId = req.params.userId;
     try {
@@ -299,17 +320,98 @@ function createWebServer({ storage, client, log, botStartTime }) {
       }, {});
 
       res.json({
-        userId,
-        logs,
-        notes,
-        blacklist: blacklistEntry,
-        tickets,
+        userId, logs, notes,
+        blacklist: blacklistEntry, tickets,
         byType: Object.entries(byTypeMap).map(([type, c]) => ({ type, c }))
       });
     } catch (e) {
       log.err('api/user', e);
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // ==================== RICERCA GLOBALE ====================
+  app.get('/api/search', requireAuth, (req, res) => {
+    const q = (req.query.q || '').toString().trim().toLowerCase();
+    if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
+
+    try {
+      const blacklist = storage.getAllBlacklist().filter(e =>
+        (e.user_id || '').toLowerCase().includes(q) ||
+        (e.username || '').toLowerCase().includes(q) ||
+        (e.reason || '').toLowerCase().includes(q)
+      );
+
+      const notes = storage.getAllNotes().filter(n =>
+        (n.user_id || '').toLowerCase().includes(q) ||
+        (n.content || '').toLowerCase().includes(q) ||
+        (n.author_tag || '').toLowerCase().includes(q)
+      );
+
+      const logs = storage.getAllLogs(500).filter(l =>
+        (l.target_id || '').toLowerCase().includes(q) ||
+        (l.target || '').toLowerCase().includes(q) ||
+        (l.moderator || '').toLowerCase().includes(q) ||
+        (l.reason || '').toLowerCase().includes(q)
+      );
+
+      const tickets = [];
+      for (const guild of client.guilds.cache.values()) {
+        for (const ch of guild.channels.cache.values()) {
+          if (ch.name && ch.name.startsWith('ticket-') && ch.name.toLowerCase().includes(q)) {
+            tickets.push({
+              guild: guild.name, channel: ch.name,
+              channelId: ch.id, userId: ch.name.replace('ticket-', '')
+            });
+          }
+        }
+      }
+
+      res.json({ blacklist, notes, logs, tickets });
+    } catch (e) {
+      log.err('api/search', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ==================== EXPORT CSV ====================
+  function toCsv(rows, headers) {
+    if (!rows.length) return headers.join(',');
+    const esc = (v) => {
+      const s = (v === null || v === undefined) ? '' : String(v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    return headers.join(',') + '\n' +
+      rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
+  }
+
+  app.get('/api/export/blacklist.csv', requireAuth, (req, res) => {
+    const rows = storage.getAllBlacklist();
+    const csv = toCsv(rows, ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="blacklist.csv"');
+    res.send(csv);
+  });
+
+  app.get('/api/export/notes.csv', requireAuth, (req, res) => {
+    const rows = storage.getAllNotes();
+    const csv = toCsv(rows, ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="notes.csv"');
+    res.send(csv);
+  });
+
+  app.get('/api/export/logs.csv', requireAuth, (req, res) => {
+    const rows = storage.getAllLogs(5000);
+    const csv = toCsv(rows, ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'timestamp']);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
+    res.send(csv);
+  });
+
+  // ==================== ACCESS LOGS ====================
+  app.get('/api/access-logs', requireAuth, (req, res) => {
+    try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
 
   // ==================== PAGINE HTML ====================
@@ -321,6 +423,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/config', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'config')));
   app.get('/charts', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'charts')));
   app.get('/user/:userId', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'user', { userId: req.params.userId })));
+  app.get('/search', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'search', { q: (req.query.q || '').toString() })));
+  app.get('/access-logs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'accesslogs')));
 
   // ==================== AVVIO ====================
   const server = app.listen(PORT, HOST, () => {
@@ -357,7 +461,9 @@ function renderLayout(user, page, params = {}) {
     commands: renderCommandsContent(),
     config: renderConfigContent(),
     charts: renderChartsContent(),
-    user: renderUserContent(params.userId)
+    user: renderUserContent(params.userId),
+    search: renderSearchContent(params.q || ''),
+    accesslogs: renderAccessLogsContent()
   };
 
   return `<!DOCTYPE html>
@@ -370,10 +476,13 @@ function renderLayout(user, page, params = {}) {
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, "Segoe UI", sans-serif; background: #1a1a1a; color: #eee; padding: 24px; }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 18px; border-bottom: 1px solid #333; }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding-bottom: 18px; border-bottom: 1px solid #333; gap: 16px; flex-wrap: wrap; }
   h1 { font-size: 22px; }
   .user { display: flex; align-items: center; gap: 12px; }
   .user img { width: 40px; height: 40px; border-radius: 50%; }
+  .search-box { flex: 1; max-width: 400px; min-width: 200px; }
+  .search-box form { display: flex; gap: 8px; }
+  .search-box input { margin: 0; }
   nav { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
   nav a { padding: 8px 14px; background: #252525; border: 1px solid #333; border-radius: 6px; color: #bbb; font-size: 14px; }
   nav a:hover { background: #2f2f2f; }
@@ -417,11 +526,19 @@ function renderLayout(user, page, params = {}) {
   .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
   .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
   code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  .export-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .export-bar a { padding: 6px 12px; background: #444; border-radius: 6px; font-size: 12px; color: #eee; }
+  .export-bar a:hover { background: #555; }
 </style>
 </head>
 <body>
   <header>
     <h1>🤖 Dashboard Bot</h1>
+    <div class="search-box">
+      <form action="/search" method="get">
+        <input type="text" name="q" placeholder="🔍 Cerca utente, motivo, moderatore..." value="${params.q || ''}">
+      </form>
+    </div>
     <div class="user">
       <img src="${avatar}" alt="">
       <span>${name}</span>
@@ -437,6 +554,7 @@ function renderLayout(user, page, params = {}) {
     <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
     <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
     <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
+    <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
   </nav>
 
   ${pages[page] || '<p>Pagina non trovata</p>'}
@@ -468,6 +586,9 @@ function renderDashboardContent() {
 
   <div class="section">
     <h2>🚫 Blacklist Globale</h2>
+    <div class="export-bar">
+      <a href="/api/export/blacklist.csv">📥 Esporta CSV</a>
+    </div>
     <div id="blacklist-content" class="loading">Caricamento...</div>
   </div>
 
@@ -525,6 +646,9 @@ function renderModlogsContent() {
   return `
   <div class="section">
     <h2>📋 Mod Logs</h2>
+    <div class="export-bar">
+      <a href="/api/export/logs.csv">📥 Esporta CSV</a>
+    </div>
     <div class="filter-bar">
       <select id="filter-type" onchange="loadLogs()">
         <option value="">Tutti i tipi</option>
@@ -576,6 +700,9 @@ function renderNotesContent() {
   return `
   <div class="section">
     <h2>📝 Note Staff</h2>
+    <div class="export-bar">
+      <a href="/api/export/notes.csv">📥 Esporta CSV</a>
+    </div>
     <div id="notes-content" class="loading">Caricamento...</div>
   </div>
 
@@ -904,10 +1031,7 @@ function renderUserContent(userId) {
 
   async function loadUser() {
     const res = await fetch('/api/user/' + USER_ID);
-    if (!res.ok) {
-      document.getElementById('u-logs').textContent = 'Errore';
-      return;
-    }
+    if (!res.ok) { document.getElementById('u-logs').textContent = 'Errore'; return; }
     const data = await res.json();
 
     document.getElementById('u-logs').textContent = data.logs.length;
@@ -921,13 +1045,7 @@ function renderUserContent(userId) {
       const b = data.blacklist;
       document.getElementById('user-blacklist-content').innerHTML =
         '<table><thead><tr><th>Username</th><th>Motivo</th><th>Aggiunto da</th><th>Data</th><th></th></tr></thead><tbody>' +
-        '<tr>' +
-          '<td>' + b.username + '</td>' +
-          '<td>' + b.reason + '</td>' +
-          '<td>' + b.moderator_tag + '</td>' +
-          '<td>' + new Date(b.added_at).toLocaleString('it-IT') + '</td>' +
-          '<td><button class="danger small" onclick="removeBL()">Rimuovi</button></td>' +
-        '</tr></tbody></table>';
+        '<tr><td>' + b.username + '</td><td>' + b.reason + '</td><td>' + b.moderator_tag + '</td><td>' + new Date(b.added_at).toLocaleString('it-IT') + '</td><td><button class="danger small" onclick="removeBL()">Rimuovi</button></td></tr></tbody></table>';
     }
 
     if (data.byType.length) {
@@ -935,10 +1053,7 @@ function renderUserContent(userId) {
       if (chartInstance) chartInstance.destroy();
       chartInstance = new Chart(document.getElementById('user-chart'), {
         type: 'doughnut',
-        data: {
-          labels: data.byType.map(t => t.type),
-          datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }]
-        },
+        data: { labels: data.byType.map(t => t.type), datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }] },
         options: { plugins: { legend: { labels: { color: '#eee' } } } }
       });
     } else {
@@ -948,33 +1063,17 @@ function renderUserContent(userId) {
     const logsEl = document.getElementById('user-logs-content');
     if (!data.logs.length) logsEl.innerHTML = '<p class="loading">Nessun log.</p>';
     else logsEl.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
-      data.logs.map(l => '<tr>' +
-        '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
-        '<td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td>' +
-        '<td>' + (l.moderator || '-') + '</td>' +
-        '<td>' + (l.reason || '-') + '</td>' +
-        '<td>' + (l.duration || '-') + '</td>' +
-      '</tr>').join('') + '</tbody></table>';
+      data.logs.map(l => '<tr><td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td><td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td><td>' + (l.moderator || '-') + '</td><td>' + (l.reason || '-') + '</td><td>' + (l.duration || '-') + '</td></tr>').join('') + '</tbody></table>';
 
     const notesEl = document.getElementById('user-notes-content');
     if (!data.notes.length) notesEl.innerHTML = '<p class="loading">Nessuna nota.</p>';
     else notesEl.innerHTML = '<table><thead><tr><th>#</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      data.notes.map(n => '<tr>' +
-        '<td>' + n.id + '</td>' +
-        '<td>' + n.author_tag + '</td>' +
-        '<td>' + n.content + '</td>' +
-        '<td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td>' +
-        '<td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td>' +
-      '</tr>').join('') + '</tbody></table>';
+      data.notes.map(n => '<tr><td>' + n.id + '</td><td>' + n.author_tag + '</td><td>' + n.content + '</td><td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td><td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
 
     const ticketsEl = document.getElementById('user-tickets-content');
     if (!data.tickets.length) ticketsEl.innerHTML = '<p class="loading">Nessun ticket aperto.</p>';
     else ticketsEl.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th></th></tr></thead><tbody>' +
-      data.tickets.map(t => '<tr>' +
-        '<td>' + t.guild + '</td>' +
-        '<td>#' + t.channel + '</td>' +
-        '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
-      '</tr>').join('') + '</tbody></table>';
+      data.tickets.map(t => '<tr><td>' + t.guild + '</td><td>#' + t.channel + '</td><td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td></tr>').join('') + '</tbody></table>';
   }
 
   async function removeBL() {
@@ -982,20 +1081,96 @@ function renderUserContent(userId) {
     await fetch('/api/blacklist/' + USER_ID, { method: 'DELETE' });
     loadUser();
   }
-
   async function deleteNote(id) {
     if (!confirm('Eliminare la nota #' + id + '?')) return;
     await fetch('/api/notes/' + id, { method: 'DELETE' });
     loadUser();
   }
-
   async function closeTicket(channelId) {
     if (!confirm('Chiudere questo ticket? Il canale verrà cancellato.')) return;
     await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
     loadUser();
   }
-
   loadUser();
+  </script>`;
+}
+
+// ---------- RICERCA ----------
+function renderSearchContent(q) {
+  return `
+  <div class="section">
+    <h2>🔍 Risultati per "${q}"</h2>
+    <div id="search-content" class="loading">Ricerca in corso...</div>
+  </div>
+
+  <script>
+  const QUERY = ${JSON.stringify(q)};
+
+  async function doSearch() {
+    const el = document.getElementById('search-content');
+    if (!QUERY.trim()) { el.innerHTML = '<p class="loading">Inserisci un termine di ricerca.</p>'; return; }
+    const res = await fetch('/api/search?q=' + encodeURIComponent(QUERY));
+    const data = await res.json();
+    const total = data.blacklist.length + data.notes.length + data.logs.length + data.tickets.length;
+    if (!total) { el.innerHTML = '<p class="loading">Nessun risultato.</p>'; return; }
+
+    let html = '';
+
+    if (data.blacklist.length) {
+      html += '<h3 style="margin-top:20px;">🚫 Blacklist (' + data.blacklist.length + ')</h3>';
+      html += '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
+        data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td></tr>').join('') + '</tbody></table>';
+    }
+
+    if (data.notes.length) {
+      html += '<h3 style="margin-top:20px;">📝 Note (' + data.notes.length + ')</h3>';
+      html += '<table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
+        data.notes.map(n => '<tr><td>' + n.id + '</td><td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td><td>' + n.content + '</td></tr>').join('') + '</tbody></table>';
+    }
+
+    if (data.logs.length) {
+      html += '<h3 style="margin-top:20px;">📋 Logs (' + data.logs.length + ')</h3>';
+      html += '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
+        data.logs.slice(0, 50).map(l => '<tr><td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td><td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + l.target_id + '">' + (l.target || l.target_id) + '</a>' : (l.target || '-')) + '</td><td>' + (l.moderator || '-') + '</td><td>' + (l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
+      if (data.logs.length > 50) html += '<p style="color:#888;font-size:12px;">...e altri ' + (data.logs.length - 50) + ' log</p>';
+    }
+
+    if (data.tickets.length) {
+      html += '<h3 style="margin-top:20px;">🎫 Ticket (' + data.tickets.length + ')</h3>';
+      html += '<table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
+        data.tickets.map(t => '<tr><td>' + t.guild + '</td><td>#' + t.channel + '</td></tr>').join('') + '</tbody></table>';
+    }
+
+    el.innerHTML = html;
+  }
+  doSearch();
+  </script>`;
+}
+
+// ---------- ACCESS LOGS ----------
+function renderAccessLogsContent() {
+  return `
+  <div class="section">
+    <h2>🔐 Log Accessi Dashboard</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:14px;">Ultimi 500 accessi alla dashboard.</p>
+    <div id="access-content" class="loading">Caricamento...</div>
+  </div>
+
+  <script>
+  async function loadAccess() {
+    const res = await fetch('/api/access-logs');
+    const logs = await res.json();
+    const el = document.getElementById('access-content');
+    if (!logs.length) { el.innerHTML = '<p class="loading">Nessun accesso registrato.</p>'; return; }
+    el.innerHTML = '<table><thead><tr><th>Data</th><th>Utente</th><th>IP</th><th>User Agent</th></tr></thead><tbody>' +
+      logs.map(l => '<tr>' +
+        '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
+        '<td><a class="user-link" href="/user/' + l.user_id + '">' + l.username + '</a></td>' +
+        '<td><code>' + (l.ip || '-') + '</code></td>' +
+        '<td style="font-size:11px;color:#888;">' + (l.user_agent || '-').slice(0, 80) + '</td>' +
+      '</tr>').join('') + '</tbody></table>';
+  }
+  loadAccess();
   </script>`;
 }
 
