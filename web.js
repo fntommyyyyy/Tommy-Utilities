@@ -1,4 +1,4 @@
-// web.js — Dashboard web con accesso basato su ruolo Discord
+// web.js — Dashboard web con accesso basato su ruolo Discord + Pagina Utente
 const express = require('express');
 const session = require('express-session');
 const axios = require('axios');
@@ -17,14 +17,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
 
-  // Ruoli autorizzati ad accedere alla dashboard
   const DASHBOARD_ROLES = ['Senior Admin'];
 
-  // Controlla se l'utente ha un ruolo autorizzato in almeno un server
   async function isAuthorizedByRole(userId) {
-    // Fallback: sempre autorizzato se in DASHBOARD_ADMIN_IDS
     if (ENV_ADMIN_IDS.includes(userId)) return true;
-
     try {
       for (const guild of client.guilds.cache.values()) {
         const member = await guild.members.fetch(userId).catch(() => null);
@@ -79,7 +75,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '3.0.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '3.1.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
@@ -110,7 +106,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
       });
       const user = userRes.data;
 
-      // ===== CONTROLLO RUOLO =====
       const authorized = await isAuthorizedByRole(user.id);
       if (!authorized) {
         log.warn(`OAuth: utente ${user.id} (${user.username}) senza ruolo autorizzato`);
@@ -278,6 +273,45 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json(guilds);
   });
 
+  // --- UTENTE (nuova) ---
+  app.get('/api/user/:userId', requireAuth, (req, res) => {
+    const userId = req.params.userId;
+    try {
+      const logs = storage.getLogsForUser(userId);
+      const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(userId);
+      const blacklistEntry = storage.getBlacklistEntry(userId);
+
+      const tickets = [];
+      for (const guild of client.guilds.cache.values()) {
+        for (const ch of guild.channels.cache.values()) {
+          if (ch.name && ch.name === `ticket-${userId}`) {
+            tickets.push({
+              guild: guild.name, guildId: guild.id,
+              channel: ch.name, channelId: ch.id
+            });
+          }
+        }
+      }
+
+      const byTypeMap = logs.reduce((acc, l) => {
+        acc[l.type] = (acc[l.type] || 0) + 1;
+        return acc;
+      }, {});
+
+      res.json({
+        userId,
+        logs,
+        notes,
+        blacklist: blacklistEntry,
+        tickets,
+        byType: Object.entries(byTypeMap).map(([type, c]) => ({ type, c }))
+      });
+    } catch (e) {
+      log.err('api/user', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ==================== PAGINE HTML ====================
   app.get('/dashboard', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'dashboard')));
   app.get('/modlogs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'modlogs')));
@@ -286,6 +320,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/commands', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'commands')));
   app.get('/config', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'config')));
   app.get('/charts', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'charts')));
+  app.get('/user/:userId', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'user', { userId: req.params.userId })));
 
   // ==================== AVVIO ====================
   const server = app.listen(PORT, HOST, () => {
@@ -308,7 +343,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
 // ============================================================
 // ================= HTML — TUTTE LE PAGINE ===================
 // ============================================================
-function renderLayout(user, page) {
+function renderLayout(user, page, params = {}) {
   const name = user.global_name || user.username;
   const avatar = user.avatar
     ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64`
@@ -321,7 +356,8 @@ function renderLayout(user, page) {
     tickets: renderTicketsContent(),
     commands: renderCommandsContent(),
     config: renderConfigContent(),
-    charts: renderChartsContent()
+    charts: renderChartsContent(),
+    user: renderUserContent(params.userId)
   };
 
   return `<!DOCTYPE html>
@@ -364,6 +400,8 @@ function renderLayout(user, page) {
   .form-row > button { margin-top: 0; }
   .loading { color: #888; font-style: italic; }
   a { color: #5865F2; text-decoration: none; }
+  a.user-link { color: #5865F2; text-decoration: none; border-bottom: 1px dashed #5865F2; }
+  a.user-link:hover { color: #4752c4; border-bottom-style: solid; }
   .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .filter-bar select, .filter-bar input { max-width: 250px; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
@@ -378,6 +416,7 @@ function renderLayout(user, page) {
   .config-block h3 { font-size: 16px; margin-bottom: 12px; color: #bbb; }
   .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
   .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
+  code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -449,7 +488,7 @@ function renderDashboardContent() {
     const el = document.getElementById('blacklist-content');
     if (!list.length) { el.innerHTML = '<p class="loading">Nessun utente in blacklist.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
-      list.map(e => '<tr><td>' + e.username + '<br><small style="color:#666">' + e.user_id + '</small></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td><td><button class="danger small" onclick="removeBL(\\'' + e.user_id + '\\')">Rimuovi</button></td></tr>').join('') +
+      list.map(e => '<tr><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a><br><small style="color:#666">' + e.user_id + '</small></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td><td><button class="danger small" onclick="removeBL(\\'' + e.user_id + '\\')">Rimuovi</button></td></tr>').join('') +
       '</tbody></table>';
   }
   async function addBL() {
@@ -521,7 +560,7 @@ function renderModlogsContent() {
       logs.map(l => '<tr>' +
         '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
         '<td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td>' +
-        '<td>' + (l.target || '-') + '</td>' +
+        '<td>' + (l.target_id ? '<a class="user-link" href="/user/' + l.target_id + '">' + (l.target || l.target_id) + '</a>' : (l.target || '-')) + '</td>' +
         '<td>' + (l.moderator || '-') + '</td>' +
         '<td>' + (l.reason || '-') + '</td>' +
         '<td>' + (l.duration || '-') + '</td>' +
@@ -549,7 +588,7 @@ function renderNotesContent() {
     el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
       notes.map(n => '<tr>' +
         '<td>' + n.id + '</td>' +
-        '<td>' + n.user_id + '</td>' +
+        '<td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td>' +
         '<td>' + n.author_tag + '</td>' +
         '<td>' + n.content + '</td>' +
         '<td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td>' +
@@ -586,7 +625,7 @@ function renderTicketsContent() {
       tickets.map(t => '<tr>' +
         '<td>' + t.guild + '</td>' +
         '<td>#' + t.channel + '</td>' +
-        '<td>' + t.userId + '</td>' +
+        '<td><a class="user-link" href="/user/' + t.userId + '">' + t.userId + '</a></td>' +
         '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
       '</tr>').join('') +
       '</tbody></table>';
@@ -814,6 +853,149 @@ function renderChartsContent() {
     });
   }
   loadCharts();
+  </script>`;
+}
+
+// ---------- PAGINA UTENTE ----------
+function renderUserContent(userId) {
+  return `
+  <div class="section">
+    <h2>👤 Utente <code>${userId}</code></h2>
+    <p style="color:#888;font-size:13px;">Dettagli completi su questo utente.</p>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2>Log Totali</h2><div class="value" id="u-logs">...</div></div>
+    <div class="card"><h2>Note</h2><div class="value" id="u-notes">...</div></div>
+    <div class="card"><h2>Ticket Aperti</h2><div class="value" id="u-tickets">...</div></div>
+    <div class="card"><h2>Blacklist</h2><div class="value" id="u-bl">...</div></div>
+  </div>
+
+  <div class="section" id="user-blacklist-section" style="display:none;">
+    <h2>🚫 Stato Blacklist</h2>
+    <div id="user-blacklist-content"></div>
+  </div>
+
+  <div class="section">
+    <h2>📊 Azioni per Tipo</h2>
+    <div class="chart-box" style="max-width:400px;margin:0 auto;">
+      <canvas id="user-chart"></canvas>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>📋 Mod Logs</h2>
+    <div id="user-logs-content" class="loading">Caricamento...</div>
+  </div>
+
+  <div class="section">
+    <h2>📝 Note</h2>
+    <div id="user-notes-content" class="loading">Caricamento...</div>
+  </div>
+
+  <div class="section">
+    <h2>🎫 Ticket Aperti</h2>
+    <div id="user-tickets-content" class="loading">Caricamento...</div>
+  </div>
+
+  <script>
+  const USER_ID = '${userId}';
+  let chartInstance = null;
+
+  async function loadUser() {
+    const res = await fetch('/api/user/' + USER_ID);
+    if (!res.ok) {
+      document.getElementById('u-logs').textContent = 'Errore';
+      return;
+    }
+    const data = await res.json();
+
+    document.getElementById('u-logs').textContent = data.logs.length;
+    document.getElementById('u-notes').textContent = data.notes.length;
+    document.getElementById('u-tickets').textContent = data.tickets.length;
+    document.getElementById('u-bl').textContent = data.blacklist ? 'Sì' : 'No';
+    document.getElementById('u-bl').style.color = data.blacklist ? '#ed4245' : '#00FF00';
+
+    if (data.blacklist) {
+      document.getElementById('user-blacklist-section').style.display = 'block';
+      const b = data.blacklist;
+      document.getElementById('user-blacklist-content').innerHTML =
+        '<table><thead><tr><th>Username</th><th>Motivo</th><th>Aggiunto da</th><th>Data</th><th></th></tr></thead><tbody>' +
+        '<tr>' +
+          '<td>' + b.username + '</td>' +
+          '<td>' + b.reason + '</td>' +
+          '<td>' + b.moderator_tag + '</td>' +
+          '<td>' + new Date(b.added_at).toLocaleString('it-IT') + '</td>' +
+          '<td><button class="danger small" onclick="removeBL()">Rimuovi</button></td>' +
+        '</tr></tbody></table>';
+    }
+
+    if (data.byType.length) {
+      const colors = ['#5865F2','#ed4245','#faa61a','#00FF00','#9B59B6','#1ABC9C'];
+      if (chartInstance) chartInstance.destroy();
+      chartInstance = new Chart(document.getElementById('user-chart'), {
+        type: 'doughnut',
+        data: {
+          labels: data.byType.map(t => t.type),
+          datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }]
+        },
+        options: { plugins: { legend: { labels: { color: '#eee' } } } }
+      });
+    } else {
+      document.getElementById('user-chart').parentElement.innerHTML = '<p class="loading">Nessuna azione.</p>';
+    }
+
+    const logsEl = document.getElementById('user-logs-content');
+    if (!data.logs.length) logsEl.innerHTML = '<p class="loading">Nessun log.</p>';
+    else logsEl.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
+      data.logs.map(l => '<tr>' +
+        '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
+        '<td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td>' +
+        '<td>' + (l.moderator || '-') + '</td>' +
+        '<td>' + (l.reason || '-') + '</td>' +
+        '<td>' + (l.duration || '-') + '</td>' +
+      '</tr>').join('') + '</tbody></table>';
+
+    const notesEl = document.getElementById('user-notes-content');
+    if (!data.notes.length) notesEl.innerHTML = '<p class="loading">Nessuna nota.</p>';
+    else notesEl.innerHTML = '<table><thead><tr><th>#</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
+      data.notes.map(n => '<tr>' +
+        '<td>' + n.id + '</td>' +
+        '<td>' + n.author_tag + '</td>' +
+        '<td>' + n.content + '</td>' +
+        '<td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td>' +
+        '<td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td>' +
+      '</tr>').join('') + '</tbody></table>';
+
+    const ticketsEl = document.getElementById('user-tickets-content');
+    if (!data.tickets.length) ticketsEl.innerHTML = '<p class="loading">Nessun ticket aperto.</p>';
+    else ticketsEl.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th></th></tr></thead><tbody>' +
+      data.tickets.map(t => '<tr>' +
+        '<td>' + t.guild + '</td>' +
+        '<td>#' + t.channel + '</td>' +
+        '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
+      '</tr>').join('') + '</tbody></table>';
+  }
+
+  async function removeBL() {
+    if (!confirm('Rimuovere ' + USER_ID + ' dalla blacklist?')) return;
+    await fetch('/api/blacklist/' + USER_ID, { method: 'DELETE' });
+    loadUser();
+  }
+
+  async function deleteNote(id) {
+    if (!confirm('Eliminare la nota #' + id + '?')) return;
+    await fetch('/api/notes/' + id, { method: 'DELETE' });
+    loadUser();
+  }
+
+  async function closeTicket(channelId) {
+    if (!confirm('Chiudere questo ticket? Il canale verrà cancellato.')) return;
+    await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
+    loadUser();
+  }
+
+  loadUser();
   </script>`;
 }
 
