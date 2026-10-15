@@ -1,4 +1,4 @@
-// web.js — Dashboard web completa con Ricerca, Export CSV, Access Logs, Session persistente
+// web.js — Dashboard web completa (Ricerca, Export CSV, Access Logs, Session, Bulk, Top 10)
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -41,7 +41,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
-  // ===== SESSION STORE PERSISTENTE (dentro il volume) =====
+  // ===== SESSION STORE PERSISTENTE =====
   const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
   try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 
@@ -64,7 +64,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
   }));
 
-  // ==================== MIDDLEWARE ====================
   function requireAuth(req, res, next) {
     if (!req.session.user) {
       if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
@@ -89,7 +88,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '4.0.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.0.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
@@ -123,13 +122,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const authorized = await isAuthorizedByRole(user.id);
       if (!authorized) {
         log.warn(`OAuth: utente ${user.id} (${user.username}) senza ruolo autorizzato`);
-        return res.status(403).send(
-          'Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.'
-        );
+        return res.status(403).send('Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.');
       }
       log.ok(`OAuth login riuscito per ${user.username} (${user.id})`);
 
-      // ===== LOG ACCESSO =====
       try {
         const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'sconosciuto';
         const ua = (req.headers['user-agent'] || '').slice(0, 300);
@@ -137,10 +133,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
       } catch (e) { log.err('saveDashboardAccess', e); }
 
       req.session.user = {
-        id: user.id,
-        username: user.username,
-        global_name: user.global_name || user.username,
-        avatar: user.avatar,
+        id: user.id, username: user.username,
+        global_name: user.global_name || user.username, avatar: user.avatar,
         dashboardAuthorized: true
       };
       req.session.save(() => res.redirect('/dashboard'));
@@ -175,6 +169,16 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ ok: storage.removeFromBlacklist(req.params.userId) });
   });
 
+  app.post('/api/blacklist/bulk-delete', requireAuth, (req, res) => {
+    try {
+      const { ids } = req.body || {};
+      if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'Nessun ID' });
+      let count = 0;
+      for (const id of ids) if (storage.removeFromBlacklist(id)) count++;
+      res.json({ ok: true, count });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   app.get('/api/logs/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
   });
@@ -189,6 +193,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try {
       const ok = storage.deleteNoteById(parseInt(req.params.id));
       res.json({ ok });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  app.post('/api/notes/bulk-delete', requireAuth, (req, res) => {
+    try {
+      const { ids } = req.body || {};
+      if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'Nessun ID' });
+      let count = 0;
+      for (const id of ids) if (storage.deleteNoteById(parseInt(id))) count++;
+      res.json({ ok: true, count });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
@@ -222,9 +235,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
         if (channelId) storage.setWelcomeChannel(guildId, channelId);
         else storage.disableWelcome(guildId);
       }
-      if (message !== undefined && message !== null) {
-        storage.setWelcomeMessage(guildId, message);
-      }
+      if (message !== undefined && message !== null) storage.setWelcomeMessage(guildId, message);
       if (embedEnabled !== undefined) {
         const current = storage.getWelcomeConfig(guildId);
         storage.setWelcomeConfig(guildId, {
@@ -274,6 +285,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.delete('/api/commands/:name', requireAuth, (req, res) => {
     res.json({ ok: storage.deleteCommand(req.params.name.toLowerCase()) });
   });
+  app.post('/api/commands/bulk-delete', requireAuth, (req, res) => {
+    try {
+      const { names } = req.body || {};
+      if (!Array.isArray(names) || !names.length) return res.status(400).json({ error: 'Nessun nome' });
+      let count = 0;
+      for (const n of names) if (storage.deleteCommand(n)) count++;
+      res.json({ ok: true, count });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
 
   app.get('/api/charts', requireAuth, (req, res) => {
     try {
@@ -283,6 +303,33 @@ function createWebServer({ storage, client, log, botStartTime }) {
       ).all();
       res.json({ byType, byDay });
     } catch (e) { res.json({ byType: [], byDay: [] }); }
+  });
+
+  app.get('/api/top', requireAuth, (req, res) => {
+    try {
+      const moderators = storage.db.prepare(`
+        SELECT moderator, COUNT(*) as c FROM mod_logs
+        WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico'
+        GROUP BY moderator ORDER BY c DESC LIMIT 10
+      `).all();
+      const targets = storage.db.prepare(`
+        SELECT target_id, target, COUNT(*) as c FROM mod_logs
+        WHERE target_id IS NOT NULL
+        GROUP BY target_id ORDER BY c DESC LIMIT 10
+      `).all();
+      const types = storage.db.prepare(`
+        SELECT type, COUNT(*) as c FROM mod_logs
+        GROUP BY type ORDER BY c DESC
+      `).all();
+      const byMonth = storage.db.prepare(`
+        SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs
+        GROUP BY month ORDER BY month DESC LIMIT 12
+      `).all();
+      res.json({ moderators, targets, types, byMonth });
+    } catch (e) {
+      log.err('api/top', e);
+      res.json({ moderators: [], targets: [], types: [], byMonth: [] });
+    }
   });
 
   app.get('/api/guilds', requireAuth, (req, res) => {
@@ -301,24 +348,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const logs = storage.getLogsForUser(userId);
       const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(userId);
       const blacklistEntry = storage.getBlacklistEntry(userId);
-
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name === `ticket-${userId}`) {
-            tickets.push({
-              guild: guild.name, guildId: guild.id,
-              channel: ch.name, channelId: ch.id
-            });
+            tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id });
           }
         }
       }
-
-      const byTypeMap = logs.reduce((acc, l) => {
-        acc[l.type] = (acc[l.type] || 0) + 1;
-        return acc;
-      }, {});
-
+      const byTypeMap = logs.reduce((acc, l) => { acc[l.type] = (acc[l.type] || 0) + 1; return acc; }, {});
       res.json({
         userId, logs, notes,
         blacklist: blacklistEntry, tickets,
@@ -330,43 +368,35 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
   });
 
-  // ==================== RICERCA GLOBALE ====================
+  // ==================== RICERCA ====================
   app.get('/api/search', requireAuth, (req, res) => {
     const q = (req.query.q || '').toString().trim().toLowerCase();
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
-
     try {
       const blacklist = storage.getAllBlacklist().filter(e =>
         (e.user_id || '').toLowerCase().includes(q) ||
         (e.username || '').toLowerCase().includes(q) ||
         (e.reason || '').toLowerCase().includes(q)
       );
-
       const notes = storage.getAllNotes().filter(n =>
         (n.user_id || '').toLowerCase().includes(q) ||
         (n.content || '').toLowerCase().includes(q) ||
         (n.author_tag || '').toLowerCase().includes(q)
       );
-
       const logs = storage.getAllLogs(500).filter(l =>
         (l.target_id || '').toLowerCase().includes(q) ||
         (l.target || '').toLowerCase().includes(q) ||
         (l.moderator || '').toLowerCase().includes(q) ||
         (l.reason || '').toLowerCase().includes(q)
       );
-
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-') && ch.name.toLowerCase().includes(q)) {
-            tickets.push({
-              guild: guild.name, channel: ch.name,
-              channelId: ch.id, userId: ch.name.replace('ticket-', '')
-            });
+            tickets.push({ guild: guild.name, channel: ch.name, channelId: ch.id, userId: ch.name.replace('ticket-', '') });
           }
         }
       }
-
       res.json({ blacklist, notes, logs, tickets });
     } catch (e) {
       log.err('api/search', e);
@@ -409,6 +439,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.send(csv);
   });
 
+  app.get('/api/export/access-logs.csv', requireAuth, (req, res) => {
+    const rows = storage.getDashboardAccessLogs();
+    const csv = toCsv(rows, ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="access-logs.csv"');
+    res.send(csv);
+  });
+
   // ==================== ACCESS LOGS ====================
   app.get('/api/access-logs', requireAuth, (req, res) => {
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
@@ -422,6 +460,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/commands', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'commands')));
   app.get('/config', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'config')));
   app.get('/charts', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'charts')));
+  app.get('/top', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'top')));
   app.get('/user/:userId', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'user', { userId: req.params.userId })));
   app.get('/search', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'search', { q: (req.query.q || '').toString() })));
   app.get('/access-logs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'accesslogs')));
@@ -461,6 +500,7 @@ function renderLayout(user, page, params = {}) {
     commands: renderCommandsContent(),
     config: renderConfigContent(),
     charts: renderChartsContent(),
+    top: renderTopContent(),
     user: renderUserContent(params.userId),
     search: renderSearchContent(params.q || ''),
     accesslogs: renderAccessLogsContent()
@@ -554,6 +594,7 @@ function renderLayout(user, page, params = {}) {
     <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
     <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
     <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
+    <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
     <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
   </nav>
 
@@ -588,6 +629,7 @@ function renderDashboardContent() {
     <h2>🚫 Blacklist Globale</h2>
     <div class="export-bar">
       <a href="/api/export/blacklist.csv">📥 Esporta CSV</a>
+      <a href="#" onclick="bulkDeleteBL();return false;">🗑️ Elimina selezionati</a>
     </div>
     <div id="blacklist-content" class="loading">Caricamento...</div>
   </div>
@@ -608,9 +650,25 @@ function renderDashboardContent() {
     const list = await res.json();
     const el = document.getElementById('blacklist-content');
     if (!list.length) { el.innerHTML = '<p class="loading">Nessun utente in blacklist.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
-      list.map(e => '<tr><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a><br><small style="color:#666">' + e.user_id + '</small></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td><td><button class="danger small" onclick="removeBL(\\'' + e.user_id + '\\')">Rimuovi</button></td></tr>').join('') +
+    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="bl-select-all" onclick="toggleAllBL()"></th><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
+      list.map(e => '<tr><td><input type="checkbox" class="bl-check" value="' + e.user_id + '"></td><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a><br><small style="color:#666">' + e.user_id + '</small></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td><td><button class="danger small" onclick="removeBL(\\'' + e.user_id + '\\')">Rimuovi</button></td></tr>').join('') +
       '</tbody></table>';
+  }
+  function toggleAllBL() {
+    const checked = document.getElementById('bl-select-all').checked;
+    document.querySelectorAll('.bl-check').forEach(c => c.checked = checked);
+  }
+  async function bulkDeleteBL() {
+    const ids = Array.from(document.querySelectorAll('.bl-check:checked')).map(c => c.value);
+    if (!ids.length) { alert('Nessun utente selezionato'); return; }
+    if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist?')) return;
+    const res = await fetch('/api/blacklist/bulk-delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    const data = await res.json();
+    if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); loadStats(); }
+    else alert('❌ ' + (data.error || 'Errore'));
   }
   async function addBL() {
     const userId = document.getElementById('bl-userId').value.trim();
@@ -646,9 +704,7 @@ function renderModlogsContent() {
   return `
   <div class="section">
     <h2>📋 Mod Logs</h2>
-    <div class="export-bar">
-      <a href="/api/export/logs.csv">📥 Esporta CSV</a>
-    </div>
+    <div class="export-bar"><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
     <div class="filter-bar">
       <select id="filter-type" onchange="loadLogs()">
         <option value="">Tutti i tipi</option>
@@ -669,10 +725,7 @@ function renderModlogsContent() {
   <script>
   let allLogs = [];
   async function loadLogs() {
-    if (!allLogs.length) {
-      const res = await fetch('/api/logs/all');
-      allLogs = await res.json();
-    }
+    if (!allLogs.length) { const res = await fetch('/api/logs/all'); allLogs = await res.json(); }
     const type = document.getElementById('filter-type').value;
     const userId = document.getElementById('filter-user').value.trim();
     let logs = allLogs;
@@ -688,8 +741,7 @@ function renderModlogsContent() {
         '<td>' + (l.moderator || '-') + '</td>' +
         '<td>' + (l.reason || '-') + '</td>' +
         '<td>' + (l.duration || '-') + '</td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
+      '</tr>').join('') + '</tbody></table>';
   }
   loadLogs();
   </script>`;
@@ -702,6 +754,7 @@ function renderNotesContent() {
     <h2>📝 Note Staff</h2>
     <div class="export-bar">
       <a href="/api/export/notes.csv">📥 Esporta CSV</a>
+      <a href="#" onclick="bulkDeleteNotes();return false;">🗑️ Elimina selezionate</a>
     </div>
     <div id="notes-content" class="loading">Caricamento...</div>
   </div>
@@ -712,16 +765,24 @@ function renderNotesContent() {
     const notes = await res.json();
     const el = document.getElementById('notes-content');
     if (!notes.length) { el.innerHTML = '<p class="loading">Nessuna nota.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      notes.map(n => '<tr>' +
-        '<td>' + n.id + '</td>' +
-        '<td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td>' +
-        '<td>' + n.author_tag + '</td>' +
-        '<td>' + n.content + '</td>' +
-        '<td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td>' +
-        '<td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
+    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="note-select-all" onclick="toggleAllNotes()"></th><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
+      notes.map(n => '<tr><td><input type="checkbox" class="note-check" value="' + n.id + '"></td><td>' + n.id + '</td><td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td><td>' + n.author_tag + '</td><td>' + n.content + '</td><td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td><td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+  }
+  function toggleAllNotes() {
+    const checked = document.getElementById('note-select-all').checked;
+    document.querySelectorAll('.note-check').forEach(c => c.checked = checked);
+  }
+  async function bulkDeleteNotes() {
+    const ids = Array.from(document.querySelectorAll('.note-check:checked')).map(c => c.value);
+    if (!ids.length) { alert('Nessuna nota selezionata'); return; }
+    if (!confirm('Eliminare ' + ids.length + ' note?')) return;
+    const res = await fetch('/api/notes/bulk-delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids })
+    });
+    const data = await res.json();
+    if (res.ok) { alert('✅ Eliminate ' + data.count + ' note'); loadNotes(); }
+    else alert('❌ ' + (data.error || 'Errore'));
   }
   async function deleteNote(id) {
     if (!confirm('Eliminare la nota #' + id + '?')) return;
@@ -754,17 +815,13 @@ function renderTicketsContent() {
         '<td>#' + t.channel + '</td>' +
         '<td><a class="user-link" href="/user/' + t.userId + '">' + t.userId + '</a></td>' +
         '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
+      '</tr>').join('') + '</tbody></table>';
   }
   async function closeTicket(channelId) {
     if (!confirm('Chiudere ed eliminare questo ticket? Il canale verrà cancellato su Discord.')) return;
     const res = await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
     if (res.ok) loadTickets();
-    else {
-      const data = await res.json();
-      alert('Errore: ' + (data.error || 'sconosciuto'));
-    }
+    else { const data = await res.json(); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
   loadTickets();
   setInterval(loadTickets, 15000);
@@ -786,6 +843,9 @@ function renderCommandsContent() {
 
   <div class="section">
     <h2>🔧 Comandi Custom</h2>
+    <div class="export-bar">
+      <a href="#" onclick="bulkDeleteCmds();return false;">🗑️ Elimina selezionati</a>
+    </div>
     <div id="commands-content" class="loading">Caricamento...</div>
   </div>
 
@@ -795,13 +855,24 @@ function renderCommandsContent() {
     const cmds = await res.json();
     const el = document.getElementById('commands-content');
     if (!cmds.length) { el.innerHTML = '<p class="loading">Nessun comando custom.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
-      cmds.map(c => '<tr>' +
-        '<td><code>-' + c.name + '</code></td>' +
-        '<td>' + c.response + '</td>' +
-        '<td><button class="danger small" onclick="removeCmd(\\'' + c.name + '\\')">Elimina</button></td>' +
-      '</tr>').join('') +
-      '</tbody></table>';
+    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
+      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + c.name + '"></td><td><code>-' + c.name + '</code></td><td>' + c.response + '</td><td><button class="danger small" onclick="removeCmd(\\'' + c.name + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+  }
+  function toggleAllCmds() {
+    const checked = document.getElementById('cmd-select-all').checked;
+    document.querySelectorAll('.cmd-check').forEach(c => c.checked = checked);
+  }
+  async function bulkDeleteCmds() {
+    const names = Array.from(document.querySelectorAll('.cmd-check:checked')).map(c => c.value);
+    if (!names.length) { alert('Nessun comando selezionato'); return; }
+    if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
+    const res = await fetch('/api/commands/bulk-delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names })
+    });
+    const data = await res.json();
+    if (res.ok) { alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(); }
+    else alert('❌ ' + (data.error || 'Errore'));
   }
   async function addCmd() {
     const name = document.getElementById('cmd-name').value.trim();
@@ -912,10 +983,8 @@ function renderConfigContent() {
       body: JSON.stringify({ autoroleId })
     });
     document.getElementById('autorole-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
+      ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
   }
-
   async function saveLogChannel(guildId) {
     const logChannelId = document.getElementById('cfg-logchannel').value || null;
     const res = await fetch('/api/config/' + guildId, {
@@ -923,10 +992,8 @@ function renderConfigContent() {
       body: JSON.stringify({ logChannelId })
     });
     document.getElementById('logchannel-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
+      ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
   }
-
   async function saveWelcome(guildId) {
     const channelId = document.getElementById('cfg-welcomechannel').value || null;
     const message = document.getElementById('cfg-welcomemessage').value;
@@ -936,10 +1003,8 @@ function renderConfigContent() {
       body: JSON.stringify({ channelId, message, embedEnabled })
     });
     document.getElementById('welcome-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
+      ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
   }
-
   loadGuilds();
   </script>`;
 }
@@ -960,16 +1025,11 @@ function renderChartsContent() {
     const res = await fetch('/api/charts');
     const data = await res.json();
     const colors = ['#5865F2','#ed4245','#faa61a','#00FF00','#9B59B6','#1ABC9C'];
-
     new Chart(document.getElementById('chart-types'), {
       type: 'doughnut',
-      data: {
-        labels: data.byType.map(t => t.type),
-        datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }]
-      },
+      data: { labels: data.byType.map(t => t.type), datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }] },
       options: { plugins: { title: { display: true, text: 'Azioni per tipo', color: '#eee' }, legend: { labels: { color: '#eee' } } } }
     });
-
     new Chart(document.getElementById('chart-days'), {
       type: 'line',
       data: {
@@ -980,6 +1040,60 @@ function renderChartsContent() {
     });
   }
   loadCharts();
+  </script>`;
+}
+
+// ---------- TOP 10 ----------
+function renderTopContent() {
+  return `
+  <div class="grid">
+    <div class="card"><h2>Top Moderatori</h2><div class="value" id="top-mod">...</div></div>
+    <div class="card"><h2>Top Utenti</h2><div class="value" id="top-user">...</div></div>
+    <div class="card"><h2>Tipi Azione</h2><div class="value" id="top-types">...</div></div>
+  </div>
+
+  <div class="section">
+    <h2>🏆 Top 10 Moderatori</h2>
+    <div id="top-mod-content" class="loading">Caricamento...</div>
+  </div>
+
+  <div class="section">
+    <h2>🎯 Top 10 Utenti più Moderati</h2>
+    <div id="top-user-content" class="loading">Caricamento...</div>
+  </div>
+
+  <div class="section">
+    <h2>📈 Azioni per Mese (ultimi 12)</h2>
+    <div class="chart-box"><canvas id="chart-month"></canvas></div>
+  </div>
+
+  <script>
+  async function loadTop() {
+    const res = await fetch('/api/top');
+    const data = await res.json();
+    document.getElementById('top-mod').textContent = data.moderators.length;
+    document.getElementById('top-user').textContent = data.targets.length;
+    document.getElementById('top-types').textContent = data.types.length;
+
+    const modEl = document.getElementById('top-mod-content');
+    if (!data.moderators.length) modEl.innerHTML = '<p class="loading">Nessun dato.</p>';
+    else modEl.innerHTML = '<table><thead><tr><th>#</th><th>Moderatore</th><th>Azioni</th></tr></thead><tbody>' +
+      data.moderators.map((m, i) => '<tr><td>#' + (i + 1) + '</td><td>' + (m.moderator || '-') + '</td><td><b>' + m.c + '</b></td></tr>').join('') + '</tbody></table>';
+
+    const userEl = document.getElementById('top-user-content');
+    if (!data.targets.length) userEl.innerHTML = '<p class="loading">Nessun dato.</p>';
+    else userEl.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Azioni</th></tr></thead><tbody>' +
+      data.targets.map((t, i) => '<tr><td>#' + (i + 1) + '</td><td>' + (t.target_id ? '<a class="user-link" href="/user/' + t.target_id + '">' + (t.target || t.target_id) + '</a>' : (t.target || '-')) + '</td><td><b>' + t.c + '</b></td></tr>').join('') + '</tbody></table>';
+
+    if (data.byMonth.length) {
+      new Chart(document.getElementById('chart-month'), {
+        type: 'bar',
+        data: { labels: data.byMonth.map(m => m.month).reverse(), datasets: [{ label: 'Azioni', data: data.byMonth.map(m => m.c).reverse(), backgroundColor: '#5865F2' }] },
+        options: { plugins: { legend: { labels: { color: '#eee' } } }, scales: { x: { ticks: { color: '#888' } }, y: { ticks: { color: '#888' } } } }
+      });
+    }
+  }
+  loadTop();
   </script>`;
 }
 
@@ -1005,9 +1119,7 @@ function renderUserContent(userId) {
 
   <div class="section">
     <h2>📊 Azioni per Tipo</h2>
-    <div class="chart-box" style="max-width:400px;margin:0 auto;">
-      <canvas id="user-chart"></canvas>
-    </div>
+    <div class="chart-box" style="max-width:400px;margin:0 auto;"><canvas id="user-chart"></canvas></div>
   </div>
 
   <div class="section">
@@ -1115,32 +1227,27 @@ function renderSearchContent(q) {
     if (!total) { el.innerHTML = '<p class="loading">Nessun risultato.</p>'; return; }
 
     let html = '';
-
     if (data.blacklist.length) {
       html += '<h3 style="margin-top:20px;">🚫 Blacklist (' + data.blacklist.length + ')</h3>';
       html += '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
         data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td></tr>').join('') + '</tbody></table>';
     }
-
     if (data.notes.length) {
       html += '<h3 style="margin-top:20px;">📝 Note (' + data.notes.length + ')</h3>';
       html += '<table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
         data.notes.map(n => '<tr><td>' + n.id + '</td><td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td><td>' + n.content + '</td></tr>').join('') + '</tbody></table>';
     }
-
     if (data.logs.length) {
       html += '<h3 style="margin-top:20px;">📋 Logs (' + data.logs.length + ')</h3>';
       html += '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
         data.logs.slice(0, 50).map(l => '<tr><td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td><td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + l.target_id + '">' + (l.target || l.target_id) + '</a>' : (l.target || '-')) + '</td><td>' + (l.moderator || '-') + '</td><td>' + (l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
       if (data.logs.length > 50) html += '<p style="color:#888;font-size:12px;">...e altri ' + (data.logs.length - 50) + ' log</p>';
     }
-
     if (data.tickets.length) {
       html += '<h3 style="margin-top:20px;">🎫 Ticket (' + data.tickets.length + ')</h3>';
       html += '<table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
         data.tickets.map(t => '<tr><td>' + t.guild + '</td><td>#' + t.channel + '</td></tr>').join('') + '</tbody></table>';
     }
-
     el.innerHTML = html;
   }
   doSearch();
@@ -1153,6 +1260,7 @@ function renderAccessLogsContent() {
   <div class="section">
     <h2>🔐 Log Accessi Dashboard</h2>
     <p style="color:#888;font-size:13px;margin-bottom:14px;">Ultimi 500 accessi alla dashboard.</p>
+    <div class="export-bar"><a href="/api/export/access-logs.csv">📥 Esporta CSV</a></div>
     <div id="access-content" class="loading">Caricamento...</div>
   </div>
 
