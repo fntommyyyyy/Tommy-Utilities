@@ -1,4 +1,4 @@
-// web.js — Dashboard web completa (Ricerca, Export CSV, Access Logs, Session, Bulk, Top 10)
+// web.js — Dashboard web con Sicurezza (Helmet, Rate Limit, CSRF, Zod)
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -36,17 +36,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
       for (const guild of client.guilds.cache.values()) {
         const member = await guild.members.fetch(userId).catch(() => null);
         if (!member) continue;
-        if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) {
-          return true;
-        }
+        if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) return true;
       }
-    } catch (err) {
-      log.err('isAuthorizedByRole', err);
-    }
+    } catch (err) { log.err('isAuthorizedByRole', err); }
     return false;
   }
 
-  // ==================== HELMET — header di sicurezza ====================
+  // ==================== HELMET ====================
   app.use(helmet({
     contentSecurityPolicy: {
       useDefaults: true,
@@ -71,21 +67,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-  // ==================== SESSION STORE PERSISTENTE ====================
+  // ==================== SESSION STORE ====================
   const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
   try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 
   app.use(session({
-    store: new FileStore({
-      path: SESSION_DIR,
-      ttl: 7 * 24 * 60 * 60,
-      retries: 0,
-      logFn: () => {}
-    }),
+    store: new FileStore({ path: SESSION_DIR, ttl: 7 * 24 * 60 * 60, retries: 0, logFn: () => {} }),
     secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    proxy: true,
+    resave: false, saveUninitialized: false, proxy: true,
     cookie: {
       secure: IS_PROD,
       httpOnly: true,
@@ -94,12 +83,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
   }));
 
-  // ==================== CSRF (double-submit cookie) ====================
+  // ==================== CSRF ====================
   const CSRF_SECRET = process.env.CSRF_SECRET || SESSION_SECRET;
-  const {
-    generateCsrfToken,
-    validateRequest
-  } = doubleCsrf({
+  const { generateCsrfToken, validateRequest } = doubleCsrf({
     getSecret: () => CSRF_SECRET,
     getSessionIdentifier: (req) => (req.session && req.session.user && req.session.user.id) || 'anon',
     cookieName: '_csrf',
@@ -111,50 +97,35 @@ function createWebServer({ storage, client, log, botStartTime }) {
     },
     size: 64,
     ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
-    getCsrfTokenFromRequest: (req) =>
-      (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
+    getCsrfTokenFromRequest: (req) => (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
   });
 
-  // Applica la validazione CSRF a tutte le richieste mutative (tranne /auth/callback che è GET)
   app.use((req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-    // L'OAuth callback è GET, quindi non serve esclusione. Ma per sicurezza
-    // escludiamo solo endpoint pubblici che non hanno sessione.
     if (req.path === '/auth/login') return next();
     return validateRequest(req, res, next);
   });
 
-  // Espone il token CSRF al frontend
   app.get('/api/csrf-token', (req, res) => {
-    try {
-      const token = generateCsrfToken(req, res);
-      res.json({ csrfToken: token });
-    } catch (e) {
-      res.status(500).json({ error: 'Errore CSRF' });
-    }
+    try { res.json({ csrfToken: generateCsrfToken(req, res) }); }
+    catch (e) { res.status(500).json({ error: 'Errore CSRF' }); }
   });
 
-  // ==================== RATE LIMITING ====================
+  // ==================== RATE LIMIT ====================
   const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 10,
-    standardHeaders: true,
-    legacyHeaders: false,
+    windowMs: 15 * 60 * 1000, max: 10,
+    standardHeaders: true, legacyHeaders: false,
     message: { error: 'Troppe richieste di login, riprova più tardi.' }
   });
-
   const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 300,
-    standardHeaders: true,
-    legacyHeaders: false,
+    windowMs: 15 * 60 * 1000, max: 300,
+    standardHeaders: true, legacyHeaders: false,
     message: { error: 'Troppe richieste, riprova più tardi.' }
   });
-
   app.use('/auth', authLimiter);
   app.use('/api', apiLimiter);
 
-  // ==================== VALIDATORI ZOD ====================
+  // ==================== SCHEMI ZOD ====================
   const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
   const guildIdSchema = z.string().regex(/^\d{17,20}$/, 'ID server non valido');
 
@@ -210,24 +181,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
     return r.data;
   }
 
-  // ==================== UTILITY SICUREZZA ====================
+  // ==================== UTILITY ====================
   function escapeHtml(str) {
     if (str === null || str === undefined) return '';
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function apiError(res, e, msg = 'Errore interno') {
-    // log dettagliato server-side, risposta generica al client
     try { log.err('api-error', e); } catch {}
     res.status(500).json({ error: msg });
   }
 
-  // ==================== AUTH GUARD ====================
   function requireAuth(req, res, next) {
     if (!req.session.user) {
       if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
@@ -242,51 +206,31 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // ==================== PUBBLICI ====================
   app.get('/health', (req, res) => {
-    res.json({
-      status: 'ok',
-      uptime: Math.floor((Date.now() - botStartTime) / 1000),
-      guilds: client.guilds.cache.size,
-      ping: client.ws.ping,
-      timestamp: new Date().toISOString()
-    });
+    res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
-
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.0.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.1.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
   app.get('/auth/login', (req, res) => {
     if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('OAuth2 non configurato.');
-    const redirectUri = `${DASHBOARD_URL}/auth/callback`;
-    const params = new URLSearchParams({
-      client_id: CLIENT_ID, redirect_uri: redirectUri,
-      response_type: 'code', scope: 'identify'
-    });
+    const params = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: `${DASHBOARD_URL}/auth/callback`, response_type: 'code', scope: 'identify' });
     res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
   });
 
   app.get('/auth/callback', async (req, res) => {
     const { code } = req.query;
     if (!code) return res.status(400).send('Codice mancante');
-    const redirectUri = `${DASHBOARD_URL}/auth/callback`;
     try {
       const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
-        new URLSearchParams({
-          client_id: CLIENT_ID, client_secret: CLIENT_SECRET,
-          grant_type: 'authorization_code', code, redirect_uri: redirectUri
-        }),
+        new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: `${DASHBOARD_URL}/auth/callback` }),
         { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
       );
-      const userRes = await axios.get('https://discord.com/api/users/@me', {
-        headers: { Authorization: `Bearer ${tokenRes.data.access_token}` },
-        timeout: 10000
-      });
+      const userRes = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }, timeout: 10000 });
       const user = userRes.data;
 
-      const authorized = await isAuthorizedByRole(user.id);
-      if (!authorized) {
-        log.warn(`OAuth: utente ${user.id} (${user.username}) senza ruolo autorizzato`);
+      if (!(await isAuthorizedByRole(user.id))) {
         return res.status(403).send('Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.');
       }
       log.ok(`OAuth login riuscito per ${user.username} (${user.id})`);
@@ -297,14 +241,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
         storage.saveDashboardAccess(user.id, user.username, ip, ua);
       } catch (e) { log.err('saveDashboardAccess', e); }
 
-      // Rigenera la sessione per prevenire session fixation
       req.session.regenerate((err) => {
         if (err) return res.status(500).send('Errore login');
-        req.session.user = {
-          id: user.id, username: user.username,
-          global_name: user.global_name || user.username, avatar: user.avatar,
-          dashboardAuthorized: true
-        };
+        req.session.user = { id: user.id, username: user.username, global_name: user.global_name || user.username, avatar: user.avatar, dashboardAuthorized: true };
         req.session.save(() => res.redirect('/dashboard'));
       });
     } catch (err) {
@@ -320,11 +259,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/api/stats', requireAuth, (req, res) => {
     try {
       const s = storage.getStats();
-      res.json({
-        logs: s.total, blacklist: s.blacklist,
-        guilds: client.guilds.cache.size, ping: client.ws.ping,
-        uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType
-      });
+      res.json({ logs: s.total, blacklist: s.blacklist, guilds: client.guilds.cache.size, ping: client.ws.ping, uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType });
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
 
@@ -344,7 +279,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
     try { res.json({ ok: storage.removeFromBlacklist(req.params.userId) }); } catch (e) { apiError(res, e); }
   });
-
   app.post('/api/blacklist/bulk-delete', requireAuth, (req, res) => {
     const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
     if (!data) return;
@@ -420,11 +354,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       if (data.message !== undefined && data.message !== null) storage.setWelcomeMessage(guildId, data.message);
       if (data.embedEnabled !== undefined) {
         const current = storage.getWelcomeConfig(guildId);
-        storage.setWelcomeConfig(guildId, {
-          channelId: current?.channel_id ?? null,
-          message: current?.message ?? null,
-          embedEnabled: data.embedEnabled
-        });
+        storage.setWelcomeConfig(guildId, { channelId: current?.channel_id ?? null, message: current?.message ?? null, embedEnabled: data.embedEnabled });
       }
       res.json({ ok: true });
     } catch (e) { apiError(res, e); }
@@ -436,11 +366,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-')) {
-            tickets.push({
-              guild: guild.name, guildId: guild.id,
-              channel: ch.name, channelId: ch.id,
-              userId: ch.name.replace('ticket-', '')
-            });
+            tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id, userId: ch.name.replace('ticket-', '') });
           }
         }
       }
@@ -491,33 +417,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/api/charts', requireAuth, (req, res) => {
     try {
       const byType = storage.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type').all();
-      const byDay = storage.db.prepare(
-        "SELECT substr(timestamp,1,10) as day, COUNT(*) as c FROM mod_logs GROUP BY day ORDER BY day DESC LIMIT 30"
-      ).all();
+      const byDay = storage.db.prepare("SELECT substr(timestamp,1,10) as day, COUNT(*) as c FROM mod_logs GROUP BY day ORDER BY day DESC LIMIT 30").all();
       res.json({ byType, byDay });
     } catch (e) { res.json({ byType: [], byDay: [] }); }
   });
 
   app.get('/api/top', requireAuth, (req, res) => {
     try {
-      const moderators = storage.db.prepare(`
-        SELECT moderator, COUNT(*) as c FROM mod_logs
-        WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico'
-        GROUP BY moderator ORDER BY c DESC LIMIT 10
-      `).all();
-      const targets = storage.db.prepare(`
-        SELECT target_id, target, COUNT(*) as c FROM mod_logs
-        WHERE target_id IS NOT NULL
-        GROUP BY target_id ORDER BY c DESC LIMIT 10
-      `).all();
-      const types = storage.db.prepare(`
-        SELECT type, COUNT(*) as c FROM mod_logs
-        GROUP BY type ORDER BY c DESC
-      `).all();
-      const byMonth = storage.db.prepare(`
-        SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs
-        GROUP BY month ORDER BY month DESC LIMIT 12
-      `).all();
+      const moderators = storage.db.prepare(`SELECT moderator, COUNT(*) as c FROM mod_logs WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico' GROUP BY moderator ORDER BY c DESC LIMIT 10`).all();
+      const targets = storage.db.prepare(`SELECT target_id, target, COUNT(*) as c FROM mod_logs WHERE target_id IS NOT NULL GROUP BY target_id ORDER BY c DESC LIMIT 10`).all();
+      const types = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type ORDER BY c DESC`).all();
+      const byMonth = storage.db.prepare(`SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs GROUP BY month ORDER BY month DESC LIMIT 12`).all();
       res.json({ moderators, targets, types, byMonth });
     } catch (e) {
       log.err('api/top', e);
@@ -536,7 +446,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // --- UTENTE ---
   app.get('/api/user/:userId', requireAuth, (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
@@ -553,37 +462,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
         }
       }
       const byTypeMap = logs.reduce((acc, l) => { acc[l.type] = (acc[l.type] || 0) + 1; return acc; }, {});
-      res.json({
-        userId, logs, notes,
-        blacklist: blacklistEntry, tickets,
-        byType: Object.entries(byTypeMap).map(([type, c]) => ({ type, c }))
-      });
-    } catch (e) {
-      apiError(res, e, 'Errore caricamento utente');
-    }
+      res.json({ userId, logs, notes, blacklist: blacklistEntry, tickets, byType: Object.entries(byTypeMap).map(([type, c]) => ({ type, c })) });
+    } catch (e) { apiError(res, e, 'Errore caricamento utente'); }
   });
 
-  // ==================== RICERCA ====================
   app.get('/api/search', requireAuth, (req, res) => {
     const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
     try {
-      const blacklist = storage.getAllBlacklist().filter(e =>
-        (e.user_id || '').toLowerCase().includes(q) ||
-        (e.username || '').toLowerCase().includes(q) ||
-        (e.reason || '').toLowerCase().includes(q)
-      );
-      const notes = storage.getAllNotes().filter(n =>
-        (n.user_id || '').toLowerCase().includes(q) ||
-        (n.content || '').toLowerCase().includes(q) ||
-        (n.author_tag || '').toLowerCase().includes(q)
-      );
-      const logs = storage.getAllLogs(500).filter(l =>
-        (l.target_id || '').toLowerCase().includes(q) ||
-        (l.target || '').toLowerCase().includes(q) ||
-        (l.moderator || '').toLowerCase().includes(q) ||
-        (l.reason || '').toLowerCase().includes(q)
-      );
+      const blacklist = storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q));
+      const notes = storage.getAllNotes().filter(n => (n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q));
+      const logs = storage.getAllLogs(500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
@@ -593,63 +482,51 @@ function createWebServer({ storage, client, log, botStartTime }) {
         }
       }
       res.json({ blacklist, notes, logs, tickets });
-    } catch (e) {
-      apiError(res, e, 'Errore ricerca');
-    }
+    } catch (e) { apiError(res, e, 'Errore ricerca'); }
   });
 
-  // ==================== EXPORT CSV ====================
   function toCsv(rows, headers) {
     if (!rows.length) return headers.join(',');
     const esc = (v) => {
       const s = (v === null || v === undefined) ? '' : String(v);
       return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    return headers.join(',') + '\n' +
-      rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
+    return headers.join(',') + '\n' + rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
   }
 
   app.get('/api/export/blacklist.csv', requireAuth, (req, res) => {
     try {
-      const rows = storage.getAllBlacklist();
-      const csv = toCsv(rows, ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
+      const csv = toCsv(storage.getAllBlacklist(), ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="blacklist.csv"');
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
-
   app.get('/api/export/notes.csv', requireAuth, (req, res) => {
     try {
-      const rows = storage.getAllNotes();
-      const csv = toCsv(rows, ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']);
+      const csv = toCsv(storage.getAllNotes(), ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="notes.csv"');
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
-
   app.get('/api/export/logs.csv', requireAuth, (req, res) => {
     try {
-      const rows = storage.getAllLogs(5000);
-      const csv = toCsv(rows, ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'timestamp']);
+      const csv = toCsv(storage.getAllLogs(5000), ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'timestamp']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
-
   app.get('/api/export/access-logs.csv', requireAuth, (req, res) => {
     try {
-      const rows = storage.getDashboardAccessLogs();
-      const csv = toCsv(rows, ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
+      const csv = toCsv(storage.getDashboardAccessLogs(), ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="access-logs.csv"');
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
 
-  // ==================== ACCESS LOGS ====================
   app.get('/api/access-logs', requireAuth, (req, res) => {
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
@@ -660,9 +537,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const out = [];
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
-          if (ch.type === 0) {
-            out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
-          }
+          if (ch.type === 0) out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
         }
       }
       out.sort((a, b) => a.guildName.localeCompare(b.guildName) || a.channelName.localeCompare(b.channelName));
@@ -676,23 +551,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try {
       const channel = await client.channels.fetch(data.channelId).catch(() => null);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
-
       const botMember = channel.guild?.members?.me;
-      if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) {
-        return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
-      }
+      if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
 
       const payload = {};
       if (data.content) payload.content = data.content;
-
       if (data.embed && (data.embed.title || data.embed.description)) {
         const { EmbedBuilder } = require('discord.js');
         const e = new EmbedBuilder();
         if (data.embed.title) e.setTitle(String(data.embed.title).slice(0, 256));
         if (data.embed.description) e.setDescription(String(data.embed.description).slice(0, 4096));
-        if (data.embed.color) {
-          try { e.setColor(data.embed.color); } catch {}
-        }
+        if (data.embed.color) { try { e.setColor(data.embed.color); } catch {} }
         if (data.embed.image) e.setImage(data.embed.image);
         if (data.embed.thumbnail) e.setThumbnail(data.embed.thumbnail);
         if (data.embed.footer) e.setFooter({ text: String(data.embed.footer).slice(0, 2048) });
@@ -700,129 +569,80 @@ function createWebServer({ storage, client, log, botStartTime }) {
       }
 
       const sent = await channel.send(payload);
-
       try {
-        storage.saveDashboardAccess(
-          req.session.user.id,
-          `MSG→#${channel.name} (${channel.guild?.name || 'DM'})`,
-          (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-',
-          (req.headers['user-agent'] || '').slice(0, 300)
-        );
+        storage.saveDashboardAccess(req.session.user.id, `MSG→#${channel.name} (${channel.guild?.name || 'DM'})`, (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-', (req.headers['user-agent'] || '').slice(0, 300));
       } catch {}
-
       res.json({ ok: true, messageId: sent.id, channelId: channel.id });
-    } catch (e) {
-      apiError(res, e, 'Errore invio messaggio');
-    }
+    } catch (e) { apiError(res, e, 'Errore invio messaggio'); }
   });
 
-  // ==================== GESTIONE UTENTI ====================
+  // ==================== AZIONI UTENTE ====================
   app.get('/api/user-lookup/:userId', requireAuth, async (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
     try {
       const user = await client.users.fetch(userId).catch(() => null);
       if (!user) return res.status(404).json({ error: 'Utente non trovato' });
-
       const memberships = [];
       for (const guild of client.guilds.cache.values()) {
         const member = await guild.members.fetch(userId).catch(() => null);
         if (member) {
-          memberships.push({
-            guildId: guild.id, guildName: guild.name,
-            joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name)
-          });
+          memberships.push({ guildId: guild.id, guildName: guild.name, joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name) });
         }
       }
-      res.json({
-        id: user.id, username: user.username, tag: user.tag, bot: user.bot,
-        avatar: user.displayAvatarURL({ size: 128 }), createdAt: user.createdAt,
-        memberships
-      });
-    } catch (e) {
-      apiError(res, e, 'Errore lookup utente');
-    }
+      res.json({ id: user.id, username: user.username, tag: user.tag, bot: user.bot, avatar: user.displayAvatarURL({ size: 128 }), createdAt: user.createdAt, memberships });
+    } catch (e) { apiError(res, e, 'Errore lookup utente'); }
   });
 
   app.post('/api/user-action', requireAuth, async (req, res) => {
     const data = parseOrFail(schemaUserAction, req.body || {}, res);
     if (!data) return;
     const { action, userId, guildId, reason } = data;
-
     try {
       const guild = client.guilds.cache.get(guildId);
       if (!guild) return res.status(404).json({ error: 'Server non trovato' });
-
       const botMember = guild.members.me;
       if (!botMember) return res.status(500).json({ error: 'Bot non nel server' });
-
       const r = (reason || `Azione da dashboard (${req.session.user.username})`).slice(0, 512);
 
       if (action === 'kick') {
-        if (!botMember.permissions.has('KickMembers'))
-          return res.status(403).json({ error: 'Il bot non ha "Espelli Membri"' });
+        if (!botMember.permissions.has('KickMembers')) return res.status(403).json({ error: 'Il bot non ha "Espelli Membri"' });
         const member = await guild.members.fetch(userId).catch(() => null);
         if (!member) return res.status(404).json({ error: 'Utente non nel server' });
         if (member.id === guild.ownerId) return res.status(403).json({ error: 'Non puoi espellere il proprietario' });
-        if (member.roles.highest.position >= botMember.roles.highest.position)
-          return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
+        if (member.roles.highest.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
         if (!member.kickable) return res.status(403).json({ error: 'Utente non espellibile' });
         await member.kick(r);
-        storage.saveLog({
-          type: 'Kick (dashboard)', targetId: userId,
-          target: `${member.user.tag} (${userId})`,
-          moderator: `${req.session.user.username} (${req.session.user.id})`,
-          reason: r, channel: 'Web Dashboard'
-        });
+        storage.saveLog({ type: 'Kick (dashboard)', targetId: userId, target: `${member.user.tag} (${userId})`, moderator: `${req.session.user.username} (${req.session.user.id})`, reason: r, channel: 'Web Dashboard' });
       }
 
       if (action === 'ban') {
-        if (!botMember.permissions.has('BanMembers'))
-          return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
+        if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
         if (userId === guild.ownerId) return res.status(403).json({ error: 'Non puoi bannare il proprietario' });
         const member = await guild.members.fetch(userId).catch(() => null);
         if (member) {
-          if (member.roles.highest.position >= botMember.roles.highest.position)
-            return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
+          if (member.roles.highest.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
           if (!member.bannable) return res.status(403).json({ error: 'Utente non bannabile' });
         }
         await guild.members.ban(userId, { reason: r });
-        storage.saveLog({
-          type: 'Ban (dashboard)', targetId: userId,
-          target: member ? `${member.user.tag} (${userId})` : userId,
-          moderator: `${req.session.user.username} (${req.session.user.id})`,
-          reason: r, channel: 'Web Dashboard'
-        });
+        storage.saveLog({ type: 'Ban (dashboard)', targetId: userId, target: member ? `${member.user.tag} (${userId})` : userId, moderator: `${req.session.user.username} (${req.session.user.id})`, reason: r, channel: 'Web Dashboard' });
       }
 
       if (action === 'unban') {
-        if (!botMember.permissions.has('BanMembers'))
-          return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
+        if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
         let ban = null;
         try { ban = await guild.bans.fetch(userId); } catch (e) { if (e.code !== 10026) throw e; }
         if (!ban) return res.status(404).json({ error: 'Utente non bannato' });
         await guild.members.unban(userId, r);
-        storage.saveLog({
-          type: 'Unban (dashboard)', targetId: userId,
-          target: `${ban.user.tag} (${userId})`,
-          moderator: `${req.session.user.username} (${req.session.user.id})`,
-          reason: r, channel: 'Web Dashboard'
-        });
+        storage.saveLog({ type: 'Unban (dashboard)', targetId: userId, target: `${ban.user.tag} (${userId})`, moderator: `${req.session.user.username} (${req.session.user.id})`, reason: r, channel: 'Web Dashboard' });
       }
 
       try {
-        storage.saveDashboardAccess(
-          req.session.user.id,
-          `${action.toUpperCase()} ${userId} su ${guild.name}`,
-          (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-',
-          (req.headers['user-agent'] || '').slice(0, 300)
-        );
+        storage.saveDashboardAccess(req.session.user.id, `${action.toUpperCase()} ${userId} su ${guild.name}`, (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-', (req.headers['user-agent'] || '').slice(0, 300));
       } catch {}
 
       res.json({ ok: true, action, userId, guildId });
-    } catch (e) {
-      apiError(res, e, 'Errore azione utente');
-    }
+    } catch (e) { apiError(res, e, 'Errore azione utente'); }
   });
 
   // ==================== PAGINE HTML ====================
@@ -859,19 +679,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
     pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
   });
 
-  // ==================== ERROR HANDLER ====================
   app.use((err, req, res, next) => {
     log.err('web-error', err);
     if (req.path.startsWith('/api/')) return res.status(500).json({ error: 'Errore interno' });
     res.status(500).send('Errore interno');
   });
 
-  // ==================== AVVIO ====================
   const server = app.listen(PORT, HOST, () => {
     log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
     log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
-    log.info(`   Ruoli autorizzati: ${DASHBOARD_ROLES.join(', ')}`);
-    if (ENV_ADMIN_IDS.length) log.info(`   Fallback admin IDs: ${ENV_ADMIN_IDS.length}`);
     log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓`);
   });
 
@@ -890,9 +706,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
 // ============================================================
 function renderLayout(user, page, params = {}, security = {}) {
   const name = escapeHtml(user.global_name || user.username);
-  const avatar = user.avatar
-    ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64`
-    : `https://cdn.discordapp.com/embed/avatars/0.png`;
+  const avatar = user.avatar ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64` : `https://cdn.discordapp.com/embed/avatars/0.png`;
   const csrfToken = security.csrfToken || '';
   const safeQ = escapeHtml(params.q || '');
 
@@ -920,7 +734,6 @@ function renderLayout(user, page, params = {}, security = {}) {
 <meta name="csrf-token" content="${escapeHtml(csrfToken)}">
 <title>Dashboard - ${escapeHtml(page)}</title>
 <script>
-  // Helper API globale con CSRF automatico
   window.__CSRF__ = document.querySelector('meta[name="csrf-token"]').content;
   window.apiFetch = async function(url, options = {}) {
     const opts = Object.assign({}, options);
@@ -1031,12 +844,7 @@ function renderLayout(user, page, params = {}, security = {}) {
 // ==================== UTILITY HTML ====================
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ---------- DASHBOARD ----------
