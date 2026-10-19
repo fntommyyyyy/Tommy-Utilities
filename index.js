@@ -52,7 +52,6 @@ function formatDuration(seconds) {
   return `${Math.floor(seconds / 86400)}g`;
 }
 
-// Converte "10m", "1h", "2d", "30s" in millisecondi
 function parseDuration(input) {
   if (!input) return null;
   const m = String(input).trim().match(/^(\d+)\s*(s|m|h|d)$/i);
@@ -294,7 +293,7 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold) {
   const config = storage.getAntiNukeConfig(guild.id);
   const whitelist = config.whitelist_ids.split(',').map(s => s.trim()).filter(Boolean);
   if (whitelist.includes(executorId)) return;
-  if (executorId === guild.ownerId) return; // Il proprietario del server è sempre immune
+  if (executorId === guild.ownerId) return;
 
   const windowMs = config.window_ms || 10000;
   const count = trackAction(guild.id, executorId, actionType, windowMs);
@@ -1636,7 +1635,11 @@ const slashCommands = [
 
   new SlashCommandBuilder().setName('lock').setDescription('Blocca il canale')
     .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
-  new SlashCommandBuilder().setName('unlock').setDescription('Sblocca il canale')
+  new SlashCommandBuilder().setName('unlock').setDescription('Sblocca il canale'),
+
+  new SlashCommandBuilder().setName('antinuke').setDescription('Gestione Anti-Nuke')
+    .addSubcommand(s => s.setName('whitelist').setDescription('Aggiungi un utente alla whitelist')
+      .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true)))
 ];
 
 // ==================== REGISTRAZIONE COMANDI ====================
@@ -2645,6 +2648,36 @@ async function handleSlashCommand(interaction) {
         return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve "Gestisci Canali".')], ephemeral: true });
       const res = await CommandLogic.unlockChannel(interaction.channel, member);
       return interaction.reply({ embeds: [buildResultEmbed({ ...res, title: 'Canale Sbloccato' })], ephemeral: !res.success });
+    }
+
+    case 'antinuke': {
+      if (!isAdmin(member)) {
+        return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Solo Admin.')], ephemeral: true });
+      }
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'whitelist') {
+        const target = interaction.options.getUser('utente');
+        const config = storage.getAntiNukeConfig(guild.id);
+        const currentWhitelist = config.whitelist_ids.split(',').map(s => s.trim()).filter(Boolean);
+        
+        if (!currentWhitelist.includes(target.id)) {
+          currentWhitelist.push(target.id);
+          storage.setAntiNukeConfig(guild.id, {
+            ...config,
+            whitelist_ids: currentWhitelist.join(',')
+          });
+          return interaction.reply({
+            embeds: [EmbedManager.success('Whitelist Aggiornata', `${target.username} è ora immune all'Anti-Nuke.`)],
+            ephemeral: true
+          });
+        } else {
+          return interaction.reply({
+            embeds: [EmbedManager.info('Già in Whitelist', `${target.username} è già immune.`)],
+            ephemeral: true
+          });
+        }
+      }
+      break;
     }
 
     default:
