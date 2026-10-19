@@ -6,12 +6,20 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
+// ==================== SICUREZZA — import ====================
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { doubleCsrf } = require('csrf-csrf');
+const { z } = require('zod');
+
 function createWebServer({ storage, client, log, botStartTime }) {
   const app = express();
   const PORT = parseInt(process.env.PORT) || 3000;
   const HOST = process.env.WEB_HOST || '0.0.0.0';
+  const IS_PROD = process.env.NODE_ENV === 'production';
 
   app.set('trust proxy', 1);
+  app.disable('x-powered-by');
 
   const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
   const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
@@ -38,10 +46,32 @@ function createWebServer({ storage, client, log, botStartTime }) {
     return false;
   }
 
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: true }));
+  // ==================== HELMET — header di sicurezza ====================
+  app.use(helmet({
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        'default-src': ["'self'"],
+        'script-src': ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+        'style-src': ["'self'", "'unsafe-inline'"],
+        'img-src': ["'self'", "data:", "https://cdn.discordapp.com"],
+        'connect-src': ["'self'"],
+        'frame-ancestors': ["'none'"],
+        'object-src': ["'none'"],
+        'base-uri': ["'self'"],
+        'form-action': ["'self'"]
+      }
+    },
+    crossOriginEmbedderPolicy: false,
+    hsts: IS_PROD ? { maxAge: 15552000, includeSubDomains: true } : false,
+    referrerPolicy: { policy: 'no-referrer' }
+  }));
 
-  // ===== SESSION STORE PERSISTENTE =====
+  // ==================== BODY LIMITS ====================
+  app.use(express.json({ limit: '100kb' }));
+  app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+
+  // ==================== SESSION STORE PERSISTENTE ====================
   const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
   try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 
@@ -57,13 +87,147 @@ function createWebServer({ storage, client, log, botStartTime }) {
     saveUninitialized: false,
     proxy: true,
     cookie: {
-      secure: process.env.NODE_ENV === 'production',
+      secure: IS_PROD,
       httpOnly: true,
-      sameSite: 'none',
+      sameSite: IS_PROD ? 'none' : 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000
     }
   }));
 
+  // ==================== CSRF (double-submit cookie) ====================
+  const CSRF_SECRET = process.env.CSRF_SECRET || SESSION_SECRET;
+  const {
+    generateCsrfToken,
+    validateRequest
+  } = doubleCsrf({
+    getSecret: () => CSRF_SECRET,
+    getSessionIdentifier: (req) => (req.session && req.session.user && req.session.user.id) || 'anon',
+    cookieName: '_csrf',
+    cookieOptions: {
+      httpOnly: true,
+      sameSite: IS_PROD ? 'none' : 'lax',
+      secure: IS_PROD,
+      path: '/'
+    },
+    size: 64,
+    ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
+    getCsrfTokenFromRequest: (req) =>
+      (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
+  });
+
+  // Applica la validazione CSRF a tutte le richieste mutative (tranne /auth/callback che è GET)
+  app.use((req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    // L'OAuth callback è GET, quindi non serve esclusione. Ma per sicurezza
+    // escludiamo solo endpoint pubblici che non hanno sessione.
+    if (req.path === '/auth/login') return next();
+    return validateRequest(req, res, next);
+  });
+
+  // Espone il token CSRF al frontend
+  app.get('/api/csrf-token', (req, res) => {
+    try {
+      const token = generateCsrfToken(req, res);
+      res.json({ csrfToken: token });
+    } catch (e) {
+      res.status(500).json({ error: 'Errore CSRF' });
+    }
+  });
+
+  // ==================== RATE LIMITING ====================
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Troppe richieste di login, riprova più tardi.' }
+  });
+
+  const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Troppe richieste, riprova più tardi.' }
+  });
+
+  app.use('/auth', authLimiter);
+  app.use('/api', apiLimiter);
+
+  // ==================== VALIDATORI ZOD ====================
+  const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
+  const guildIdSchema = z.string().regex(/^\d{17,20}$/, 'ID server non valido');
+
+  const schemaBlacklistAdd = z.object({
+    userId: userIdSchema,
+    username: z.string().min(1).max(64),
+    reason: z.string().min(1).max(500)
+  });
+  const schemaBulkDelete = z.object({
+    ids: z.array(z.union([z.string(), z.number()])).min(1).max(500)
+  });
+  const schemaConfig = z.object({
+    autoroleId: z.string().regex(/^\d{17,20}$/).nullable().optional(),
+    logChannelId: z.string().regex(/^\d{17,20}$/).nullable().optional()
+  });
+  const schemaWelcome = z.object({
+    channelId: z.string().regex(/^\d{17,20}$/).nullable().optional(),
+    message: z.string().max(2000).nullable().optional(),
+    embedEnabled: z.boolean().optional()
+  });
+  const schemaCommandAdd = z.object({
+    name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i, 'Nome comando non valido'),
+    response: z.string().min(1).max(4096)
+  });
+  const schemaMessagesSend = z.object({
+    channelId: z.string().regex(/^\d{17,20}$/),
+    content: z.string().max(2000).optional(),
+    embed: z.object({
+      title: z.string().max(256).optional(),
+      description: z.string().max(4096).optional(),
+      color: z.string().max(20).optional(),
+      image: z.string().url().max(500).optional(),
+      thumbnail: z.string().url().max(500).optional(),
+      footer: z.string().max(2048).optional()
+    }).optional()
+  }).refine(d => (d.content && d.content.length > 0) || (d.embed && (d.embed.title || d.embed.description)), {
+    message: 'Testo o embed obbligatorio'
+  });
+  const schemaUserAction = z.object({
+    action: z.enum(['kick', 'ban', 'unban']),
+    userId: userIdSchema,
+    guildId: guildIdSchema,
+    reason: z.string().max(512).optional().default('')
+  });
+
+  function parseOrFail(schema, data, res) {
+    const r = schema.safeParse(data);
+    if (!r.success) {
+      const issues = r.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
+      res.status(400).json({ error: `Dati non validi — ${issues}` });
+      return null;
+    }
+    return r.data;
+  }
+
+  // ==================== UTILITY SICUREZZA ====================
+  function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function apiError(res, e, msg = 'Errore interno') {
+    // log dettagliato server-side, risposta generica al client
+    try { log.err('api-error', e); } catch {}
+    res.status(500).json({ error: msg });
+  }
+
+  // ==================== AUTH GUARD ====================
   function requireAuth(req, res, next) {
     if (!req.session.user) {
       if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
@@ -112,10 +276,11 @@ function createWebServer({ storage, client, log, botStartTime }) {
           client_id: CLIENT_ID, client_secret: CLIENT_SECRET,
           grant_type: 'authorization_code', code, redirect_uri: redirectUri
         }),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
       );
       const userRes = await axios.get('https://discord.com/api/users/@me', {
-        headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }
+        headers: { Authorization: `Bearer ${tokenRes.data.access_token}` },
+        timeout: 10000
       });
       const user = userRes.data;
 
@@ -132,12 +297,16 @@ function createWebServer({ storage, client, log, botStartTime }) {
         storage.saveDashboardAccess(user.id, user.username, ip, ua);
       } catch (e) { log.err('saveDashboardAccess', e); }
 
-      req.session.user = {
-        id: user.id, username: user.username,
-        global_name: user.global_name || user.username, avatar: user.avatar,
-        dashboardAuthorized: true
-      };
-      req.session.save(() => res.redirect('/dashboard'));
+      // Rigenera la sessione per prevenire session fixation
+      req.session.regenerate((err) => {
+        if (err) return res.status(500).send('Errore login');
+        req.session.user = {
+          id: user.id, username: user.username,
+          global_name: user.global_name || user.username, avatar: user.avatar,
+          dashboardAuthorized: true
+        };
+        req.session.save(() => res.redirect('/dashboard'));
+      });
     } catch (err) {
       log.err('OAuth', err.response?.data || err.message);
       res.status(500).send('Errore login');
@@ -149,150 +318,174 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // ==================== API ====================
   app.get('/api/stats', requireAuth, (req, res) => {
-    const s = storage.getStats();
-    res.json({
-      logs: s.total, blacklist: s.blacklist,
-      guilds: client.guilds.cache.size, ping: client.ws.ping,
-      uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType
-    });
+    try {
+      const s = storage.getStats();
+      res.json({
+        logs: s.total, blacklist: s.blacklist,
+        guilds: client.guilds.cache.size, ping: client.ws.ping,
+        uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType
+      });
+    } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
 
-  app.get('/api/blacklist', requireAuth, (req, res) => res.json(storage.getAllBlacklist()));
+  app.get('/api/blacklist', requireAuth, (req, res) => {
+    try { res.json(storage.getAllBlacklist()); } catch (e) { apiError(res, e); }
+  });
   app.post('/api/blacklist', requireAuth, (req, res) => {
-    const { userId, username, reason } = req.body || {};
-    if (!userId || !username || !reason) return res.status(400).json({ error: 'Campi mancanti' });
-    if (storage.isBlacklisted(userId)) return res.status(409).json({ error: 'Già in blacklist' });
-    storage.addToBlacklist(userId, username, reason, req.session.user.id, req.session.user.username);
-    res.json({ ok: true });
+    const data = parseOrFail(schemaBlacklistAdd, req.body || {}, res);
+    if (!data) return;
+    try {
+      if (storage.isBlacklisted(data.userId)) return res.status(409).json({ error: 'Già in blacklist' });
+      storage.addToBlacklist(data.userId, data.username, data.reason, req.session.user.id, req.session.user.username);
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e); }
   });
   app.delete('/api/blacklist/:userId', requireAuth, (req, res) => {
-    res.json({ ok: storage.removeFromBlacklist(req.params.userId) });
+    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
+    try { res.json({ ok: storage.removeFromBlacklist(req.params.userId) }); } catch (e) { apiError(res, e); }
   });
 
   app.post('/api/blacklist/bulk-delete', requireAuth, (req, res) => {
+    const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
+    if (!data) return;
     try {
-      const { ids } = req.body || {};
-      if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'Nessun ID' });
       let count = 0;
-      for (const id of ids) if (storage.removeFromBlacklist(id)) count++;
+      for (const id of data.ids) if (storage.removeFromBlacklist(String(id))) count++;
       res.json({ ok: true, count });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/logs/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
   });
   app.get('/api/logs/:userId', requireAuth, (req, res) => {
-    res.json(storage.getLogsForUser(req.params.userId));
+    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
+    try { res.json(storage.getLogsForUser(req.params.userId)); } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/notes/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
   });
   app.delete('/api/notes/:id', requireAuth, (req, res) => {
-    try {
-      const ok = storage.deleteNoteById(parseInt(req.params.id));
-      res.json({ ok });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'ID non valido' });
+    try { res.json({ ok: storage.deleteNoteById(id) }); } catch (e) { apiError(res, e); }
   });
   app.post('/api/notes/bulk-delete', requireAuth, (req, res) => {
+    const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
+    if (!data) return;
     try {
-      const { ids } = req.body || {};
-      if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: 'Nessun ID' });
       let count = 0;
-      for (const id of ids) if (storage.deleteNoteById(parseInt(id))) count++;
+      for (const id of data.ids) if (storage.deleteNoteById(parseInt(id, 10))) count++;
       res.json({ ok: true, count });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/config/:guildId', requireAuth, (req, res) => {
-    res.json(storage.getGuildConfig(req.params.guildId));
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    try { res.json(storage.getGuildConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
   });
   app.post('/api/config/:guildId', requireAuth, (req, res) => {
-    const { autoroleId, logChannelId } = req.body || {};
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    const data = parseOrFail(schemaConfig, req.body || {}, res);
+    if (!data) return;
     const guildId = req.params.guildId;
     try {
-      if (autoroleId !== undefined) {
-        if (autoroleId) storage.setAutorole(guildId, autoroleId);
+      if (data.autoroleId !== undefined) {
+        if (data.autoroleId) storage.setAutorole(guildId, data.autoroleId);
         else storage.clearAutorole(guildId);
       }
-      if (logChannelId !== undefined) {
-        if (logChannelId) storage.setLogChannel(guildId, logChannelId);
+      if (data.logChannelId !== undefined) {
+        if (data.logChannelId) storage.setLogChannel(guildId, data.logChannelId);
         else storage.clearLogChannel(guildId);
       }
       res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
-    res.json(storage.getWelcomeConfig(req.params.guildId) || {});
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    try { res.json(storage.getWelcomeConfig(req.params.guildId) || {}); } catch (e) { apiError(res, e); }
   });
   app.post('/api/welcome/:guildId', requireAuth, (req, res) => {
-    const { channelId, message, embedEnabled } = req.body || {};
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    const data = parseOrFail(schemaWelcome, req.body || {}, res);
+    if (!data) return;
     const guildId = req.params.guildId;
     try {
-      if (channelId !== undefined) {
-        if (channelId) storage.setWelcomeChannel(guildId, channelId);
+      if (data.channelId !== undefined) {
+        if (data.channelId) storage.setWelcomeChannel(guildId, data.channelId);
         else storage.disableWelcome(guildId);
       }
-      if (message !== undefined && message !== null) storage.setWelcomeMessage(guildId, message);
-      if (embedEnabled !== undefined) {
+      if (data.message !== undefined && data.message !== null) storage.setWelcomeMessage(guildId, data.message);
+      if (data.embedEnabled !== undefined) {
         const current = storage.getWelcomeConfig(guildId);
         storage.setWelcomeConfig(guildId, {
           channelId: current?.channel_id ?? null,
           message: current?.message ?? null,
-          embedEnabled
+          embedEnabled: data.embedEnabled
         });
       }
       res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/tickets', requireAuth, (req, res) => {
-    const tickets = [];
-    for (const guild of client.guilds.cache.values()) {
-      for (const ch of guild.channels.cache.values()) {
-        if (ch.name && ch.name.startsWith('ticket-')) {
-          tickets.push({
-            guild: guild.name, guildId: guild.id,
-            channel: ch.name, channelId: ch.id,
-            userId: ch.name.replace('ticket-', '')
-          });
+    try {
+      const tickets = [];
+      for (const guild of client.guilds.cache.values()) {
+        for (const ch of guild.channels.cache.values()) {
+          if (ch.name && ch.name.startsWith('ticket-')) {
+            tickets.push({
+              guild: guild.name, guildId: guild.id,
+              channel: ch.name, channelId: ch.id,
+              userId: ch.name.replace('ticket-', '')
+            });
+          }
         }
       }
-    }
-    res.json(tickets);
+      res.json(tickets);
+    } catch (e) { apiError(res, e); }
   });
   app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
+    if (!/^\d{17,20}$/.test(req.params.channelId)) return res.status(400).json({ error: 'ID canale non valido' });
     try {
       const ch = await client.channels.fetch(req.params.channelId).catch(() => null);
       if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
+      if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
       await ch.delete('Chiuso dalla dashboard web');
       res.json({ ok: true });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/commands', requireAuth, (req, res) => {
-    const cmds = storage.loadCommands();
-    res.json(Object.entries(cmds).map(([name, response]) => ({ name, response })));
+    try {
+      const cmds = storage.loadCommands();
+      res.json(Object.entries(cmds).map(([name, response]) => ({ name, response })));
+    } catch (e) { apiError(res, e); }
   });
   app.post('/api/commands', requireAuth, (req, res) => {
-    const { name, response } = req.body || {};
-    if (!name || !response) return res.status(400).json({ error: 'Campi mancanti' });
-    storage.saveCommand(name.toLowerCase(), response);
-    res.json({ ok: true });
+    const data = parseOrFail(schemaCommandAdd, req.body || {}, res);
+    if (!data) return;
+    try {
+      storage.saveCommand(data.name.toLowerCase(), data.response);
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e); }
   });
   app.delete('/api/commands/:name', requireAuth, (req, res) => {
-    res.json({ ok: storage.deleteCommand(req.params.name.toLowerCase()) });
+    const name = String(req.params.name || '').toLowerCase();
+    if (!/^[a-z0-9_-]{1,50}$/.test(name)) return res.status(400).json({ error: 'Nome non valido' });
+    try { res.json({ ok: storage.deleteCommand(name) }); } catch (e) { apiError(res, e); }
   });
   app.post('/api/commands/bulk-delete', requireAuth, (req, res) => {
+    const schema = z.object({ names: z.array(z.string().regex(/^[a-z0-9_-]{1,50}$/i)).min(1).max(500) });
+    const data = parseOrFail(schema, req.body || {}, res);
+    if (!data) return;
     try {
-      const { names } = req.body || {};
-      if (!Array.isArray(names) || !names.length) return res.status(400).json({ error: 'Nessun nome' });
       let count = 0;
-      for (const n of names) if (storage.deleteCommand(n)) count++;
+      for (const n of data.names) if (storage.deleteCommand(n)) count++;
       res.json({ ok: true, count });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/charts', requireAuth, (req, res) => {
@@ -333,17 +526,20 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   app.get('/api/guilds', requireAuth, (req, res) => {
-    const guilds = client.guilds.cache.map(g => ({
-      id: g.id, name: g.name,
-      roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
-      channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
-    }));
-    res.json(guilds);
+    try {
+      const guilds = client.guilds.cache.map(g => ({
+        id: g.id, name: g.name,
+        roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
+        channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
+      }));
+      res.json(guilds);
+    } catch (e) { apiError(res, e); }
   });
 
   // --- UTENTE ---
   app.get('/api/user/:userId', requireAuth, (req, res) => {
     const userId = req.params.userId;
+    if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
     try {
       const logs = storage.getLogsForUser(userId);
       const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(userId);
@@ -363,14 +559,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
         byType: Object.entries(byTypeMap).map(([type, c]) => ({ type, c }))
       });
     } catch (e) {
-      log.err('api/user', e);
-      res.status(500).json({ error: e.message });
+      apiError(res, e, 'Errore caricamento utente');
     }
   });
 
   // ==================== RICERCA ====================
   app.get('/api/search', requireAuth, (req, res) => {
-    const q = (req.query.q || '').toString().trim().toLowerCase();
+    const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
     try {
       const blacklist = storage.getAllBlacklist().filter(e =>
@@ -399,8 +594,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       }
       res.json({ blacklist, notes, logs, tickets });
     } catch (e) {
-      log.err('api/search', e);
-      res.status(500).json({ error: e.message });
+      apiError(res, e, 'Errore ricerca');
     }
   });
 
@@ -409,42 +603,50 @@ function createWebServer({ storage, client, log, botStartTime }) {
     if (!rows.length) return headers.join(',');
     const esc = (v) => {
       const s = (v === null || v === undefined) ? '' : String(v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     return headers.join(',') + '\n' +
       rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
   }
 
   app.get('/api/export/blacklist.csv', requireAuth, (req, res) => {
-    const rows = storage.getAllBlacklist();
-    const csv = toCsv(rows, ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="blacklist.csv"');
-    res.send(csv);
+    try {
+      const rows = storage.getAllBlacklist();
+      const csv = toCsv(rows, ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="blacklist.csv"');
+      res.send(csv);
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/export/notes.csv', requireAuth, (req, res) => {
-    const rows = storage.getAllNotes();
-    const csv = toCsv(rows, ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="notes.csv"');
-    res.send(csv);
+    try {
+      const rows = storage.getAllNotes();
+      const csv = toCsv(rows, ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="notes.csv"');
+      res.send(csv);
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/export/logs.csv', requireAuth, (req, res) => {
-    const rows = storage.getAllLogs(5000);
-    const csv = toCsv(rows, ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'timestamp']);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
-    res.send(csv);
+    try {
+      const rows = storage.getAllLogs(5000);
+      const csv = toCsv(rows, ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'timestamp']);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
+      res.send(csv);
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/export/access-logs.csv', requireAuth, (req, res) => {
-    const rows = storage.getDashboardAccessLogs();
-    const csv = toCsv(rows, ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="access-logs.csv"');
-    res.send(csv);
+    try {
+      const rows = storage.getDashboardAccessLogs();
+      const csv = toCsv(rows, ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename="access-logs.csv"');
+      res.send(csv);
+    } catch (e) { apiError(res, e); }
   });
 
   // ==================== ACCESS LOGS ====================
@@ -453,29 +655,26 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   // ==================== MESSAGGI ====================
-  // Lista canali testuali di tutti i server (per il select)
   app.get('/api/messages/channels', requireAuth, (req, res) => {
-    const out = [];
-    for (const guild of client.guilds.cache.values()) {
-      for (const ch of guild.channels.cache.values()) {
-        if (ch.type === 0) {
-          out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
+    try {
+      const out = [];
+      for (const guild of client.guilds.cache.values()) {
+        for (const ch of guild.channels.cache.values()) {
+          if (ch.type === 0) {
+            out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
+          }
         }
       }
-    }
-    out.sort((a, b) => a.guildName.localeCompare(b.guildName) || a.channelName.localeCompare(b.channelName));
-    res.json(out);
+      out.sort((a, b) => a.guildName.localeCompare(b.guildName) || a.channelName.localeCompare(b.channelName));
+      res.json(out);
+    } catch (e) { apiError(res, e); }
   });
 
-  // Invio messaggio (testo + embed opzionale)
   app.post('/api/messages/send', requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaMessagesSend, req.body || {}, res);
+    if (!data) return;
     try {
-      const { channelId, content, embed } = req.body || {};
-      if (!channelId) return res.status(400).json({ error: 'channelId mancante' });
-      if (!content && !embed) return res.status(400).json({ error: 'Contenuto vuoto' });
-      if (content && content.length > 2000) return res.status(400).json({ error: 'Testo max 2000 caratteri' });
-
-      const channel = await client.channels.fetch(channelId).catch(() => null);
+      const channel = await client.channels.fetch(data.channelId).catch(() => null);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
 
       const botMember = channel.guild?.members?.me;
@@ -484,17 +683,19 @@ function createWebServer({ storage, client, log, botStartTime }) {
       }
 
       const payload = {};
-      if (content) payload.content = content;
+      if (data.content) payload.content = data.content;
 
-      if (embed && (embed.title || embed.description)) {
+      if (data.embed && (data.embed.title || data.embed.description)) {
         const { EmbedBuilder } = require('discord.js');
         const e = new EmbedBuilder();
-        if (embed.title) e.setTitle(String(embed.title).slice(0, 256));
-        if (embed.description) e.setDescription(String(embed.description).slice(0, 4096));
-        if (embed.color) e.setColor(embed.color);
-        if (embed.image) e.setImage(embed.image);
-        if (embed.thumbnail) e.setThumbnail(embed.thumbnail);
-        if (embed.footer) e.setFooter({ text: String(embed.footer).slice(0, 2048) });
+        if (data.embed.title) e.setTitle(String(data.embed.title).slice(0, 256));
+        if (data.embed.description) e.setDescription(String(data.embed.description).slice(0, 4096));
+        if (data.embed.color) {
+          try { e.setColor(data.embed.color); } catch {}
+        }
+        if (data.embed.image) e.setImage(data.embed.image);
+        if (data.embed.thumbnail) e.setThumbnail(data.embed.thumbnail);
+        if (data.embed.footer) e.setFooter({ text: String(data.embed.footer).slice(0, 2048) });
         payload.embeds = [e];
       }
 
@@ -511,8 +712,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
       res.json({ ok: true, messageId: sent.id, channelId: channel.id });
     } catch (e) {
-      log.err('api/messages/send', e);
-      res.status(500).json({ error: e.message });
+      apiError(res, e, 'Errore invio messaggio');
     }
   });
 
@@ -540,24 +740,22 @@ function createWebServer({ storage, client, log, botStartTime }) {
         memberships
       });
     } catch (e) {
-      log.err('api/user-lookup', e);
-      res.status(500).json({ error: e.message });
+      apiError(res, e, 'Errore lookup utente');
     }
   });
 
   app.post('/api/user-action', requireAuth, async (req, res) => {
-    const { action, userId, guildId, reason } = req.body || {};
-    if (!['kick', 'ban', 'unban'].includes(action))
-      return res.status(400).json({ error: 'Azione non valida' });
-    if (!/^\d{17,20}$/.test(userId || ''))
-      return res.status(400).json({ error: 'userId non valido' });
-    if (!guildId) return res.status(400).json({ error: 'guildId mancante' });
+    const data = parseOrFail(schemaUserAction, req.body || {}, res);
+    if (!data) return;
+    const { action, userId, guildId, reason } = data;
 
     try {
       const guild = client.guilds.cache.get(guildId);
       if (!guild) return res.status(404).json({ error: 'Server non trovato' });
 
       const botMember = guild.members.me;
+      if (!botMember) return res.status(500).json({ error: 'Bot non nel server' });
+
       const r = (reason || `Azione da dashboard (${req.session.user.username})`).slice(0, 512);
 
       if (action === 'kick') {
@@ -623,27 +821,50 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
       res.json({ ok: true, action, userId, guildId });
     } catch (e) {
-      log.err('api/user-action', e);
-      res.status(500).json({ error: e.message });
+      apiError(res, e, 'Errore azione utente');
     }
   });
 
   // ==================== PAGINE HTML ====================
-  app.get('/dashboard', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'dashboard')));
-  app.get('/modlogs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'modlogs')));
-  app.get('/notes', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'notes')));
-  app.get('/tickets', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'tickets')));
-  app.get('/commands', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'commands')));
-  app.get('/config', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'config')));
-  app.get('/charts', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'charts')));
-  app.get('/top', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'top')));
-  app.get('/user/:userId', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'user', { userId: req.params.userId })));
-  app.get('/search', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'search', { q: (req.query.q || '').toString() })));
-  app.get('/access-logs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'accesslogs')));
-  app.get('/messages', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'messages')));
-  app.get('/user-actions', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'userActions')));
-  app.get('/user-actions/:userId', requireAuth, (req, res) =>
-    res.send(renderLayout(req.session.user, 'userActions', { userId: req.params.userId })));
+  const pageHandler = (page, paramsFn) => (req, res, next) => {
+    try {
+      const params = paramsFn ? paramsFn(req) : {};
+      res.send(renderLayout(req.session.user, page, params, {
+        csrfToken: (() => { try { return generateCsrfToken(req, res); } catch { return ''; } })()
+      }));
+    } catch (e) {
+      log.err(`page ${page}`, e);
+      res.status(500).send('Errore rendering');
+    }
+  };
+
+  app.get('/dashboard', requireAuth, pageHandler('dashboard'));
+  app.get('/modlogs', requireAuth, pageHandler('modlogs'));
+  app.get('/notes', requireAuth, pageHandler('notes'));
+  app.get('/tickets', requireAuth, pageHandler('tickets'));
+  app.get('/commands', requireAuth, pageHandler('commands'));
+  app.get('/config', requireAuth, pageHandler('config'));
+  app.get('/charts', requireAuth, pageHandler('charts'));
+  app.get('/top', requireAuth, pageHandler('top'));
+  app.get('/user/:userId', requireAuth, (req, res, next) => {
+    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).send('ID non valido');
+    pageHandler('user', r => ({ userId: r.params.userId }))(req, res, next);
+  });
+  app.get('/search', requireAuth, pageHandler('search', r => ({ q: (r.query.q || '').toString().slice(0, 100) })));
+  app.get('/access-logs', requireAuth, pageHandler('accesslogs'));
+  app.get('/messages', requireAuth, pageHandler('messages'));
+  app.get('/user-actions', requireAuth, pageHandler('userActions'));
+  app.get('/user-actions/:userId', requireAuth, (req, res, next) => {
+    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).send('ID non valido');
+    pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
+  });
+
+  // ==================== ERROR HANDLER ====================
+  app.use((err, req, res, next) => {
+    log.err('web-error', err);
+    if (req.path.startsWith('/api/')) return res.status(500).json({ error: 'Errore interno' });
+    res.status(500).send('Errore interno');
+  });
 
   // ==================== AVVIO ====================
   const server = app.listen(PORT, HOST, () => {
@@ -651,6 +872,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
     log.info(`   Ruoli autorizzati: ${DASHBOARD_ROLES.join(', ')}`);
     if (ENV_ADMIN_IDS.length) log.info(`   Fallback admin IDs: ${ENV_ADMIN_IDS.length}`);
+    log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓`);
   });
 
   server.on('error', (err) => {
@@ -666,11 +888,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
 // ============================================================
 // ================= HTML — TUTTE LE PAGINE ===================
 // ============================================================
-function renderLayout(user, page, params = {}) {
-  const name = user.global_name || user.username;
+function renderLayout(user, page, params = {}, security = {}) {
+  const name = escapeHtml(user.global_name || user.username);
   const avatar = user.avatar
-    ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64`
+    ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64`
     : `https://cdn.discordapp.com/embed/avatars/0.png`;
+  const csrfToken = security.csrfToken || '';
+  const safeQ = escapeHtml(params.q || '');
 
   const pages = {
     dashboard: renderDashboardContent(),
@@ -693,7 +917,24 @@ function renderLayout(user, page, params = {}) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dashboard - ${page}</title>
+<meta name="csrf-token" content="${escapeHtml(csrfToken)}">
+<title>Dashboard - ${escapeHtml(page)}</title>
+<script>
+  // Helper API globale con CSRF automatico
+  window.__CSRF__ = document.querySelector('meta[name="csrf-token"]').content;
+  window.apiFetch = async function(url, options = {}) {
+    const opts = Object.assign({}, options);
+    opts.headers = Object.assign({}, opts.headers || {});
+    const method = (opts.method || 'GET').toUpperCase();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+      opts.headers['X-CSRF-Token'] = window.__CSRF__;
+      if (opts.body && typeof opts.body === 'string' && !opts.headers['Content-Type']) {
+        opts.headers['Content-Type'] = 'application/json';
+      }
+    }
+    return fetch(url, opts);
+  };
+</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -758,7 +999,7 @@ function renderLayout(user, page, params = {}) {
     <h1>🤖 Dashboard Bot</h1>
     <div class="search-box">
       <form action="/search" method="get">
-        <input type="text" name="q" placeholder="🔍 Cerca utente, motivo, moderatore..." value="${params.q || ''}">
+        <input type="text" name="q" placeholder="🔍 Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
       </form>
     </div>
     <div class="user">
@@ -787,6 +1028,17 @@ function renderLayout(user, page, params = {}) {
 </html>`;
 }
 
+// ==================== UTILITY HTML ====================
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ---------- DASHBOARD ----------
 function renderDashboardContent() {
   return `
@@ -801,9 +1053,9 @@ function renderDashboardContent() {
   <div class="section">
     <h2>➕ Aggiungi alla Blacklist</h2>
     <div class="form-row">
-      <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)">
-      <input type="text" id="bl-username" placeholder="Username">
-      <input type="text" id="bl-reason" placeholder="Motivo">
+      <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)" maxlength="20">
+      <input type="text" id="bl-username" placeholder="Username" maxlength="64">
+      <input type="text" id="bl-reason" placeholder="Motivo" maxlength="500">
       <button onclick="addBL()">Aggiungi</button>
     </div>
     <div id="bl-msg"></div>
@@ -819,8 +1071,11 @@ function renderDashboardContent() {
   </div>
 
   <script>
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
   async function loadStats() {
-    const res = await fetch('/api/stats'); if (!res.ok) return;
+    const res = await apiFetch('/api/stats'); if (!res.ok) return;
     const s = await res.json();
     document.getElementById('stat-logs').textContent = s.logs;
     document.getElementById('stat-bl').textContent = s.blacklist;
@@ -830,12 +1085,12 @@ function renderDashboardContent() {
     document.getElementById('stat-uptime').textContent = h + 'h ' + m + 'm';
   }
   async function loadBlacklist() {
-    const res = await fetch('/api/blacklist');
+    const res = await apiFetch('/api/blacklist');
     const list = await res.json();
     const el = document.getElementById('blacklist-content');
     if (!list.length) { el.innerHTML = '<p class="loading">Nessun utente in blacklist.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="bl-select-all" onclick="toggleAllBL()"></th><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
-      list.map(e => '<tr><td><input type="checkbox" class="bl-check" value="' + e.user_id + '"></td><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a><br><small style="color:#666">' + e.user_id + '</small></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td><td><button class="danger small" onclick="removeBL(\\'' + e.user_id + '\\')">Rimuovi</button></td></tr>').join('') +
+      list.map(e => '<tr><td><input type="checkbox" class="bl-check" value="' + esc(e.user_id) + '"></td><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a><br><small style="color:#666">' + esc(e.user_id) + '</small></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td><td><button class="danger small" onclick="removeBL(\\'' + esc(e.user_id) + '\\')">Rimuovi</button></td></tr>').join('') +
       '</tbody></table>';
   }
   function toggleAllBL() {
@@ -846,7 +1101,7 @@ function renderDashboardContent() {
     const ids = Array.from(document.querySelectorAll('.bl-check:checked')).map(c => c.value);
     if (!ids.length) { alert('Nessun utente selezionato'); return; }
     if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist?')) return;
-    const res = await fetch('/api/blacklist/bulk-delete', {
+    const res = await apiFetch('/api/blacklist/bulk-delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids })
     });
@@ -860,7 +1115,7 @@ function renderDashboardContent() {
     const reason = document.getElementById('bl-reason').value.trim();
     const msg = document.getElementById('bl-msg');
     if (!userId || !username || !reason) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await fetch('/api/blacklist', {
+    const res = await apiFetch('/api/blacklist', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ userId, username, reason })
     });
@@ -871,11 +1126,11 @@ function renderDashboardContent() {
       document.getElementById('bl-username').value = '';
       document.getElementById('bl-reason').value = '';
       loadBlacklist(); loadStats();
-    } else { msg.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>'; }
+    } else { msg.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; }
   }
   async function removeBL(userId) {
     if (!confirm('Rimuovere ' + userId + ' dalla blacklist?')) return;
-    await fetch('/api/blacklist/' + userId, { method: 'DELETE' });
+    await apiFetch('/api/blacklist/' + encodeURIComponent(userId), { method: 'DELETE' });
     loadBlacklist(); loadStats();
   }
   loadStats(); loadBlacklist();
@@ -901,15 +1156,16 @@ function renderModlogsContent() {
         <option value="Lock">Lock</option>
         <option value="Unlock">Unlock</option>
       </select>
-      <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()">
+      <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()" maxlength="20">
     </div>
     <div id="logs-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let allLogs = [];
   async function loadLogs() {
-    if (!allLogs.length) { const res = await fetch('/api/logs/all'); allLogs = await res.json(); }
+    if (!allLogs.length) { const res = await apiFetch('/api/logs/all'); allLogs = await res.json(); }
     const type = document.getElementById('filter-type').value;
     const userId = document.getElementById('filter-user').value.trim();
     let logs = allLogs;
@@ -919,12 +1175,12 @@ function renderModlogsContent() {
     if (!logs.length) { el.innerHTML = '<p class="loading">Nessun log trovato.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
       logs.map(l => '<tr>' +
-        '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
-        '<td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td>' +
-        '<td>' + (l.target_id ? '<a class="user-link" href="/user/' + l.target_id + '">' + (l.target || l.target_id) + '</a>' : (l.target || '-')) + '</td>' +
-        '<td>' + (l.moderator || '-') + '</td>' +
-        '<td>' + (l.reason || '-') + '</td>' +
-        '<td>' + (l.duration || '-') + '</td>' +
+        '<td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td>' +
+        '<td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td>' +
+        '<td>' + (l.target_id ? '<a class="user-link" href="/user/' + esc(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td>' +
+        '<td>' + esc(l.moderator || '-') + '</td>' +
+        '<td>' + esc(l.reason || '-') + '</td>' +
+        '<td>' + esc(l.duration || '-') + '</td>' +
       '</tr>').join('') + '</tbody></table>';
   }
   loadLogs();
@@ -944,13 +1200,14 @@ function renderNotesContent() {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   async function loadNotes() {
-    const res = await fetch('/api/notes/all');
+    const res = await apiFetch('/api/notes/all');
     const notes = await res.json();
     const el = document.getElementById('notes-content');
     if (!notes.length) { el.innerHTML = '<p class="loading">Nessuna nota.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="note-select-all" onclick="toggleAllNotes()"></th><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      notes.map(n => '<tr><td><input type="checkbox" class="note-check" value="' + n.id + '"></td><td>' + n.id + '</td><td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td><td>' + n.author_tag + '</td><td>' + n.content + '</td><td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td><td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+      notes.map(n => '<tr><td><input type="checkbox" class="note-check" value="' + esc(n.id) + '"></td><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + esc(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.author_tag) + '</td><td>' + esc(n.content) + '</td><td>' + esc(new Date(n.created_at).toLocaleString('it-IT')) + '</td><td><button class="danger small" onclick="deleteNote(' + esc(n.id) + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
   }
   function toggleAllNotes() {
     const checked = document.getElementById('note-select-all').checked;
@@ -960,7 +1217,7 @@ function renderNotesContent() {
     const ids = Array.from(document.querySelectorAll('.note-check:checked')).map(c => c.value);
     if (!ids.length) { alert('Nessuna nota selezionata'); return; }
     if (!confirm('Eliminare ' + ids.length + ' note?')) return;
-    const res = await fetch('/api/notes/bulk-delete', {
+    const res = await apiFetch('/api/notes/bulk-delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ids })
     });
@@ -970,7 +1227,7 @@ function renderNotesContent() {
   }
   async function deleteNote(id) {
     if (!confirm('Eliminare la nota #' + id + '?')) return;
-    const res = await fetch('/api/notes/' + id, { method: 'DELETE' });
+    const res = await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
     if (res.ok) loadNotes();
     else alert('Errore durante l\\'eliminazione');
   }
@@ -988,22 +1245,23 @@ function renderTicketsContent() {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   async function loadTickets() {
-    const res = await fetch('/api/tickets');
+    const res = await apiFetch('/api/tickets');
     const tickets = await res.json();
     const el = document.getElementById('tickets-content');
     if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente (ID)</th><th></th></tr></thead><tbody>' +
       tickets.map(t => '<tr>' +
-        '<td>' + t.guild + '</td>' +
-        '<td>#' + t.channel + '</td>' +
-        '<td><a class="user-link" href="/user/' + t.userId + '">' + t.userId + '</a></td>' +
-        '<td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td>' +
+        '<td>' + esc(t.guild) + '</td>' +
+        '<td>#' + esc(t.channel) + '</td>' +
+        '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
+        '<td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
       '</tr>').join('') + '</tbody></table>';
   }
   async function closeTicket(channelId) {
     if (!confirm('Chiudere ed eliminare questo ticket? Il canale verrà cancellato su Discord.')) return;
-    const res = await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
+    const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
     if (res.ok) loadTickets();
     else { const data = await res.json(); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
@@ -1018,8 +1276,8 @@ function renderCommandsContent() {
   <div class="section">
     <h2>➕ Aggiungi Comando Custom</h2>
     <div class="form-row">
-      <input type="text" id="cmd-name" placeholder="Nome (es. regole)">
-      <input type="text" id="cmd-response" placeholder="Risposta">
+      <input type="text" id="cmd-name" placeholder="Nome (es. regole)" maxlength="50">
+      <input type="text" id="cmd-response" placeholder="Risposta" maxlength="4096">
       <button onclick="addCmd()">Aggiungi</button>
     </div>
     <div id="cmd-msg"></div>
@@ -1034,13 +1292,14 @@ function renderCommandsContent() {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   async function loadCmds() {
-    const res = await fetch('/api/commands');
+    const res = await apiFetch('/api/commands');
     const cmds = await res.json();
     const el = document.getElementById('commands-content');
     if (!cmds.length) { el.innerHTML = '<p class="loading">Nessun comando custom.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
-      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + c.name + '"></td><td><code>-' + c.name + '</code></td><td>' + c.response + '</td><td><button class="danger small" onclick="removeCmd(\\'' + c.name + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + esc(c.name) + '"></td><td><code>-' + esc(c.name) + '</code></td><td>' + esc(c.response) + '</td><td><button class="danger small" onclick="removeCmd(\\'' + esc(c.name) + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table>';
   }
   function toggleAllCmds() {
     const checked = document.getElementById('cmd-select-all').checked;
@@ -1050,7 +1309,7 @@ function renderCommandsContent() {
     const names = Array.from(document.querySelectorAll('.cmd-check:checked')).map(c => c.value);
     if (!names.length) { alert('Nessun comando selezionato'); return; }
     if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
-    const res = await fetch('/api/commands/bulk-delete', {
+    const res = await apiFetch('/api/commands/bulk-delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ names })
     });
@@ -1063,7 +1322,7 @@ function renderCommandsContent() {
     const response = document.getElementById('cmd-response').value.trim();
     const msg = document.getElementById('cmd-msg');
     if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await fetch('/api/commands', {
+    const res = await apiFetch('/api/commands', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, response })
     });
@@ -1076,7 +1335,7 @@ function renderCommandsContent() {
   }
   async function removeCmd(name) {
     if (!confirm('Eliminare il comando -' + name + '?')) return;
-    await fetch('/api/commands/' + name, { method: 'DELETE' });
+    await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
     loadCmds();
   }
   loadCmds();
@@ -1095,13 +1354,14 @@ function renderConfigContent() {
   <div id="config-content"></div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let guildsData = [];
 
   async function loadGuilds() {
-    const res = await fetch('/api/guilds');
+    const res = await apiFetch('/api/guilds');
     guildsData = await res.json();
     const sel = document.getElementById('guild-select');
-    sel.innerHTML = guildsData.map(g => '<option value="' + g.id + '">' + g.name + '</option>').join('');
+    sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
     if (guildsData.length) loadGuildConfig();
   }
 
@@ -1111,8 +1371,8 @@ function renderConfigContent() {
     if (!guild) return;
 
     const [configRes, welcomeRes] = await Promise.all([
-      fetch('/api/config/' + guildId),
-      fetch('/api/welcome/' + guildId)
+      apiFetch('/api/config/' + encodeURIComponent(guildId)),
+      apiFetch('/api/welcome/' + encodeURIComponent(guildId))
     ]);
     const config = await configRes.json();
     const welcome = await welcomeRes.json();
@@ -1124,9 +1384,9 @@ function renderConfigContent() {
           <h3>🎭 Autorole</h3>
           <select id="cfg-autorole">
             <option value="">— Nessuno —</option>
-            \${guild.roles.map(r => '<option value="' + r.id + '" ' + (config.autorole_id === r.id ? 'selected' : '') + '>' + r.name + '</option>').join('')}
+            \${guild.roles.map(r => '<option value="' + esc(r.id) + '" ' + (config.autorole_id === r.id ? 'selected' : '') + '>' + esc(r.name) + '</option>').join('')}
           </select>
-          <button onclick="saveAutorole('\\\${guildId}')">Salva</button>
+          <button onclick="saveAutorole('\\\${esc(guildId)}')">Salva</button>
           <div id="autorole-msg"></div>
         </div>
 
@@ -1134,9 +1394,9 @@ function renderConfigContent() {
           <h3>📋 Canale Log Moderazione</h3>
           <select id="cfg-logchannel">
             <option value="">— Nessuno —</option>
-            \${guild.channels.map(c => '<option value="' + c.id + '" ' + (config.log_channel_id === c.id ? 'selected' : '') + '>#' + c.name + '</option>').join('')}
+            \${guild.channels.map(c => '<option value="' + esc(c.id) + '" ' + (config.log_channel_id === c.id ? 'selected' : '') + '>#' + esc(c.name) + '</option>').join('')}
           </select>
-          <button onclick="saveLogChannel('\\\${guildId}')">Salva</button>
+          <button onclick="saveLogChannel('\\\${esc(guildId)}')">Salva</button>
           <div id="logchannel-msg"></div>
         </div>
 
@@ -1145,15 +1405,15 @@ function renderConfigContent() {
           <label style="font-size:13px;color:#888;">Canale di benvenuto</label>
           <select id="cfg-welcomechannel">
             <option value="">— Disattivato —</option>
-            \${guild.channels.map(c => '<option value="' + c.id + '" ' + (welcome.channel_id === c.id ? 'selected' : '') + '>#' + c.name + '</option>').join('')}
+            \${guild.channels.map(c => '<option value="' + esc(c.id) + '" ' + (welcome.channel_id === c.id ? 'selected' : '') + '>#' + esc(c.name) + '</option>').join('')}
           </select>
           <label style="font-size:13px;color:#888;">Messaggio (usa {user}, {username}, {server}, {memberCount})</label>
-          <textarea id="cfg-welcomemessage" rows="3" placeholder="Benvenuto {user} in {server}!">\${welcome.message || ''}</textarea>
+          <textarea id="cfg-welcomemessage" rows="3" placeholder="Benvenuto {user} in {server}!">\${esc(welcome.message || '')}</textarea>
           <label style="font-size:13px;color:#888;">
             <input type="checkbox" id="cfg-welcomeembed" style="width:auto;margin-right:6px;" \${welcome.embed_enabled ? 'checked' : ''}>
             Usa formato embed
           </label>
-          <br><button onclick="saveWelcome('\\\${guildId}')">Salva</button>
+          <br><button onclick="saveWelcome('\\\${esc(guildId)}')">Salva</button>
           <div id="welcome-msg"></div>
         </div>
       </div>
@@ -1162,7 +1422,7 @@ function renderConfigContent() {
 
   async function saveAutorole(guildId) {
     const autoroleId = document.getElementById('cfg-autorole').value || null;
-    const res = await fetch('/api/config/' + guildId, {
+    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ autoroleId })
     });
@@ -1171,7 +1431,7 @@ function renderConfigContent() {
   }
   async function saveLogChannel(guildId) {
     const logChannelId = document.getElementById('cfg-logchannel').value || null;
-    const res = await fetch('/api/config/' + guildId, {
+    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ logChannelId })
     });
@@ -1182,7 +1442,7 @@ function renderConfigContent() {
     const channelId = document.getElementById('cfg-welcomechannel').value || null;
     const message = document.getElementById('cfg-welcomemessage').value;
     const embedEnabled = document.getElementById('cfg-welcomeembed').checked;
-    const res = await fetch('/api/welcome/' + guildId, {
+    const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ channelId, message, embedEnabled })
     });
@@ -1206,7 +1466,7 @@ function renderChartsContent() {
 
   <script>
   async function loadCharts() {
-    const res = await fetch('/api/charts');
+    const res = await apiFetch('/api/charts');
     const data = await res.json();
     const colors = ['#5865F2','#ed4245','#faa61a','#00FF00','#9B59B6','#1ABC9C'];
     new Chart(document.getElementById('chart-types'), {
@@ -1252,8 +1512,9 @@ function renderTopContent() {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   async function loadTop() {
-    const res = await fetch('/api/top');
+    const res = await apiFetch('/api/top');
     const data = await res.json();
     document.getElementById('top-mod').textContent = data.moderators.length;
     document.getElementById('top-user').textContent = data.targets.length;
@@ -1262,12 +1523,12 @@ function renderTopContent() {
     const modEl = document.getElementById('top-mod-content');
     if (!data.moderators.length) modEl.innerHTML = '<p class="loading">Nessun dato.</p>';
     else modEl.innerHTML = '<table><thead><tr><th>#</th><th>Moderatore</th><th>Azioni</th></tr></thead><tbody>' +
-      data.moderators.map((m, i) => '<tr><td>#' + (i + 1) + '</td><td>' + (m.moderator || '-') + '</td><td><b>' + m.c + '</b></td></tr>').join('') + '</tbody></table>';
+      data.moderators.map((m, i) => '<tr><td>#' + (i + 1) + '</td><td>' + esc(m.moderator || '-') + '</td><td><b>' + esc(m.c) + '</b></td></tr>').join('') + '</tbody></table>';
 
     const userEl = document.getElementById('top-user-content');
     if (!data.targets.length) userEl.innerHTML = '<p class="loading">Nessun dato.</p>';
     else userEl.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Azioni</th></tr></thead><tbody>' +
-      data.targets.map((t, i) => '<tr><td>#' + (i + 1) + '</td><td>' + (t.target_id ? '<a class="user-link" href="/user/' + t.target_id + '">' + (t.target || t.target_id) + '</a>' : (t.target || '-')) + '</td><td><b>' + t.c + '</b></td></tr>').join('') + '</tbody></table>';
+      data.targets.map((t, i) => '<tr><td>#' + (i + 1) + '</td><td>' + (t.target_id ? '<a class="user-link" href="/user/' + esc(t.target_id) + '">' + esc(t.target || t.target_id) + '</a>' : esc(t.target || '-')) + '</td><td><b>' + esc(t.c) + '</b></td></tr>').join('') + '</tbody></table>';
 
     if (data.byMonth.length) {
       new Chart(document.getElementById('chart-month'), {
@@ -1283,11 +1544,12 @@ function renderTopContent() {
 
 // ---------- PAGINA UTENTE ----------
 function renderUserContent(userId) {
+  const safeUserId = escapeHtml(userId);
   return `
   <div class="section">
-    <h2>👤 Utente <code>${userId}</code></h2>
+    <h2>👤 Utente <code>${safeUserId}</code></h2>
     <p style="color:#888;font-size:13px;">Dettagli completi su questo utente.</p>
-    <a href="/user-actions/${userId}"><button class="secondary small" style="margin-top:10px;">🛠️ Gestisci utente</button></a>
+    <a href="/user-actions/${encodeURIComponent(userId)}"><button class="secondary small" style="margin-top:10px;">🛠️ Gestisci utente</button></a>
   </div>
 
   <div class="grid">
@@ -1323,11 +1585,12 @@ function renderUserContent(userId) {
   </div>
 
   <script>
-  const USER_ID = '${userId}';
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  const USER_ID = ${JSON.stringify(userId)};
   let chartInstance = null;
 
   async function loadUser() {
-    const res = await fetch('/api/user/' + USER_ID);
+    const res = await apiFetch('/api/user/' + encodeURIComponent(USER_ID));
     if (!res.ok) { document.getElementById('u-logs').textContent = 'Errore'; return; }
     const data = await res.json();
 
@@ -1342,7 +1605,7 @@ function renderUserContent(userId) {
       const b = data.blacklist;
       document.getElementById('user-blacklist-content').innerHTML =
         '<table><thead><tr><th>Username</th><th>Motivo</th><th>Aggiunto da</th><th>Data</th><th></th></tr></thead><tbody>' +
-        '<tr><td>' + b.username + '</td><td>' + b.reason + '</td><td>' + b.moderator_tag + '</td><td>' + new Date(b.added_at).toLocaleString('it-IT') + '</td><td><button class="danger small" onclick="removeBL()">Rimuovi</button></td></tr></tbody></table>';
+        '<tr><td>' + esc(b.username) + '</td><td>' + esc(b.reason) + '</td><td>' + esc(b.moderator_tag) + '</td><td>' + esc(new Date(b.added_at).toLocaleString('it-IT')) + '</td><td><button class="danger small" onclick="removeBL()">Rimuovi</button></td></tr></tbody></table>';
     }
 
     if (data.byType.length) {
@@ -1360,32 +1623,32 @@ function renderUserContent(userId) {
     const logsEl = document.getElementById('user-logs-content');
     if (!data.logs.length) logsEl.innerHTML = '<p class="loading">Nessun log.</p>';
     else logsEl.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
-      data.logs.map(l => '<tr><td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td><td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td><td>' + (l.moderator || '-') + '</td><td>' + (l.reason || '-') + '</td><td>' + (l.duration || '-') + '</td></tr>').join('') + '</tbody></table>';
+      data.logs.map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td><td>' + esc(l.duration || '-') + '</td></tr>').join('') + '</tbody></table>';
 
     const notesEl = document.getElementById('user-notes-content');
     if (!data.notes.length) notesEl.innerHTML = '<p class="loading">Nessuna nota.</p>';
     else notesEl.innerHTML = '<table><thead><tr><th>#</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      data.notes.map(n => '<tr><td>' + n.id + '</td><td>' + n.author_tag + '</td><td>' + n.content + '</td><td>' + new Date(n.created_at).toLocaleString('it-IT') + '</td><td><button class="danger small" onclick="deleteNote(' + n.id + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+      data.notes.map(n => '<tr><td>' + esc(n.id) + '</td><td>' + esc(n.author_tag) + '</td><td>' + esc(n.content) + '</td><td>' + esc(new Date(n.created_at).toLocaleString('it-IT')) + '</td><td><button class="danger small" onclick="deleteNote(' + esc(n.id) + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
 
     const ticketsEl = document.getElementById('user-tickets-content');
     if (!data.tickets.length) ticketsEl.innerHTML = '<p class="loading">Nessun ticket aperto.</p>';
     else ticketsEl.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th></th></tr></thead><tbody>' +
-      data.tickets.map(t => '<tr><td>' + t.guild + '</td><td>#' + t.channel + '</td><td><button class="danger small" onclick="closeTicket(\\'' + t.channelId + '\\')">Chiudi</button></td></tr>').join('') + '</tbody></table>';
+      data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td><td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td></tr>').join('') + '</tbody></table>';
   }
 
   async function removeBL() {
     if (!confirm('Rimuovere ' + USER_ID + ' dalla blacklist?')) return;
-    await fetch('/api/blacklist/' + USER_ID, { method: 'DELETE' });
+    await apiFetch('/api/blacklist/' + encodeURIComponent(USER_ID), { method: 'DELETE' });
     loadUser();
   }
   async function deleteNote(id) {
     if (!confirm('Eliminare la nota #' + id + '?')) return;
-    await fetch('/api/notes/' + id, { method: 'DELETE' });
+    await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
     loadUser();
   }
   async function closeTicket(channelId) {
     if (!confirm('Chiudere questo ticket? Il canale verrà cancellato.')) return;
-    await fetch('/api/tickets/' + channelId, { method: 'DELETE' });
+    await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
     loadUser();
   }
   loadUser();
@@ -1396,17 +1659,18 @@ function renderUserContent(userId) {
 function renderSearchContent(q) {
   return `
   <div class="section">
-    <h2>🔍 Risultati per "${q}"</h2>
+    <h2>🔍 Risultati per "${escapeHtml(q)}"</h2>
     <div id="search-content" class="loading">Ricerca in corso...</div>
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   const QUERY = ${JSON.stringify(q)};
 
   async function doSearch() {
     const el = document.getElementById('search-content');
     if (!QUERY.trim()) { el.innerHTML = '<p class="loading">Inserisci un termine di ricerca.</p>'; return; }
-    const res = await fetch('/api/search?q=' + encodeURIComponent(QUERY));
+    const res = await apiFetch('/api/search?q=' + encodeURIComponent(QUERY));
     const data = await res.json();
     const total = data.blacklist.length + data.notes.length + data.logs.length + data.tickets.length;
     if (!total) { el.innerHTML = '<p class="loading">Nessun risultato.</p>'; return; }
@@ -1415,23 +1679,23 @@ function renderSearchContent(q) {
     if (data.blacklist.length) {
       html += '<h3 style="margin-top:20px;">🚫 Blacklist (' + data.blacklist.length + ')</h3>';
       html += '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
-        data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + e.user_id + '">' + e.username + '</a></td><td>' + e.reason + '</td><td>' + e.moderator_tag + '</td></tr>').join('') + '</tbody></table>';
+        data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td></tr>').join('') + '</tbody></table>';
     }
     if (data.notes.length) {
       html += '<h3 style="margin-top:20px;">📝 Note (' + data.notes.length + ')</h3>';
       html += '<table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
-        data.notes.map(n => '<tr><td>' + n.id + '</td><td><a class="user-link" href="/user/' + n.user_id + '">' + n.user_id + '</a></td><td>' + n.content + '</td></tr>').join('') + '</tbody></table>';
+        data.notes.map(n => '<tr><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + esc(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.content) + '</td></tr>').join('') + '</tbody></table>';
     }
     if (data.logs.length) {
       html += '<h3 style="margin-top:20px;">📋 Logs (' + data.logs.length + ')</h3>';
       html += '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
-        data.logs.slice(0, 50).map(l => '<tr><td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td><td><span class="badge ' + (l.type || 'default').toLowerCase() + '">' + (l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + l.target_id + '">' + (l.target || l.target_id) + '</a>' : (l.target || '-')) + '</td><td>' + (l.moderator || '-') + '</td><td>' + (l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
+        data.logs.slice(0, 50).map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + esc(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
       if (data.logs.length > 50) html += '<p style="color:#888;font-size:12px;">...e altri ' + (data.logs.length - 50) + ' log</p>';
     }
     if (data.tickets.length) {
       html += '<h3 style="margin-top:20px;">🎫 Ticket (' + data.tickets.length + ')</h3>';
       html += '<table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
-        data.tickets.map(t => '<tr><td>' + t.guild + '</td><td>#' + t.channel + '</td></tr>').join('') + '</tbody></table>';
+        data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td></tr>').join('') + '</tbody></table>';
     }
     el.innerHTML = html;
   }
@@ -1450,17 +1714,18 @@ function renderAccessLogsContent() {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   async function loadAccess() {
-    const res = await fetch('/api/access-logs');
+    const res = await apiFetch('/api/access-logs');
     const logs = await res.json();
     const el = document.getElementById('access-content');
     if (!logs.length) { el.innerHTML = '<p class="loading">Nessun accesso registrato.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th>Data</th><th>Utente</th><th>IP</th><th>User Agent</th></tr></thead><tbody>' +
       logs.map(l => '<tr>' +
-        '<td>' + new Date(l.timestamp).toLocaleString('it-IT') + '</td>' +
-        '<td><a class="user-link" href="/user/' + l.user_id + '">' + l.username + '</a></td>' +
-        '<td><code>' + (l.ip || '-') + '</code></td>' +
-        '<td style="font-size:11px;color:#888;">' + (l.user_agent || '-').slice(0, 80) + '</td>' +
+        '<td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td>' +
+        '<td><a class="user-link" href="/user/' + esc(l.user_id) + '">' + esc(l.username) + '</a></td>' +
+        '<td><code>' + esc(l.ip || '-') + '</code></td>' +
+        '<td style="font-size:11px;color:#888;">' + esc((l.user_agent || '-').slice(0, 80)) + '</td>' +
       '</tr>').join('') + '</tbody></table>';
   }
   loadAccess();
@@ -1476,17 +1741,17 @@ function renderMessagesContent() {
     <select id="msg-channel"></select>
 
     <label style="font-size:13px;color:#888;">Testo (max 2000)</label>
-    <textarea id="msg-content" rows="3" placeholder="Ciao {user}..."></textarea>
+    <textarea id="msg-content" rows="3" placeholder="Ciao {user}..." maxlength="2000"></textarea>
 
     <details style="margin:14px 0;">
       <summary style="cursor:pointer;color:#5865F2;">➕ Aggiungi embed (opzionale)</summary>
       <div style="margin-top:12px;">
-        <input id="emb-title" placeholder="Titolo">
-        <textarea id="emb-desc" rows="3" placeholder="Descrizione"></textarea>
-        <input id="emb-color" placeholder="Colore (es. #5865F2)">
-        <input id="emb-image" placeholder="URL immagine">
-        <input id="emb-thumb" placeholder="URL thumbnail">
-        <input id="emb-footer" placeholder="Footer">
+        <input id="emb-title" placeholder="Titolo" maxlength="256">
+        <textarea id="emb-desc" rows="3" placeholder="Descrizione" maxlength="4096"></textarea>
+        <input id="emb-color" placeholder="Colore (es. #5865F2)" maxlength="20">
+        <input id="emb-image" placeholder="URL immagine" maxlength="500">
+        <input id="emb-thumb" placeholder="URL thumbnail" maxlength="500">
+        <input id="emb-footer" placeholder="Footer" maxlength="2048">
       </div>
     </details>
 
@@ -1495,13 +1760,14 @@ function renderMessagesContent() {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let channelsCache = [];
   async function loadChannels() {
-    const res = await fetch('/api/messages/channels');
+    const res = await apiFetch('/api/messages/channels');
     channelsCache = await res.json();
     const sel = document.getElementById('msg-channel');
     sel.innerHTML = channelsCache.map(c =>
-      '<option value="' + c.channelId + '">' + c.guildName + ' → #' + c.channelName + '</option>'
+      '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>'
     ).join('') || '<option value="">Nessun canale</option>';
   }
 
@@ -1523,17 +1789,17 @@ function renderMessagesContent() {
     }
     const btn = document.querySelector('button[onclick="sendMessage()"]');
     btn.disabled = true; btn.textContent = '⏳ Invio...';
-    const res = await fetch('/api/messages/send', {
+    const res = await apiFetch('/api/messages/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ channelId, content, embed })
     });
     const data = await res.json();
     btn.disabled = false; btn.textContent = '📤 Invia';
     if (res.ok) {
-      result.innerHTML = '<span class="success">✅ Inviato! ID: ' + data.messageId + '</span>';
+      result.innerHTML = '<span class="success">✅ Inviato! ID: ' + esc(data.messageId) + '</span>';
       document.getElementById('msg-content').value = '';
     } else {
-      result.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>';
+      result.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>';
     }
   }
   loadChannels();
@@ -1546,7 +1812,7 @@ function renderUserActionsContent(userId = '') {
   <div class="section">
     <h2>🛠️ Gestione Utenti</h2>
     <div class="form-row">
-      <input id="ua-userid" placeholder="ID utente (17-20 cifre)" value="${userId}">
+      <input id="ua-userid" placeholder="ID utente (17-20 cifre)" value="${escapeHtml(userId)}" maxlength="20">
       <button onclick="lookupUser()">🔍 Cerca</button>
     </div>
     <div id="ua-userinfo"></div>
@@ -1557,7 +1823,7 @@ function renderUserActionsContent(userId = '') {
     <label style="font-size:13px;color:#888;">Server</label>
     <select id="ua-guild"></select>
     <label style="font-size:13px;color:#888;">Motivo (opzionale)</label>
-    <input id="ua-reason" placeholder="Motivo dell'azione">
+    <input id="ua-reason" placeholder="Motivo dell'azione" maxlength="512">
     <div style="display:flex;gap:8px;margin-top:8px;">
       <button class="secondary" onclick="doAction('kick')">👢 Kick</button>
       <button class="danger" onclick="doAction('ban')">🔨 Ban</button>
@@ -1567,6 +1833,7 @@ function renderUserActionsContent(userId = '') {
   </div>
 
   <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let currentUser = null;
 
   async function lookupUser() {
@@ -1575,21 +1842,21 @@ function renderUserActionsContent(userId = '') {
     const actions = document.getElementById('ua-actions');
     if (!/^\\d{17,20}$/.test(userId)) { info.innerHTML = '<span class="error">❌ ID non valido</span>'; return; }
     info.innerHTML = '<p class="loading">Ricerca...</p>';
-    const res = await fetch('/api/user-lookup/' + userId);
+    const res = await apiFetch('/api/user-lookup/' + encodeURIComponent(userId));
     const data = await res.json();
-    if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>'; actions.style.display='none'; return; }
+    if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; actions.style.display='none'; return; }
     currentUser = data;
 
     info.innerHTML =
       '<div style="display:flex;gap:14px;align-items:center;margin-top:12px;">' +
-      '<img src="' + data.avatar + '" style="width:64px;height:64px;border-radius:50%;">' +
-      '<div><b>' + data.tag + '</b><br><small style="color:#666;">' + data.id + (data.bot ? ' • BOT' : '') + '</small></div>' +
+      '<img src="' + esc(data.avatar) + '" style="width:64px;height:64px;border-radius:50%;">' +
+      '<div><b>' + esc(data.tag) + '</b><br><small style="color:#666;">' + esc(data.id) + (data.bot ? ' • BOT' : '') + '</small></div>' +
       '</div>' +
-      '<p style="margin-top:12px;color:#888;font-size:13px;">Server in comune: ' + data.memberships.length + '</p>';
+      '<p style="margin-top:12px;color:#888;font-size:13px;">Server in comune: ' + esc(data.memberships.length) + '</p>';
 
     const sel = document.getElementById('ua-guild');
     sel.innerHTML = data.memberships.map(m =>
-      '<option value="' + m.guildId + '">' + m.guildName + ' (ruoli: ' + m.roles.join(', ') + ')</option>'
+      '<option value="' + esc(m.guildId) + '">' + esc(m.guildName) + ' (ruoli: ' + esc(m.roles.join(', ')) + ')</option>'
     ).join('') || '<option value="">Nessun server</option>';
 
     actions.style.display = 'block';
@@ -1602,14 +1869,14 @@ function renderUserActionsContent(userId = '') {
     const result = document.getElementById('ua-result');
     if (!guildId) { result.innerHTML = '<span class="error">❌ Seleziona un server</span>'; return; }
     if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + currentUser.tag + '?')) return;
-    const res = await fetch('/api/user-action', {
+    const res = await apiFetch('/api/user-action', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action, userId: currentUser.id, guildId, reason })
     });
     const data = await res.json();
     result.innerHTML = res.ok
-      ? '<span class="success">✅ ' + action.toUpperCase() + ' eseguito</span>'
-      : '<span class="error">❌ ' + (data.error || 'Errore') + '</span>';
+      ? '<span class="success">✅ ' + esc(action.toUpperCase()) + ' eseguito</span>'
+      : '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>';
   }
 
   ${userId ? 'lookupUser();' : ''}
