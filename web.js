@@ -30,16 +30,30 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   const DASHBOARD_ROLES = ['Senior Admin'];
 
+  // ==================== AUTORIZZAZIONE CON CACHE ====================
+  const AUTH_CACHE_TTL = 60 * 1000;
+  const authCache = new Map();
+
   async function isAuthorizedByRole(userId) {
-    if (ENV_ADMIN_IDS.includes(userId)) return true;
-    try {
-      for (const guild of client.guilds.cache.values()) {
-        const member = await guild.members.fetch(userId).catch(() => null);
-        if (!member) continue;
-        if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) return true;
-      }
-    } catch (err) { log.err('isAuthorizedByRole', err); }
-    return false;
+    const now = Date.now();
+    const cached = authCache.get(userId);
+    if (cached && cached.expires > now) return cached.authorized;
+
+    let authorized = ENV_ADMIN_IDS.includes(userId);
+    if (!authorized) {
+      try {
+        for (const guild of client.guilds.cache.values()) {
+          const member = await guild.members.fetch(userId).catch(() => null);
+          if (!member) continue;
+          if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) {
+            authorized = true;
+            break;
+          }
+        }
+      } catch (err) { log.err('isAuthorizedByRole', err); }
+    }
+    authCache.set(userId, { authorized, expires: now + AUTH_CACHE_TTL });
+    return authorized;
   }
 
   // ==================== HELMET ====================
@@ -122,8 +136,25 @@ function createWebServer({ storage, client, log, botStartTime }) {
     standardHeaders: true, legacyHeaders: false,
     message: { error: 'Troppe richieste, riprova più tardi.' }
   });
+  const actionLimiter = rateLimit({
+    windowMs: 60 * 1000, max: 10,
+    standardHeaders: true, legacyHeaders: false,
+    message: { error: 'Troppe azioni distruttive, riprova tra un minuto.' }
+  });
+  const messageLimiter = rateLimit({
+    windowMs: 60 * 1000, max: 20,
+    standardHeaders: true, legacyHeaders: false,
+    message: { error: 'Troppi messaggi inviati, riprova tra un minuto.' }
+  });
+
   app.use('/auth', authLimiter);
   app.use('/api', apiLimiter);
+  app.use('/api/user-action', actionLimiter);
+  app.use('/api/messages/send', messageLimiter);
+  app.use('/api/tickets', (req, res, next) => {
+    if (req.method === 'DELETE') return actionLimiter(req, res, next);
+    next();
+  });
 
   // ==================== SCHEMI ZOD ====================
   const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
@@ -170,6 +201,19 @@ function createWebServer({ storage, client, log, botStartTime }) {
     guildId: guildIdSchema,
     reason: z.string().max(512).optional().default('')
   });
+  const schemaReminder = z.object({
+    guildId: guildIdSchema,
+    channelId: z.string().regex(/^\d{17,20}$/),
+    content: z.string().min(1).max(500),
+    when: z.string().min(1).max(20)
+  });
+  const schemaAntinuke = z.object({
+    threshold: z.number().int().min(1).max(50).optional(),
+    threshold_role_update: z.number().int().min(1).max(50).optional(),
+    window_ms: z.number().int().min(1000).max(600000).optional(),
+    punishment: z.enum(['quarantine', 'ban', 'kick']).optional(),
+    whitelist_ids: z.string().max(2000).optional()
+  });
 
   function parseOrFail(schema, data, res) {
     const r = schema.safeParse(data);
@@ -192,7 +236,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.status(500).json({ error: msg });
   }
 
-  function requireAuth(req, res, next) {
+  async function requireAuth(req, res, next) {
     if (!req.session.user) {
       if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
       return res.redirect('/auth/login');
@@ -200,6 +244,16 @@ function createWebServer({ storage, client, log, botStartTime }) {
     if (!req.session.user.dashboardAuthorized) {
       if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Non autorizzato' });
       return res.status(403).send('Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.');
+    }
+    try {
+      const ok = await isAuthorizedByRole(req.session.user.id);
+      if (!ok) {
+        req.session.user.dashboardAuthorized = false;
+        if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Ruolo non più valido' });
+        return res.status(403).send('Accesso negato: il ruolo "Senior Admin" non è più presente.');
+      }
+    } catch (e) {
+      log.err('requireAuth recheck', e);
     }
     next();
   }
@@ -209,7 +263,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.1.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.2.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
@@ -255,11 +309,51 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/auth/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
   app.get('/auth/me', (req, res) => res.json({ user: req.session.user || null }));
 
+  // ==================== LOGOUT GLOBALE ====================
+  app.post('/api/logout-all', requireAuth, (req, res) => {
+    const userId = req.session.user.id;
+    try {
+      const files = fs.readdirSync(SESSION_DIR);
+      let removed = 0;
+      for (const f of files) {
+        try {
+          const content = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), 'utf8'));
+          if (content?.user?.id === userId) {
+            fs.unlinkSync(path.join(SESSION_DIR, f));
+            removed++;
+          }
+        } catch {}
+      }
+      authCache.delete(userId);
+      req.session.destroy(() => res.json({ ok: true, removed }));
+    } catch (e) { apiError(res, e, 'Errore logout globale'); }
+  });
+
   // ==================== API ====================
   app.get('/api/stats', requireAuth, (req, res) => {
     try {
       const s = storage.getStats();
-      res.json({ logs: s.total, blacklist: s.blacklist, guilds: client.guilds.cache.size, ping: client.ws.ping, uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType });
+      let ticketsCount = 0;
+      let notesCount = 0;
+      let transcriptsCount = 0;
+      let remindersCount = 0;
+      try {
+        for (const guild of client.guilds.cache.values()) {
+          for (const ch of guild.channels.cache.values()) {
+            if (ch.name && ch.name.startsWith('ticket-')) ticketsCount++;
+          }
+        }
+        notesCount = storage.db.prepare('SELECT COUNT(*) as c FROM member_notes').get()?.c || 0;
+        transcriptsCount = storage.db.prepare('SELECT COUNT(*) as c FROM ticket_transcripts').get()?.c || 0;
+        remindersCount = storage.db.prepare('SELECT COUNT(*) as c FROM reminders').get()?.c || 0;
+      } catch {}
+      res.json({
+        logs: s.total, blacklist: s.blacklist,
+        guilds: client.guilds.cache.size, ping: client.ws.ping,
+        uptime: Math.floor((Date.now() - botStartTime) / 1000),
+        byType: s.byType,
+        tickets: ticketsCount, notes: notesCount, transcripts: transcriptsCount, reminders: remindersCount
+      });
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
 
@@ -269,6 +363,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.post('/api/blacklist', requireAuth, (req, res) => {
     const data = parseOrFail(schemaBlacklistAdd, req.body || {}, res);
     if (!data) return;
+    if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist il bot' });
+    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist te stesso' });
     try {
       if (storage.isBlacklisted(data.userId)) return res.status(409).json({ error: 'Già in blacklist' });
       storage.addToBlacklist(data.userId, data.username, data.reason, req.session.user.id, req.session.user.username);
@@ -360,6 +456,46 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  app.post('/api/welcome/:guildId/test', requireAuth, async (req, res) => {
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    const guild = client.guilds.cache.get(req.params.guildId);
+    if (!guild) return res.status(404).json({ error: 'Server non trovato' });
+
+    const config = storage.getWelcomeConfig(req.params.guildId);
+    if (!config || !config.channel_id) return res.status(400).json({ error: 'Canale welcome non configurato' });
+
+    const channel = guild.channels.cache.get(config.channel_id);
+    if (!channel || !channel.isTextBased()) return res.status(400).json({ error: 'Canale welcome non valido' });
+
+    try {
+      const { EmbedBuilder } = require('discord.js');
+      const user = req.session.user;
+      const fill = (t) => String(t || 'Benvenuto {user} in {server}!')
+        .replace(/{user}/g, `<@${user.id}>`)
+        .replace(/{username}/g, user.username)
+        .replace(/{server}/g, guild.name)
+        .replace(/{memberCount}/g, guild.memberCount);
+
+      const text = fill(config.message);
+      if (config.embed_enabled) {
+        const avatarUrl = user.avatar
+          ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
+          : `https://cdn.discordapp.com/embed/avatars/0.png`;
+        const embed = new EmbedBuilder()
+          .setTitle('👋 Benvenuto!')
+          .setDescription(text)
+          .setColor(0x00FF00)
+          .setThumbnail(avatarUrl)
+          .setFooter({ text: `Sei il membro #${guild.memberCount}` })
+          .setTimestamp();
+        await channel.send({ embeds: [embed] });
+      } else {
+        await channel.send({ content: text, allowedMentions: { parse: ['users'] } });
+      }
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore test welcome'); }
+  });
+
   app.get('/api/tickets', requireAuth, (req, res) => {
     try {
       const tickets = [];
@@ -382,39 +518,85 @@ function createWebServer({ storage, client, log, botStartTime }) {
       if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
       if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
 
-      // Genera Transcript HTML
       const messages = await ch.messages.fetch({ limit: 100 });
-      let html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Transcript #' + ch.name + '</title><style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}.avatar{width:40px;height:40px;border-radius:50%}.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}.content{flex:1;word-wrap:break-word}</style></head><body>';
-      html += '<h1>Transcript: #' + ch.name + '</h1>';
-      
+
+      const esc = (s) => String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+      let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + esc(ch.name) + '</title>'
+        + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
+        + '.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}'
+        + '.avatar{width:40px;height:40px;border-radius:50%}'
+        + '.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}'
+        + '.content{flex:1;word-wrap:break-word;white-space:pre-wrap}'
+        + 'img.attach{max-width:300px;border-radius:6px;margin-top:6px}</style></head><body>';
+      html += '<h1>Transcript: #' + esc(ch.name) + '</h1>';
+
       const sorted = [...messages.values()].reverse();
       for (const m of sorted) {
+        const avatar = esc(m.author.displayAvatarURL());
+        const username = esc(m.author.username);
+        const time = esc(m.createdAt.toLocaleString('it-IT'));
         if (m.author.bot && m.embeds.length > 0) {
-          html += '<div class="msg"><div class="author">[BOT] ' + m.author.username + '</div><div class="content">' + m.embeds.map(e => e.description || '').join('<br>') + '</div></div>';
+          const desc = m.embeds.map(e => esc(e.description || '')).join('<br>');
+          html += '<div class="msg"><div class="content"><span class="author">[BOT] ' + username + '</span>'
+            + '<span class="time">' + time + '</span><br>' + desc + '</div></div>';
         } else {
-          html += '<div class="msg"><img src="' + m.author.displayAvatarURL() + '" class="avatar"><div class="content"><span class="author">' + m.author.username + '</span><span class="time">' + m.createdAt.toLocaleString() + '</span><br>' + m.content + '</div></div>';
+          let attach = '';
+          for (const att of m.attachments.values()) {
+            if ((att.contentType || '').startsWith('image/')) {
+              attach += '<br><img class="attach" src="' + esc(att.url) + '" alt="attachment">';
+            } else {
+              attach += '<br><a href="' + esc(att.url) + '" target="_blank" rel="noopener">📎 ' + esc(att.name) + '</a>';
+            }
+          }
+          html += '<div class="msg"><img src="' + avatar + '" class="avatar">'
+            + '<div class="content"><span class="author">' + username + '</span>'
+            + '<span class="time">' + time + '</span><br>' + esc(m.content) + attach + '</div></div>';
         }
       }
       html += '</body></html>';
 
-      // Salva nel DB
       storage.saveTranscript(ch.id, ch.name, ch.name.replace('ticket-', ''), 'Staff (Dashboard)', 'N/D', html);
-
-      // Cancella il canale
       await ch.delete('Chiuso dalla dashboard web');
       res.json({ ok: true });
     } catch (e) { apiError(res, e); }
   });
 
-  // API per visualizzare i transcripts
+  app.post('/api/ticketpanel', requireAuth, async (req, res) => {
+    const schema = z.object({ channelId: z.string().regex(/^\d{17,20}$/) });
+    const data = parseOrFail(schema, req.body || {}, res);
+    if (!data) return;
+    try {
+      const channel = await client.channels.fetch(data.channelId).catch(() => null);
+      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
+
+      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      const embed = new EmbedBuilder()
+        .setTitle('Pannello Ticket')
+        .setDescription('Premi il bottone qui sotto per aprire un ticket.')
+        .setColor(0x0099FF)
+        .setTimestamp();
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('create_ticket').setLabel('Apri Ticket').setStyle(ButtonStyle.Primary)
+      );
+      await channel.send({ embeds: [embed], components: [row] });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore creazione pannello'); }
+  });
+
   app.get('/api/tickets/transcripts', requireAuth, (req, res) => {
     try { res.json(storage.getAllTranscripts()); } catch (e) { apiError(res, e); }
   });
   app.get('/api/tickets/transcripts/:id', requireAuth, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).send('ID non valido');
     try {
-      const t = storage.getTranscript(parseInt(req.params.id));
+      const t = storage.getTranscript(id);
       if (!t) return res.status(404).send('Transcript non trovato');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
       res.send(t.html_content);
     } catch (e) { apiError(res, e); }
   });
@@ -520,10 +702,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore ricerca'); }
   });
 
+  function sanitizeCsvCell(v) {
+    const s = (v === null || v === undefined) ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) return "'" + s;
+    return s;
+  }
   function toCsv(rows, headers) {
     if (!rows.length) return headers.join(',');
     const esc = (v) => {
-      const s = (v === null || v === undefined) ? '' : String(v);
+      const s = sanitizeCsvCell(v);
       return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     return headers.join(',') + '\n' + rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
@@ -633,6 +820,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const data = parseOrFail(schemaUserAction, req.body || {}, res);
     if (!data) return;
     const { action, userId, guildId, reason } = data;
+    if (userId === req.session.user.id) {
+      return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
+    }
     try {
       const guild = client.guilds.cache.get(guildId);
       if (!guild) return res.status(404).json({ error: 'Server non trovato' });
@@ -680,6 +870,50 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore azione utente'); }
   });
 
+  // ==================== REMINDER ====================
+  app.get('/api/reminders', requireAuth, (req, res) => {
+    try {
+      const rows = storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all();
+      res.json(rows);
+    } catch (e) { apiError(res, e); }
+  });
+
+  app.post('/api/reminders', requireAuth, (req, res) => {
+    const data = parseOrFail(schemaReminder, req.body || {}, res);
+    if (!data) return;
+
+    const m = data.when.trim().match(/^(\d+)\s*(s|m|h|d)$/i);
+    if (!m) return res.status(400).json({ error: 'Formato tempo non valido (es. 10m, 1h, 2d)' });
+    const n = parseInt(m[1], 10);
+    const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2].toLowerCase()];
+    const ms = n * mult;
+    if (ms < 5000 || ms > 30 * 24 * 60 * 60 * 1000) {
+      return res.status(400).json({ error: 'Durata tra 5s e 30g' });
+    }
+
+    try {
+      const id = storage.addReminder(req.session.user.id, data.guildId, data.channelId, data.content, new Date(Date.now() + ms));
+      res.json({ ok: true, id });
+    } catch (e) { apiError(res, e); }
+  });
+
+  // ==================== ANTINUKE ====================
+  app.get('/api/antinuke/:guildId', requireAuth, (req, res) => {
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    try { res.json(storage.getAntiNukeConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
+  });
+
+  app.post('/api/antinuke/:guildId', requireAuth, (req, res) => {
+    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    const data = parseOrFail(schemaAntinuke, req.body || {}, res);
+    if (!data) return;
+    try {
+      const current = storage.getAntiNukeConfig(req.params.guildId);
+      storage.setAntiNukeConfig(req.params.guildId, { ...current, ...data });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e); }
+  });
+
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
     try {
@@ -713,6 +947,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
     if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).send('ID non valido');
     pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
   });
+  app.get('/reminders', requireAuth, pageHandler('reminders'));
+  app.get('/antinuke', requireAuth, pageHandler('antinuke'));
 
   app.use((err, req, res, next) => {
     log.err('web-error', err);
@@ -723,7 +959,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const server = app.listen(PORT, HOST, () => {
     log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
     log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
-    log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓`);
+    log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓ cache-auth ✓`);
   });
 
   server.on('error', (err) => {
@@ -758,7 +994,9 @@ function renderLayout(user, page, params = {}, security = {}) {
     search: renderSearchContent(params.q || ''),
     accesslogs: renderAccessLogsContent(),
     messages: renderMessagesContent(),
-    userActions: renderUserActionsContent(params.userId || '')
+    userActions: renderUserActionsContent(params.userId || ''),
+    reminders: renderRemindersContent(),
+    antinuke: renderAntinukeContent()
   };
 
   return `<!DOCTYPE html>
@@ -782,6 +1020,12 @@ function renderLayout(user, page, params = {}, security = {}) {
     }
     return fetch(url, opts);
   };
+  async function logoutAll() {
+    if (!confirm('Vuoi disconnetterti da TUTTE le sessioni?')) return;
+    const res = await apiFetch('/api/logout-all', { method: 'POST' });
+    if (res.ok) window.location.href = '/';
+    else alert('Errore logout globale');
+  }
 </script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
@@ -840,6 +1084,9 @@ function renderLayout(user, page, params = {}, security = {}) {
   .export-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
   .export-bar a { padding: 6px 12px; background: #444; border-radius: 6px; font-size: 12px; color: #eee; }
   .export-bar a:hover { background: #555; }
+  .pager { display: flex; gap: 6px; margin-top: 12px; align-items: center; justify-content: center; }
+  .pager button { padding: 4px 10px; }
+  .pager span { color: #888; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -853,6 +1100,7 @@ function renderLayout(user, page, params = {}, security = {}) {
     <div class="user">
       <img src="${avatar}" alt="">
       <span>${name}</span>
+      <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
       <a href="/auth/logout"><button class="danger">Logout</button></a>
     </div>
   </header>
@@ -864,6 +1112,8 @@ function renderLayout(user, page, params = {}, security = {}) {
     <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
     <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
     <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
+    <a href="/antinuke" class="${page === 'antinuke' ? 'active' : ''}">🛡️ Anti-Nuke</a>
+    <a href="/reminders" class="${page === 'reminders' ? 'active' : ''}">⏰ Reminder</a>
     <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
     <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
     <a href="/messages" class="${page === 'messages' ? 'active' : ''}">✉️ Messaggi</a>
@@ -891,6 +1141,10 @@ function renderDashboardContent() {
     <div class="card"><h2>Server</h2><div class="value" id="stat-guilds">...</div></div>
     <div class="card"><h2>Ping</h2><div class="value" id="stat-ping">...</div></div>
     <div class="card"><h2>Uptime</h2><div class="value" id="stat-uptime">...</div></div>
+    <div class="card"><h2>Ticket Aperti</h2><div class="value" id="stat-tickets">...</div></div>
+    <div class="card"><h2>Note</h2><div class="value" id="stat-notes">...</div></div>
+    <div class="card"><h2>Transcripts</h2><div class="value" id="stat-transcripts">...</div></div>
+    <div class="card"><h2>Reminder</h2><div class="value" id="stat-reminders">...</div></div>
   </div>
 
   <div class="section">
@@ -926,6 +1180,10 @@ function renderDashboardContent() {
     document.getElementById('stat-ping').textContent = s.ping + 'ms';
     const h = Math.floor(s.uptime/3600), m = Math.floor((s.uptime%3600)/60);
     document.getElementById('stat-uptime').textContent = h + 'h ' + m + 'm';
+    document.getElementById('stat-tickets').textContent = s.tickets || 0;
+    document.getElementById('stat-notes').textContent = s.notes || 0;
+    document.getElementById('stat-transcripts').textContent = s.transcripts || 0;
+    document.getElementById('stat-reminders').textContent = s.reminders || 0;
   }
   async function loadBlacklist() {
     const res = await apiFetch('/api/blacklist');
@@ -1081,22 +1339,45 @@ function renderNotesContent() {
 // ---------- TICKET (CON TRANSCRIPT) ----------
 function renderTicketsContent() {
   return `
-  <div class="card-bg border rounded-xl p-5 mb-6">
-    <h2 class="text-lg font-semibold mb-4">🎫 Ticket Aperti</h2>
-    <p class="text-sm opacity-60 mb-4">Gestisci i ticket aperti sul server.</p>
+  <div class="section">
+    <h2>🎫 Ticket Aperti</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:14px;">Gestisci i ticket aperti sul server.</p>
+    <div class="form-row" style="margin-bottom:14px;">
+      <select id="tp-channel"></select>
+      <button onclick="createTicketPanel()">📋 Crea Pannello Ticket</button>
+    </div>
     <div id="tickets-content" class="loading">Caricamento...</div>
   </div>
 
-  <div class="card-bg border rounded-xl p-5">
-    <h2 class="text-lg font-semibold mb-4">📜 Archivio Transcripts (Ultimi 100)</h2>
+  <div class="section">
+    <h2>📜 Archivio Transcripts (Ultimi 100)</h2>
     <div id="transcripts-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  
+
+  async function loadChannelsForPanel() {
+    const res = await apiFetch('/api/messages/channels');
+    const chs = await res.json();
+    const sel = document.getElementById('tp-channel');
+    sel.innerHTML = chs.map(c => '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
+  }
+
+  async function createTicketPanel() {
+    const channelId = document.getElementById('tp-channel').value;
+    if (!channelId) { alert('Seleziona un canale'); return; }
+    if (!confirm('Inviare il pannello ticket in questo canale?')) return;
+    const res = await apiFetch('/api/ticketpanel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId })
+    });
+    if (res.ok) alert('✅ Pannello inviato');
+    else { const d = await res.json(); alert('❌ ' + (d.error || 'Errore')); }
+  }
+
   async function loadTickets() {
-    const res = await fetch('/api/tickets');
+    const res = await apiFetch('/api/tickets');
     const tickets = await res.json();
     const el = document.getElementById('tickets-content');
     if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
@@ -1105,12 +1386,12 @@ function renderTicketsContent() {
         '<td>' + esc(t.guild) + '</td>' +
         '<td>#' + esc(t.channel) + '</td>' +
         '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
-        '<td><button class="btn danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
+        '<td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
       '</tr>').join('') + '</tbody></table>';
   }
 
   async function loadTranscripts() {
-    const res = await fetch('/api/tickets/transcripts');
+    const res = await apiFetch('/api/tickets/transcripts');
     const transcripts = await res.json();
     const el = document.getElementById('transcripts-content');
     if (!transcripts.length) { el.innerHTML = '<p class="loading">Nessun transcript salvato.</p>'; return; }
@@ -1121,17 +1402,18 @@ function renderTicketsContent() {
         '<td>' + esc(t.user_id) + '</td>' +
         '<td>' + esc(t.claimed_by || '-') + '</td>' +
         '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td><a href="/api/tickets/transcripts/' + t.id + '" target="_blank" class="btn secondary small">Visualizza</a></td>' +
+        '<td><a href="/api/tickets/transcripts/' + esc(t.id) + '" target="_blank" rel="noopener" style="padding:5px 10px;background:#444;color:#eee;border-radius:6px;font-size:12px;">Visualizza</a></td>' +
       '</tr>').join('') + '</tbody></table>';
   }
 
   async function closeTicket(channelId) {
     if (!confirm('Chiudere ed eliminare questo ticket? Verrà salvato un transcript.')) return;
-    const res = await fetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
+    const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
     if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(); loadTranscripts(); }
     else { const data = await res.json(); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
-  
+
+  loadChannelsForPanel();
   loadTickets();
   loadTranscripts();
   setInterval(loadTickets, 15000);
@@ -1282,6 +1564,7 @@ function renderConfigContent() {
             Usa formato embed
           </label>
           <br><button onclick="saveWelcome('\\\${esc(guildId)}')">Salva</button>
+          <button class="secondary" onclick="testWelcome('\\\${esc(guildId)}')">🧪 Test Welcome</button>
           <div id="welcome-msg"></div>
         </div>
       </div>
@@ -1316,6 +1599,12 @@ function renderConfigContent() {
     });
     document.getElementById('welcome-msg').innerHTML = res.ok
       ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
+  }
+  async function testWelcome(guildId) {
+    if (!confirm('Inviare un messaggio di test nel canale welcome?')) return;
+    const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId) + '/test', { method: 'POST' });
+    if (res.ok) alert('✅ Test inviato');
+    else { const d = await res.json(); alert('❌ ' + (d.error || 'Errore')); }
   }
   loadGuilds();
   </script>`;
@@ -1577,15 +1866,26 @@ function renderAccessLogsContent() {
   <div class="section">
     <h2>🔐 Log Accessi Dashboard</h2>
     <p style="color:#888;font-size:13px;margin-bottom:14px;">Ultimi 500 accessi alla dashboard.</p>
+    <div class="filter-bar">
+      <input type="text" id="al-filter" placeholder="Filtra per utente o azione..." oninput="renderAccess()" maxlength="100">
+    </div>
     <div class="export-bar"><a href="/api/export/access-logs.csv">📥 Esporta CSV</a></div>
     <div id="access-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  let allAccess = [];
   async function loadAccess() {
     const res = await apiFetch('/api/access-logs');
-    const logs = await res.json();
+    allAccess = await res.json();
+    renderAccess();
+  }
+  function renderAccess() {
+    const filter = (document.getElementById('al-filter').value || '').toLowerCase();
+    const logs = filter
+      ? allAccess.filter(l => (l.username || '').toLowerCase().includes(filter) || (l.user_id || '').includes(filter) || (l.user_agent || '').toLowerCase().includes(filter))
+      : allAccess;
     const el = document.getElementById('access-content');
     if (!logs.length) { el.innerHTML = '<p class="loading">Nessun accesso registrato.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th>Data</th><th>Utente</th><th>IP</th><th>User Agent</th></tr></thead><tbody>' +
@@ -1748,6 +2048,167 @@ function renderUserActionsContent(userId = '') {
   }
 
   ${userId ? 'lookupUser();' : ''}
+  </script>`;
+}
+
+// ---------- REMINDER ----------
+function renderRemindersContent() {
+  return `
+  <div class="section">
+    <h2>⏰ Nuovo Reminder</h2>
+    <div class="form-row">
+      <select id="rm-guild" onchange="loadChannels()"></select>
+      <select id="rm-channel"></select>
+    </div>
+    <input id="rm-content" placeholder="Cosa ricordare (max 500)" maxlength="500">
+    <div class="form-row">
+      <input id="rm-when" placeholder="Quando (es. 10m, 1h, 2d)" maxlength="20" style="max-width:180px;">
+      <button onclick="createReminder()">➕ Crea</button>
+    </div>
+    <div id="rm-result"></div>
+  </div>
+
+  <div class="section">
+    <h2>📋 Reminder Recenti</h2>
+    <div id="reminders-content" class="loading">Caricamento...</div>
+  </div>
+
+  <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  let guildsData = [];
+  let channelsData = [];
+
+  async function loadGuilds() {
+    const res = await apiFetch('/api/guilds');
+    guildsData = await res.json();
+    const sel = document.getElementById('rm-guild');
+    sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
+    if (guildsData.length) loadChannels();
+  }
+  async function loadChannels() {
+    const guildId = document.getElementById('rm-guild').value;
+    const res = await apiFetch('/api/messages/channels');
+    const all = await res.json();
+    channelsData = all.filter(c => c.guildId === guildId);
+    document.getElementById('rm-channel').innerHTML = channelsData.map(c => '<option value="' + esc(c.channelId) + '">#' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
+  }
+  async function createReminder() {
+    const guildId = document.getElementById('rm-guild').value;
+    const channelId = document.getElementById('rm-channel').value;
+    const content = document.getElementById('rm-content').value.trim();
+    const when = document.getElementById('rm-when').value.trim();
+    const result = document.getElementById('rm-result');
+    if (!guildId || !channelId || !content || !when) { result.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
+    const res = await apiFetch('/api/reminders', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ guildId, channelId, content, when })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      result.innerHTML = '<span class="success">✅ Reminder #' + esc(data.id) + ' creato</span>';
+      document.getElementById('rm-content').value = '';
+      document.getElementById('rm-when').value = '';
+      loadReminders();
+    } else { result.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; }
+  }
+  async function loadReminders() {
+    const res = await apiFetch('/api/reminders');
+    const rows = await res.json();
+    const el = document.getElementById('reminders-content');
+    if (!rows.length) { el.innerHTML = '<p class="loading">Nessun reminder.</p>'; return; }
+    el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Server</th><th>Canale</th><th>Contenuto</th><th>Quando</th></tr></thead><tbody>' +
+      rows.map(r => '<tr>' +
+        '<td>' + esc(r.id) + '</td>' +
+        '<td><a class="user-link" href="/user/' + esc(r.user_id) + '">' + esc(r.user_id) + '</a></td>' +
+        '<td>' + esc(r.guild_id) + '</td>' +
+        '<td>' + esc(r.channel_id) + '</td>' +
+        '<td>' + esc(r.content) + '</td>' +
+        '<td>' + esc(new Date(r.remind_at).toLocaleString('it-IT')) + '</td>' +
+      '</tr>').join('') + '</tbody></table>';
+  }
+  loadGuilds();
+  loadReminders();
+  </script>`;
+}
+
+// ---------- ANTINUKE ----------
+function renderAntinukeContent() {
+  return `
+  <div class="section">
+    <h2>🛡️ Configurazione Anti-Nuke</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:14px;">Configura soglie e punizioni per il sistema Anti-Nuke.</p>
+    <select id="an-guild"></select>
+
+    <div class="config-block" style="margin-top:14px;">
+      <h3>Soglie</h3>
+      <label style="font-size:13px;color:#888;">Threshold generico (azioni)</label>
+      <input type="number" id="an-threshold" min="1" max="50">
+      <label style="font-size:13px;color:#888;">Threshold role update (azioni)</label>
+      <input type="number" id="an-threshold-role" min="1" max="50">
+      <label style="font-size:13px;color:#888;">Finestra (ms)</label>
+      <input type="number" id="an-window" min="1000" max="600000">
+    </div>
+
+    <div class="config-block">
+      <h3>Punizione</h3>
+      <select id="an-punishment">
+        <option value="quarantine">Quarantena (poi ban se fallisce)</option>
+        <option value="ban">Ban</option>
+        <option value="kick">Kick</option>
+      </select>
+    </div>
+
+    <div class="config-block">
+      <h3>Whitelist (ID utenti separati da virgola)</h3>
+      <textarea id="an-whitelist" rows="3" placeholder="123456789012345678,987654321098765432"></textarea>
+    </div>
+
+    <button onclick="saveAntinuke()">💾 Salva</button>
+    <div id="an-result"></div>
+  </div>
+
+  <script>
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  let guildsData = [];
+
+  async function loadGuilds() {
+    const res = await apiFetch('/api/guilds');
+    guildsData = await res.json();
+    const sel = document.getElementById('an-guild');
+    sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
+    sel.onchange = loadConfig;
+    if (guildsData.length) loadConfig();
+  }
+  async function loadConfig() {
+    const guildId = document.getElementById('an-guild').value;
+    if (!guildId) return;
+    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId));
+    const c = await res.json();
+    document.getElementById('an-threshold').value = c.threshold || 3;
+    document.getElementById('an-threshold-role').value = c.threshold_role_update || 3;
+    document.getElementById('an-window').value = c.window_ms || 10000;
+    document.getElementById('an-punishment').value = c.punishment || 'quarantine';
+    document.getElementById('an-whitelist').value = c.whitelist_ids || '';
+  }
+  async function saveAntinuke() {
+    const guildId = document.getElementById('an-guild').value;
+    if (!guildId) return;
+    const payload = {
+      threshold: parseInt(document.getElementById('an-threshold').value, 10) || 3,
+      threshold_role_update: parseInt(document.getElementById('an-threshold-role').value, 10) || 3,
+      window_ms: parseInt(document.getElementById('an-window').value, 10) || 10000,
+      punishment: document.getElementById('an-punishment').value,
+      whitelist_ids: document.getElementById('an-whitelist').value.trim()
+    };
+    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    document.getElementById('an-result').innerHTML = res.ok
+      ? '<span class="success">✅ Salvato</span>'
+      : '<span class="error">❌ Errore</span>';
+  }
+  loadGuilds();
   </script>`;
 }
 
