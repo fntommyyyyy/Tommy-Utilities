@@ -143,6 +143,26 @@ class StorageService {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_reports_guild ON reports(guild_id, status);
+
+      CREATE TABLE IF NOT EXISTS dashboard_access_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        ip TEXT,
+        user_agent TEXT,
+        timestamp TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ticket_transcripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        channel_name TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        claimed_by TEXT,
+        priority TEXT,
+        html_content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -283,6 +303,19 @@ class StorageService {
     `);
     this._repAllOpen = this.db.prepare("SELECT * FROM reports WHERE guild_id = ? AND status = 'open' ORDER BY id DESC");
     this._repSetStatus = this.db.prepare('UPDATE reports SET status = ? WHERE id = ? AND guild_id = ?');
+
+    this._dashLogInsert = this.db.prepare(`
+      INSERT INTO dashboard_access_logs (user_id, username, ip, user_agent, timestamp)
+      VALUES (@userId, @username, @ip, @userAgent, @timestamp)
+    `);
+    this._dashLogAll = this.db.prepare('SELECT * FROM dashboard_access_logs ORDER BY id DESC LIMIT 500');
+
+    this._transcriptInsert = this.db.prepare(`
+      INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, created_at)
+      VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @htmlContent, @createdAt)
+    `);
+    this._transcriptAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
+    this._transcriptGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
 
     this._logCounter = 0;
   }
@@ -425,6 +458,22 @@ class StorageService {
   }
   getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
   setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
+
+  saveDashboardAccess(userId, username, ip, userAgent) {
+    try {
+      this._dashLogInsert.run({ userId, username, ip, userAgent, timestamp: new Date().toISOString() });
+    } catch (err) { console.error('saveDashboardAccess', err); }
+  }
+  getDashboardAccessLogs() { return this._dashLogAll.all(); }
+
+  saveTranscript(channelId, channelName, userId, claimedBy, priority, htmlContent) {
+    this._transcriptInsert.run({
+      channelId, channelName, userId, claimedBy, priority, htmlContent,
+      createdAt: new Date().toISOString()
+    });
+  }
+  getAllTranscripts() { return this._transcriptAll.all(); }
+  getTranscript(id) { return this._transcriptGet.get(id) || null; }
 
   close() {
     try { if (this.db && this.db.open) this.db.close(); }
