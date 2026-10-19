@@ -540,11 +540,11 @@ class StorageService {
     this._setAntiNuke.run({
       guildId,
       whitelistIds: config.whitelist_ids || '',
-      thresholdChannel: config.threshold_channel ?? 3,
-      thresholdRole: config.threshold_role ?? 3,
+      thresholdChannel: config.threshold_channel ?? 1,
+      thresholdRole: config.threshold_role ?? 1,
       thresholdBan: config.threshold_ban ?? 3,
-      thresholdRoleUpdate: config.threshold_role_update ?? 3,
-      windowMs: config.window_ms ?? 10000,
+      thresholdRoleUpdate: config.threshold_role_update ?? 1,
+      windowMs: config.window_ms ?? 8000,
       punishment: config.punishment || 'quarantine',
       updatedAt: new Date().toISOString()
     });
