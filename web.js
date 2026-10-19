@@ -1,4 +1,4 @@
-// web.js — Dashboard web con Sicurezza (Helmet, Rate Limit, CSRF, Zod)
+// web.js — Dashboard web con Sicurezza (Helmet, Rate Limit, CSRF, Zod) + Transcripts
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -373,14 +373,49 @@ function createWebServer({ storage, client, log, botStartTime }) {
       res.json(tickets);
     } catch (e) { apiError(res, e); }
   });
+
+  // ==================== TICKET CLOSE CON TRANSCRIPT ====================
   app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.channelId)) return res.status(400).json({ error: 'ID canale non valido' });
     try {
       const ch = await client.channels.fetch(req.params.channelId).catch(() => null);
       if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
       if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
+
+      // Genera Transcript HTML
+      const messages = await ch.messages.fetch({ limit: 100 });
+      let html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Transcript #' + ch.name + '</title><style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}.avatar{width:40px;height:40px;border-radius:50%}.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}.content{flex:1;word-wrap:break-word}</style></head><body>';
+      html += '<h1>Transcript: #' + ch.name + '</h1>';
+      
+      const sorted = [...messages.values()].reverse();
+      for (const m of sorted) {
+        if (m.author.bot && m.embeds.length > 0) {
+          html += '<div class="msg"><div class="author">[BOT] ' + m.author.username + '</div><div class="content">' + m.embeds.map(e => e.description || '').join('<br>') + '</div></div>';
+        } else {
+          html += '<div class="msg"><img src="' + m.author.displayAvatarURL() + '" class="avatar"><div class="content"><span class="author">' + m.author.username + '</span><span class="time">' + m.createdAt.toLocaleString() + '</span><br>' + m.content + '</div></div>';
+        }
+      }
+      html += '</body></html>';
+
+      // Salva nel DB
+      storage.saveTranscript(ch.id, ch.name, ch.name.replace('ticket-', ''), 'Staff (Dashboard)', 'N/D', html);
+
+      // Cancella il canale
       await ch.delete('Chiuso dalla dashboard web');
       res.json({ ok: true });
+    } catch (e) { apiError(res, e); }
+  });
+
+  // API per visualizzare i transcripts
+  app.get('/api/tickets/transcripts', requireAuth, (req, res) => {
+    try { res.json(storage.getAllTranscripts()); } catch (e) { apiError(res, e); }
+  });
+  app.get('/api/tickets/transcripts/:id', requireAuth, (req, res) => {
+    try {
+      const t = storage.getTranscript(parseInt(req.params.id));
+      if (!t) return res.status(404).send('Transcript non trovato');
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.send(t.html_content);
     } catch (e) { apiError(res, e); }
   });
 
@@ -1043,37 +1078,62 @@ function renderNotesContent() {
   </script>`;
 }
 
-// ---------- TICKET ----------
+// ---------- TICKET (CON TRANSCRIPT) ----------
 function renderTicketsContent() {
   return `
-  <div class="section">
-    <h2>🎫 Ticket Aperti</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Il pulsante Chiudi cancella il canale del ticket su Discord.</p>
+  <div class="card-bg border rounded-xl p-5 mb-6">
+    <h2 class="text-lg font-semibold mb-4">🎫 Ticket Aperti</h2>
+    <p class="text-sm opacity-60 mb-4">Gestisci i ticket aperti sul server.</p>
     <div id="tickets-content" class="loading">Caricamento...</div>
+  </div>
+
+  <div class="card-bg border rounded-xl p-5">
+    <h2 class="text-lg font-semibold mb-4">📜 Archivio Transcripts (Ultimi 100)</h2>
+    <div id="transcripts-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  
   async function loadTickets() {
-    const res = await apiFetch('/api/tickets');
+    const res = await fetch('/api/tickets');
     const tickets = await res.json();
     const el = document.getElementById('tickets-content');
     if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente (ID)</th><th></th></tr></thead><tbody>' +
+    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Azioni</th></tr></thead><tbody>' +
       tickets.map(t => '<tr>' +
         '<td>' + esc(t.guild) + '</td>' +
         '<td>#' + esc(t.channel) + '</td>' +
         '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
-        '<td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
+        '<td><button class="btn danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
       '</tr>').join('') + '</tbody></table>';
   }
+
+  async function loadTranscripts() {
+    const res = await fetch('/api/tickets/transcripts');
+    const transcripts = await res.json();
+    const el = document.getElementById('transcripts-content');
+    if (!transcripts.length) { el.innerHTML = '<p class="loading">Nessun transcript salvato.</p>'; return; }
+    el.innerHTML = '<table><thead><tr><th>Data</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Link</th></tr></thead><tbody>' +
+      transcripts.map(t => '<tr>' +
+        '<td>' + esc(new Date(t.created_at).toLocaleString('it-IT')) + '</td>' +
+        '<td>#' + esc(t.channel_name) + '</td>' +
+        '<td>' + esc(t.user_id) + '</td>' +
+        '<td>' + esc(t.claimed_by || '-') + '</td>' +
+        '<td>' + esc(t.priority || '-') + '</td>' +
+        '<td><a href="/api/tickets/transcripts/' + t.id + '" target="_blank" class="btn secondary small">Visualizza</a></td>' +
+      '</tr>').join('') + '</tbody></table>';
+  }
+
   async function closeTicket(channelId) {
-    if (!confirm('Chiudere ed eliminare questo ticket? Il canale verrà cancellato su Discord.')) return;
-    const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
-    if (res.ok) loadTickets();
+    if (!confirm('Chiudere ed eliminare questo ticket? Verrà salvato un transcript.')) return;
+    const res = await fetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
+    if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(); loadTranscripts(); }
     else { const data = await res.json(); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
+  
   loadTickets();
+  loadTranscripts();
   setInterval(loadTickets, 15000);
   </script>`;
 }
