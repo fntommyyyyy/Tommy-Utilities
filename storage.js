@@ -177,10 +177,7 @@ class StorageService {
       );
     `);
 
-    // ==================== MIGRAZIONI MANUALI (PATCH) ====================
-    // Controlla se la colonna esiste, altrimenti la aggiunge.
-    // Questo serve perché CREATE TABLE IF NOT EXISTS non modifica tabelle esistenti.
-
+    // ==================== MIGRAZIONI MANUALI ====================
     const checkColumn = (table, column) => {
       try {
         const info = this.db.prepare(`PRAGMA table_info(${table})`).all();
@@ -201,6 +198,7 @@ class StorageService {
   }
 
   _prepare() {
+    // ==================== CUSTOM COMMANDS ====================
     this._allCmds = this.db.prepare('SELECT name, response FROM custom_commands');
     this._getCmd = this.db.prepare('SELECT response FROM custom_commands WHERE name = ?');
     this._upsertCmd = this.db.prepare(`
@@ -210,6 +208,7 @@ class StorageService {
     `);
     this._delCmd = this.db.prepare('DELETE FROM custom_commands WHERE name = ?');
 
+    // ==================== MOD LOGS ====================
     this._insertLog = this.db.prepare(`
       INSERT INTO mod_logs (type, target_id, target, moderator, reason, duration, channel, timestamp)
       VALUES (@type, @targetId, @target, @moderator, @reason, @duration, @channel, @timestamp)
@@ -223,6 +222,7 @@ class StorageService {
       )
     `);
 
+    // ==================== BLACKLIST ====================
     this._blGet = this.db.prepare('SELECT * FROM blacklist WHERE user_id = ?');
     this._blAll = this.db.prepare('SELECT * FROM blacklist ORDER BY added_at DESC');
     this._blInsert = this.db.prepare(`
@@ -232,6 +232,7 @@ class StorageService {
     this._blDelete = this.db.prepare('DELETE FROM blacklist WHERE user_id = ?');
     this._blCount = this.db.prepare('SELECT COUNT(*) as c FROM blacklist');
 
+    // ==================== GUILD CONFIG ====================
     this._getConfig = this.db.prepare('SELECT * FROM guild_config WHERE guild_id = ?');
     this._upsertConfig = this.db.prepare(`
       INSERT INTO guild_config (guild_id, autorole_id, log_channel_id, updated_at)
@@ -242,6 +243,7 @@ class StorageService {
         updated_at = excluded.updated_at
     `);
 
+    // ==================== MEMBER NOTES ====================
     this._insertNote = this.db.prepare(`
       INSERT INTO member_notes (guild_id, user_id, author_id, author_tag, content, created_at)
       VALUES (@guildId, @userId, @authorId, @authorTag, @content, @createdAt)
@@ -251,6 +253,7 @@ class StorageService {
     this._deleteNote = this.db.prepare('DELETE FROM member_notes WHERE id = ? AND guild_id = ?');
     this._countNotes = this.db.prepare('SELECT COUNT(*) as c FROM member_notes WHERE guild_id = ?');
 
+    // ==================== WELCOME ====================
     this._getWelcome = this.db.prepare(`
       SELECT guild_id, channel_id, message,
              COALESCE(embed_enabled, 1) AS embed_enabled,
@@ -270,6 +273,7 @@ class StorageService {
       'UPDATE welcome_config SET channel_id = NULL, updated_at = ? WHERE guild_id = ?'
     );
 
+    // ==================== REACTION ROLES ====================
     this._rrInsert = this.db.prepare(`
       INSERT INTO reaction_roles (guild_id, message_id, channel_id, emoji, role_id, created_at)
       VALUES (@guildId, @messageId, @channelId, @emoji, @roleId, @createdAt)
@@ -279,6 +283,7 @@ class StorageService {
     this._rrDelete = this.db.prepare('DELETE FROM reaction_roles WHERE id = ? AND guild_id = ?');
     this._rrDeleteByMessage = this.db.prepare('DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ?');
 
+    // ==================== AUTORESPONSES ====================
     this._arInsert = this.db.prepare(`
       INSERT INTO autoresponses (guild_id, trigger, response, created_at)
       VALUES (@guildId, @trigger, @response, @createdAt)
@@ -287,6 +292,7 @@ class StorageService {
     this._arByTrigger = this.db.prepare('SELECT * FROM autoresponses WHERE guild_id = ? AND trigger = ?');
     this._arDelete = this.db.prepare('DELETE FROM autoresponses WHERE id = ? AND guild_id = ?');
 
+    // ==================== BIRTHDAYS ====================
     this._bdSet = this.db.prepare(`
       INSERT INTO birthdays (user_id, guild_id, day, month, year, updated_at)
       VALUES (@userId, @guildId, @day, @month, @year, @updatedAt)
@@ -302,6 +308,7 @@ class StorageService {
     this._bdAll = this.db.prepare('SELECT * FROM birthdays WHERE guild_id = ? ORDER BY month, day');
     this._bdDelete = this.db.prepare('DELETE FROM birthdays WHERE user_id = ? AND guild_id = ?');
 
+    // ==================== REMINDERS ====================
     this._remInsert = this.db.prepare(`
       INSERT INTO reminders (user_id, guild_id, channel_id, content, remind_at, created_at)
       VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
@@ -309,7 +316,9 @@ class StorageService {
     this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ?');
     this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
     this._remByUser = this.db.prepare('SELECT * FROM reminders WHERE user_id = ? AND guild_id = ? ORDER BY remind_at ASC');
+    this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200');
 
+    // ==================== PERSONAL NOTES ====================
     this._pnInsert = this.db.prepare(`
       INSERT INTO personal_notes (user_id, guild_id, content, created_at)
       VALUES (@userId, @guildId, @content, @createdAt)
@@ -317,6 +326,7 @@ class StorageService {
     this._pnByUser = this.db.prepare('SELECT * FROM personal_notes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC');
     this._pnDelete = this.db.prepare('DELETE FROM personal_notes WHERE id = ? AND user_id = ?');
 
+    // ==================== CASES ====================
     this._caseInsert = this.db.prepare(`
       INSERT INTO cases (guild_id, user_id, moderator_id, action, reason, duration, status, created_at, updated_at)
       VALUES (@guildId, @userId, @moderatorId, @action, @reason, @duration, 'active', @now, @now)
@@ -331,6 +341,7 @@ class StorageService {
     `);
     this._caseDelete = this.db.prepare('DELETE FROM cases WHERE id = ? AND guild_id = ?');
 
+    // ==================== REPORTS ====================
     this._repInsert = this.db.prepare(`
       INSERT INTO reports (guild_id, reporter_id, target_id, reason, status, created_at)
       VALUES (@guildId, @reporterId, @targetId, @reason, 'open', @createdAt)
@@ -338,12 +349,14 @@ class StorageService {
     this._repAllOpen = this.db.prepare("SELECT * FROM reports WHERE guild_id = ? AND status = 'open' ORDER BY id DESC");
     this._repSetStatus = this.db.prepare('UPDATE reports SET status = ? WHERE id = ? AND guild_id = ?');
 
+    // ==================== DASHBOARD ACCESS LOGS ====================
     this._dashLogInsert = this.db.prepare(`
       INSERT INTO dashboard_access_logs (user_id, username, ip, user_agent, timestamp)
       VALUES (@userId, @username, @ip, @userAgent, @timestamp)
     `);
     this._dashLogAll = this.db.prepare('SELECT * FROM dashboard_access_logs ORDER BY id DESC LIMIT 500');
 
+    // ==================== TRANSCRIPTS ====================
     this._transcriptInsert = this.db.prepare(`
       INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, created_at)
       VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @htmlContent, @createdAt)
@@ -351,6 +364,7 @@ class StorageService {
     this._transcriptAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
     this._transcriptGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
 
+    // ==================== ANTINUKE ====================
     this._getAntiNuke = this.db.prepare('SELECT * FROM antinuke_config WHERE guild_id = ?');
     this._setAntiNuke = this.db.prepare(`
       INSERT INTO antinuke_config (guild_id, whitelist_ids, threshold_channel, threshold_role, threshold_ban, threshold_role_update, window_ms, punishment, updated_at)
@@ -369,11 +383,13 @@ class StorageService {
     this._logCounter = 0;
   }
 
+  // ==================== CUSTOM COMMANDS ====================
   loadCommands() { return Object.fromEntries(this._allCmds.all().map(r => [r.name, r.response])); }
   getCommand(name) { return this._getCmd.get(name)?.response ?? null; }
   saveCommand(name, response) { this._upsertCmd.run(name, response, new Date().toISOString()); }
   deleteCommand(name) { return this._delCmd.run(name).changes > 0; }
 
+  // ==================== MOD LOGS ====================
   saveLog(entry) {
     try {
       this._insertLog.run({
@@ -392,6 +408,7 @@ class StorageService {
     return { total: this._countLogs.get().c, byType: this._countByType.all(), blacklist: this._blCount.get().c };
   }
 
+  // ==================== BLACKLIST ====================
   isBlacklisted(userId) { return !!this._blGet.get(userId); }
   getBlacklistEntry(userId) { return this._blGet.get(userId) || null; }
   getAllBlacklist() { return this._blAll.all(); }
@@ -402,6 +419,7 @@ class StorageService {
   }
   removeFromBlacklist(userId) { return this._blDelete.run(userId).changes > 0; }
 
+  // ==================== GUILD CONFIG ====================
   getGuildConfig(guildId) {
     return this._getConfig.get(guildId) || { guild_id: guildId, autorole_id: null, log_channel_id: null };
   }
@@ -422,6 +440,7 @@ class StorageService {
     this._upsertConfig.run({ guildId, autoroleId: current.autorole_id, logChannelId: null, updatedAt: new Date().toISOString() });
   }
 
+  // ==================== MEMBER NOTES ====================
   addNote(guildId, userId, authorId, authorTag, content) {
     const res = this._insertNote.run({ guildId, userId, authorId, authorTag, content, createdAt: new Date().toISOString() });
     return res.lastInsertRowid;
@@ -433,6 +452,7 @@ class StorageService {
   getAllNotes() { return this.db.prepare('SELECT * FROM member_notes ORDER BY id DESC LIMIT 500').all(); }
   deleteNoteById(id) { return this.db.prepare('DELETE FROM member_notes WHERE id = ?').run(id).changes > 0; }
 
+  // ==================== WELCOME ====================
   getWelcomeConfig(guildId) { return this._getWelcome.get(guildId) || null; }
   setWelcomeConfig(guildId, { channelId, message, embedEnabled }) {
     this._setWelcome.run({
@@ -451,6 +471,7 @@ class StorageService {
     this.setWelcomeConfig(guildId, { channelId: current?.channel_id ?? null, message, embedEnabled: current?.embed_enabled });
   }
 
+  // ==================== REACTION ROLES ====================
   addReactionRole(guildId, messageId, channelId, emoji, roleId) {
     this._rrInsert.run({ guildId, messageId, channelId, emoji, roleId, createdAt: new Date().toISOString() });
   }
@@ -459,6 +480,7 @@ class StorageService {
   deleteReactionRole(guildId, id) { return this._rrDelete.run(id, guildId).changes > 0; }
   deleteReactionRolesForMessage(guildId, messageId) { return this._rrDeleteByMessage.run(guildId, messageId).changes > 0; }
 
+  // ==================== AUTORESPONSES ====================
   addAutoresponse(guildId, trigger, response) {
     this._arInsert.run({ guildId, trigger: trigger.toLowerCase(), response, createdAt: new Date().toISOString() });
   }
@@ -466,6 +488,7 @@ class StorageService {
   getAutoresponseByTrigger(guildId, trigger) { return this._arByTrigger.get(guildId, trigger.toLowerCase()) || null; }
   deleteAutoresponse(guildId, id) { return this._arDelete.run(id, guildId).changes > 0; }
 
+  // ==================== BIRTHDAYS ====================
   setBirthday(userId, guildId, day, month, year) {
     this._bdSet.run({ userId, guildId, day, month, year: year || null, updatedAt: new Date().toISOString() });
   }
@@ -474,6 +497,7 @@ class StorageService {
   getAllBirthdays(guildId) { return this._bdAll.all(guildId); }
   deleteBirthday(userId, guildId) { return this._bdDelete.run(userId, guildId).changes > 0; }
 
+  // ==================== REMINDERS ====================
   addReminder(userId, guildId, channelId, content, remindAt) {
     const res = this._remInsert.run({ userId, guildId, channelId, content, remindAt: remindAt.toISOString(), createdAt: new Date().toISOString() });
     return res.lastInsertRowid;
@@ -481,7 +505,9 @@ class StorageService {
   getDueReminders(now = new Date()) { return this._remDue.all(now.toISOString()); }
   deleteReminder(id) { return this._remDelete.run(id).changes > 0; }
   getRemindersForUser(userId, guildId) { return this._remByUser.all(userId, guildId); }
+  getAllReminders() { return this._remAll.all(); }
 
+  // ==================== PERSONAL NOTES ====================
   addPersonalNote(userId, guildId, content) {
     const res = this._pnInsert.run({ userId, guildId, content, createdAt: new Date().toISOString() });
     return res.lastInsertRowid;
@@ -489,6 +515,7 @@ class StorageService {
   getPersonalNotes(userId, guildId) { return this._pnByUser.all(userId, guildId); }
   deletePersonalNote(id, userId) { return this._pnDelete.run(id, userId).changes > 0; }
 
+  // ==================== CASES ====================
   addCase(guildId, userId, moderatorId, action, reason, duration) {
     const now = new Date().toISOString();
     const res = this._caseInsert.run({ guildId, userId, moderatorId, action, reason, duration, now });
@@ -501,6 +528,7 @@ class StorageService {
   }
   deleteCase(guildId, id) { return this._caseDelete.run(id, guildId).changes > 0; }
 
+  // ==================== REPORTS ====================
   addReport(guildId, reporterId, targetId, reason) {
     const res = this._repInsert.run({ guildId, reporterId, targetId, reason, createdAt: new Date().toISOString() });
     return res.lastInsertRowid;
@@ -508,6 +536,7 @@ class StorageService {
   getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
   setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
 
+  // ==================== DASHBOARD ACCESS LOGS ====================
   saveDashboardAccess(userId, username, ip, userAgent) {
     try {
       this._dashLogInsert.run({ userId, username, ip, userAgent, timestamp: new Date().toISOString() });
@@ -515,6 +544,7 @@ class StorageService {
   }
   getDashboardAccessLogs() { return this._dashLogAll.all(); }
 
+  // ==================== TRANSCRIPTS ====================
   saveTranscript(channelId, channelName, userId, claimedBy, priority, htmlContent) {
     this._transcriptInsert.run({
       channelId, channelName, userId, claimedBy, priority, htmlContent,
@@ -524,32 +554,45 @@ class StorageService {
   getAllTranscripts() { return this._transcriptAll.all(); }
   getTranscript(id) { return this._transcriptGet.get(id) || null; }
 
+  // ==================== ANTINUKE ====================
   getAntiNukeConfig(guildId) {
-    return this._getAntiNuke.get(guildId) || {
-      guild_id: guildId,
-      whitelist_ids: '',
-      threshold_channel: 3,
-      threshold_role: 3,
-      threshold_ban: 3,
-      threshold_role_update: 3,
-      window_ms: 10000,
-      punishment: 'quarantine'
-    };
+    const row = this._getAntiNuke.get(guildId);
+    if (!row) {
+      return {
+        guild_id: guildId,
+        whitelist_ids: '',
+        threshold_channel: 3,
+        threshold_role: 3,
+        threshold_ban: 3,
+        threshold_role_update: 3,
+        window_ms: 10000,
+        punishment: 'quarantine'
+      };
+    }
+    return row;
   }
+
   setAntiNukeConfig(guildId, config) {
+    // Supporta sia il formato "generico" (threshold) sia quello specifico (threshold_channel, ...)
+    const thresholdChannel = config.threshold_channel ?? config.threshold ?? 3;
+    const thresholdRole = config.threshold_role ?? config.threshold ?? 3;
+    const thresholdBan = config.threshold_ban ?? 3;
+    const thresholdRoleUpdate = config.threshold_role_update ?? config.threshold ?? 3;
+
     this._setAntiNuke.run({
       guildId,
       whitelistIds: config.whitelist_ids || '',
-      thresholdChannel: config.threshold_channel ?? 1,
-      thresholdRole: config.threshold_role ?? 1,
-      thresholdBan: config.threshold_ban ?? 3,
-      thresholdRoleUpdate: config.threshold_role_update ?? 1,
-      windowMs: config.window_ms ?? 8000,
+      thresholdChannel: Number(thresholdChannel) || 3,
+      thresholdRole: Number(thresholdRole) || 3,
+      thresholdBan: Number(thresholdBan) || 3,
+      thresholdRoleUpdate: Number(thresholdRoleUpdate) || 3,
+      windowMs: Number(config.window_ms) || 10000,
       punishment: config.punishment || 'quarantine',
       updatedAt: new Date().toISOString()
     });
   }
 
+  // ==================== CLOSE ====================
   close() {
     try { if (this.db && this.db.open) this.db.close(); }
     catch (err) { console.error('❌ close error:', err); }
