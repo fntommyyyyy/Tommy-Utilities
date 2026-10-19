@@ -275,7 +275,7 @@ async function quarantineUser(guild, member, reason) {
   }
 }
 
-async function checkAntiNuke(guild, auditAction, actionType, threshold) {
+async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId = null) {
   let executorId = null;
   try {
     const logs = await guild.fetchAuditLogs({ limit: 1, type: auditAction });
@@ -323,13 +323,14 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold) {
 
     antinukeTracker.delete(`${guild.id}-${executorId}-${actionType}`);
 
+    // LOG NEL CANALE DI MODERAZIONE
     await ModLogModule.logUserAction(guild, {
-      type: 'Anti-Nuke',
-      title: '🛡️ Anti-Nuke Attivato',
+      type: 'Anti-Nuke (Ruoli)',
+      title: '🛡️ Anti-Nuke Attivato (Cambio Ruoli)',
       targetId: executorId,
       target: `${member.user.tag} (${executorId})`,
       moderator: 'Sistema Anti-Nuke',
-      reason: `Ha eseguito ${count} azioni di tipo "${actionType}" in ${windowMs}ms (soglia: ${threshold}). Punizione: ${config.punishment}`
+      reason: `Ha modificato i ruoli di ${count} membri in ${windowMs}ms (soglia: ${threshold}). Punizione: ${config.punishment}`
     }).catch(() => {});
   }
 }
@@ -1696,21 +1697,15 @@ const client = new Client({
 clientRef = client;
 
 // ==================== ANTI-NUKE EVENTI ====================
-client.on(Events.ChannelDelete, async (channel) => {
-  if (!channel.guild) return;
-  const config = storage.getAntiNukeConfig(channel.guild.id);
-  await checkAntiNuke(channel.guild, AuditLogEvent.ChannelDelete, 'channel', config.threshold_channel);
-});
+client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
+  if (!newMember.guild) return;
+  
+  // Controlla se i ruoli sono effettivamente cambiati
+  if (oldMember.roles.cache.size === newMember.roles.cache.size) return;
 
-client.on(Events.GuildRoleDelete, async (role) => {
-  if (!role.guild) return;
-  const config = storage.getAntiNukeConfig(role.guild.id);
-  await checkAntiNuke(role.guild, AuditLogEvent.RoleDelete, 'role', config.threshold_role);
-});
-
-client.on(Events.GuildBanAdd, async (ban) => {
-  const config = storage.getAntiNukeConfig(ban.guild.id);
-  await checkAntiNuke(ban.guild, AuditLogEvent.MemberBanAdd, 'ban', config.threshold_ban);
+  const config = storage.getAntiNukeConfig(newMember.guild.id);
+  // Passiamo il targetId per il log (l'utente a cui sono stati cambiati i ruoli)
+  await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', config.threshold_role_update, newMember.id);
 });
 
 // ==================== REMINDER SCHEDULER ====================
