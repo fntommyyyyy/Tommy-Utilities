@@ -86,7 +86,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 
   app.use(session({
-    store: new FileStore({ path: SESSION_DIR, ttl: 7 * 24 * 60 * 60, retries: 0, logFn: () => {} }),
+    store: new FileStore({ path: SESSION_DIR, ttl: 7 * 24 * 60 * 60, retries: 0 }),
     secret: SESSION_SECRET,
     resave: false, saveUninitialized: false, proxy: true,
     cookie: {
@@ -208,7 +208,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     when: z.string().min(1).max(20)
   });
   const schemaAntinuke = z.object({
-    threshold: z.number().int().min(1).max(50).optional(),
+    threshold_channel: z.number().int().min(1).max(50).optional(),
+    threshold_role: z.number().int().min(1).max(50).optional(),
+    threshold_ban: z.number().int().min(1).max(50).optional(),
     threshold_role_update: z.number().int().min(1).max(50).optional(),
     window_ms: z.number().int().min(1000).max(600000).optional(),
     punishment: z.enum(['quarantine', 'ban', 'kick']).optional(),
@@ -900,7 +902,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
   // ==================== ANTINUKE ====================
   app.get('/api/antinuke/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    try { res.json(storage.getAntiNukeConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
+    try {
+      const cfg = storage.getAntiNukeConfig(req.params.guildId);
+      res.json(cfg || {});
+    } catch (e) {
+      log.err('GET antinuke', e);
+      res.status(500).json({ error: 'Errore lettura config' });
+    }
   });
 
   app.post('/api/antinuke/:guildId', requireAuth, (req, res) => {
@@ -908,10 +916,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const data = parseOrFail(schemaAntinuke, req.body || {}, res);
     if (!data) return;
     try {
-      const current = storage.getAntiNukeConfig(req.params.guildId);
+      const current = storage.getAntiNukeConfig(req.params.guildId) || {};
       storage.setAntiNukeConfig(req.params.guildId, { ...current, ...data });
       res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
+    } catch (e) {
+      log.err('POST antinuke', e);
+      res.status(500).json({ error: 'Errore salvataggio: ' + (e.message || 'sconosciuto') });
+    }
   });
 
   // ==================== PAGINE HTML ====================
@@ -2141,10 +2152,14 @@ function renderAntinukeContent() {
 
     <div class="config-block" style="margin-top:14px;">
       <h3>Soglie</h3>
-      <label style="font-size:13px;color:#888;">Threshold generico (azioni)</label>
-      <input type="number" id="an-threshold" min="1" max="50">
-      <label style="font-size:13px;color:#888;">Threshold role update (azioni)</label>
+      <label style="font-size:13px;color:#888;">Threshold canali (azioni)</label>
+      <input type="number" id="an-threshold-channel" min="1" max="50">
+      <label style="font-size:13px;color:#888;">Threshold ruoli (azioni)</label>
       <input type="number" id="an-threshold-role" min="1" max="50">
+      <label style="font-size:13px;color:#888;">Threshold ban (azioni)</label>
+      <input type="number" id="an-threshold-ban" min="1" max="50">
+      <label style="font-size:13px;color:#888;">Threshold role update (azioni)</label>
+      <input type="number" id="an-threshold-role-update" min="1" max="50">
       <label style="font-size:13px;color:#888;">Finestra (ms)</label>
       <input type="number" id="an-window" min="1000" max="600000">
     </div>
@@ -2184,18 +2199,22 @@ function renderAntinukeContent() {
     if (!guildId) return;
     const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId));
     const c = await res.json();
-    document.getElementById('an-threshold').value = c.threshold || 3;
-    document.getElementById('an-threshold-role').value = c.threshold_role_update || 3;
-    document.getElementById('an-window').value = c.window_ms || 10000;
-    document.getElementById('an-punishment').value = c.punishment || 'quarantine';
-    document.getElementById('an-whitelist').value = c.whitelist_ids || '';
+    document.getElementById('an-threshold-channel').value = c.threshold_channel ?? 3;
+    document.getElementById('an-threshold-role').value = c.threshold_role ?? 3;
+    document.getElementById('an-threshold-ban').value = c.threshold_ban ?? 3;
+    document.getElementById('an-threshold-role-update').value = c.threshold_role_update ?? 3;
+    document.getElementById('an-window').value = c.window_ms ?? 10000;
+    document.getElementById('an-punishment').value = c.punishment ?? 'quarantine';
+    document.getElementById('an-whitelist').value = c.whitelist_ids ?? '';
   }
   async function saveAntinuke() {
     const guildId = document.getElementById('an-guild').value;
     if (!guildId) return;
     const payload = {
-      threshold: parseInt(document.getElementById('an-threshold').value, 10) || 3,
-      threshold_role_update: parseInt(document.getElementById('an-threshold-role').value, 10) || 3,
+      threshold_channel: parseInt(document.getElementById('an-threshold-channel').value, 10) || 3,
+      threshold_role: parseInt(document.getElementById('an-threshold-role').value, 10) || 3,
+      threshold_ban: parseInt(document.getElementById('an-threshold-ban').value, 10) || 3,
+      threshold_role_update: parseInt(document.getElementById('an-threshold-role-update').value, 10) || 3,
       window_ms: parseInt(document.getElementById('an-window').value, 10) || 10000,
       punishment: document.getElementById('an-punishment').value,
       whitelist_ids: document.getElementById('an-whitelist').value.trim()
@@ -2204,9 +2223,10 @@ function renderAntinukeContent() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    document.getElementById('an-result').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>'
-      : '<span class="error">❌ Errore</span>';
+    const data = await res.json();
+    const el = document.getElementById('an-result');
+    if (res.ok) el.innerHTML = '<span class="success">✅ Salvato</span>';
+    else el.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>';
   }
   loadGuilds();
   </script>`;
