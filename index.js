@@ -12,7 +12,8 @@ const {
   EmbedBuilder,
   SlashCommandBuilder,
   REST,
-  Routes
+  Routes,
+  AuditLogEvent
 } = require('discord.js');
 
 const StorageService = require('./storage');
@@ -86,15 +87,11 @@ function isAdmin(member) {
   return member.roles?.cache?.some(r => ADMIN_ROLES.includes(r.name)) ?? false;
 }
 
-// Nome leggibile di chi esegue un'azione (GuildMember o User)
 function actorName(executor) {
   if (!executor) return 'N/A';
   return executor.user ? executor.user.tag : (executor.username ?? 'N/A');
 }
 
-// FIX: controllo gerarchia lato esecutore.
-// true se l'esecutore può agire sul bersaglio (il proprietario del server può sempre,
-// nessuno può agire sul proprietario, altrimenti serve un ruolo strettamente più alto).
 function outranks(executor, targetMember, guild) {
   if (!executor || !targetMember) return true;
   if (guild.ownerId === executor.id) return true;
@@ -133,8 +130,6 @@ function getPaginatedSlice(arr, page, perPage) {
   return arr.slice(start, start + perPage);
 }
 
-// FIX: true per qualsiasi interazione rispondibile (slash, bottoni...), false per i messaggi prefisso.
-// Prima si usava isChatInputCommand(), che per i bottoni restituiva false.
 function isInteractionSource(source) {
   return typeof source.isRepliable === 'function' && source.isRepliable();
 }
@@ -168,10 +163,8 @@ async function safeReply(interaction, data) {
 
 async function safeReplySource(source, data, isSlash) {
   if (isSlash) {
-    // Per le interazioni, ephemeral è valido; per i messaggi no.
     return safeReply(source, data);
   }
-  // Per i messaggi prefisso, rimuoviamo eventuali opzioni non valide
   const payload = { ...data };
   delete payload.ephemeral;
   try {
@@ -182,13 +175,11 @@ async function safeReplySource(source, data, isSlash) {
   }
 }
 
-// ===== Auto-embed per risposte testuali di CommandLogic =====
 function buildResultEmbed(result, defaultTitle = 'Risultato') {
   const msg = (result && result.message) ? String(result.message) : '';
   const isSuccess = msg.includes('✅') || result?.success === true;
   const isError = msg.includes('❌') || result?.success === false;
 
-  // Regex corretta: alternanza di emoji complete (con variation selector incluso)
   const cleanText = msg.replace(/^(✅|❌|⚠️|🧹|🔒|🔓|🏓|⏱️)\s*/u, '').trim();
   const customTitle = result && result.title ? result.title : defaultTitle;
   const title = isSuccess ? `✅ ${customTitle}` : isError ? `❌ ${customTitle}` : `ℹ️ ${customTitle}`;
@@ -236,6 +227,114 @@ let clientRef = null;
 const storage = new StorageService(process.env.DB_PATH || './data/bot.db');
 const botStartTime = Date.now();
 
+// ==================== ANTI-NUKE ====================
+const antinukeTracker = new Map();
+
+function trackAction(guildId, userId, actionType, windowMs) {
+  const key = `${guildId}-${userId}-${actionType}`;
+  const now = Date.now();
+  const timestamps = antinukeTracker.get(key) || [];
+  const recent = timestamps.filter(t => now - t < windowMs);
+  recent.push(now);
+  antinukeTracker.set(key, recent);
+  return recent.length;
+}
+
+async function quarantineUser(guild, member, reason) {
+  let quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantena' || r.name === 'Quarantine');
+  
+  if (!quarantineRole) {
+    try {
+      quarantineRole = await guild.roles.create({
+        name: 'Quarantena',
+        color: 0x808080,
+        permissions: [],
+        reason: 'Ruolo creato automaticamente per l\'Anti-Nuke'
+      });
+      log.info(`Creato ruolo "Quarantena" in ${guild.name}`);
+    } catch (err) {
+      log.err('Impossibile creare il ruolo Quarantena', err);
+      return false;
+    }
+  }
+
+  const botMember = guild.members.me;
+  if (quarantineRole.position >= botMember.roles.highest.position) {
+    log.warn(`Il ruolo "Quarantena" è troppo in alto per essere assegnato in ${guild.name}`);
+    return false;
+  }
+
+  try {
+    const rolesToRemove = member.roles.cache.filter(r => r.id !== guild.id && r.id !== quarantineRole.id);
+    await member.roles.remove(rolesToRemove, reason);
+    await member.roles.add(quarantineRole, reason);
+    log.ok(`Utente ${member.user.tag} messo in quarantena in ${guild.name}`);
+    return true;
+  } catch (err) {
+    log.err(`Errore quarantena per ${member.user.tag}`, err);
+    return false;
+  }
+}
+
+async function checkAntiNuke(guild, auditAction, actionType, threshold) {
+  let executorId = null;
+  try {
+    const logs = await guild.fetchAuditLogs({ limit: 1, type: auditAction });
+    const entry = logs.entries.first();
+    if (!entry) return;
+    if (entry.executor.id === clientRef.user.id) return;
+    if (Date.now() - entry.createdTimestamp > 15000) return;
+    executorId = entry.executor.id;
+  } catch (e) {
+    return;
+  }
+
+  if (!executorId) return;
+
+  const config = storage.getAntiNukeConfig(guild.id);
+  const whitelist = config.whitelist_ids.split(',').map(s => s.trim()).filter(Boolean);
+  if (whitelist.includes(executorId)) return;
+  if (executorId === guild.ownerId) return; // Il proprietario del server è sempre immune
+
+  const windowMs = config.window_ms || 10000;
+  const count = trackAction(guild.id, executorId, actionType, windowMs);
+
+  if (count >= (threshold || 3)) {
+    const member = await guild.members.fetch(executorId).catch(() => null);
+    if (!member) return;
+
+    const botMember = guild.members.me;
+    if (member.roles.highest.position >= botMember.roles.highest.position) {
+      log.warn(`Anti-Nuke: impossibile punire ${executorId} (ruolo troppo alto)`);
+      return;
+    }
+
+    const punishReason = `[ANTI-NUKE] Superata soglia ${actionType} (${count} in ${windowMs}ms)`;
+    
+    if (config.punishment === 'quarantine') {
+      const success = await quarantineUser(guild, member, punishReason);
+      if (!success) {
+        await member.ban({ reason: punishReason }).catch(() => {});
+      }
+    } else if (config.punishment === 'ban') {
+      await member.ban({ reason: punishReason }).catch(() => {});
+    } else if (config.punishment === 'kick') {
+      await member.kick(punishReason).catch(() => {});
+    }
+
+    antinukeTracker.delete(`${guild.id}-${executorId}-${actionType}`);
+
+    await ModLogModule.logUserAction(guild, {
+      type: 'Anti-Nuke',
+      title: '🛡️ Anti-Nuke Attivato',
+      targetId: executorId,
+      target: `${member.user.tag} (${executorId})`,
+      moderator: 'Sistema Anti-Nuke',
+      reason: `Ha eseguito ${count} azioni di tipo "${actionType}" in ${windowMs}ms (soglia: ${threshold}). Punizione: ${config.punishment}`
+    }).catch(() => {});
+  }
+}
+
 // ==================== MOD LOG ====================
 const ModLogModule = {
   async logUserAction(guild, logData = {}) {
@@ -279,7 +378,6 @@ const ticketCooldowns = new Map();
 
 async function createTicket(source, user) {
   const guild = source.guild;
-  // FIX: i bottoni sono interazioni → rispondono con reply/followUp, non con channel.send
   const isSlash = isInteractionSource(source);
 
   const botMember = guild.members.me;
@@ -346,7 +444,6 @@ async function createTicket(source, user) {
       permissionOverwrites: overwrites
     });
 
-    // Aggiunti bottoni Claim e Priorità
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('close_ticket').setLabel('Chiudi Ticket').setStyle(ButtonStyle.Danger),
       new ButtonBuilder().setCustomId('claim_ticket').setLabel('Prendi in carico').setStyle(ButtonStyle.Success),
@@ -392,7 +489,6 @@ async function createTicket(source, user) {
 
 async function closeTicket(source, user) {
   const channel = source.channel;
-  // FIX: come sopra, vale anche per il bottone "Chiudi Ticket"
   const isSlash = isInteractionSource(source);
 
   if (!isTicketChannel(channel)) {
@@ -684,7 +780,6 @@ async function addBlacklist(source, targetUser, reason, moderator, isSlash) {
     }, isSlash);
   }
 
-  // FIX: il ban su tutti i server può superare i 3 secondi → defer dopo i controlli (gli errori restano ephemeral).
   if (isSlash && !source.deferred && !source.replied) {
     await source.deferReply().catch(err => log.err('addBlacklist deferReply', err));
   }
@@ -747,7 +842,6 @@ async function removeBlacklist(source, targetUser, moderator, isSlash) {
     }, isSlash);
   }
 
-  // FIX: lo sban su tutti i server può superare i 3 secondi → defer dopo il controllo.
   if (isSlash && !source.deferred && !source.replied) {
     await source.deferReply().catch(err => log.err('removeBlacklist deferReply', err));
   }
@@ -757,12 +851,11 @@ async function removeBlacklist(source, targetUser, moderator, isSlash) {
   const results = await Promise.allSettled(
     clientRef.guilds.cache.map(async (guild) => {
       try {
-        // FIX: si scarica solo il ban dell'utente invece di tutta la lista ban del server.
         let ban = null;
         try {
           ban = await guild.bans.fetch(targetUser.id);
         } catch (e) {
-          if (e.code !== 10026) throw e; // 10026 = Unknown Ban (utente non bannato)
+          if (e.code !== 10026) throw e;
         }
         if (ban) {
           await guild.members.unban(targetUser.id, `[BLACKLIST RIMOSSA] ${moderator.username}`);
@@ -1197,12 +1290,10 @@ const CommandLogic = {
       return { success: false, message: '❌ Non posso espellere me stesso!' };
     if (member.roles.highest.position >= botMember.roles.highest.position)
       return { success: false, message: '❌ Non posso espellere un utente con ruolo più alto!' };
-    // FIX: l'esecutore non può espellere chi ha un ruolo uguale o superiore al suo
     if (!outranks(executor, member, guild))
       return { success: false, message: '❌ Non puoi espellere un utente con ruolo uguale o superiore al tuo!' };
 
     await member.kick(reason);
-    // FIX: l'azione ora viene registrata nei modlogs
     await ModLogModule.logUserAction(guild, {
       type: 'Kick', title: 'Kick', targetId,
       target: `${member.user.tag} (${targetId})`,
@@ -1227,12 +1318,10 @@ const CommandLogic = {
     const member = await this.getUserFromId(guild, targetId);
     if (member && !member.bannable)
       return { success: false, message: '❌ Non posso bannare questo utente!' };
-    // FIX: l'esecutore non può bannare chi ha un ruolo uguale o superiore al suo
     if (member && !outranks(executor, member, guild))
       return { success: false, message: '❌ Non puoi bannare un utente con ruolo uguale o superiore al tuo!' };
 
     await guild.members.ban(targetId, { reason });
-    // FIX: l'azione ora viene registrata nei modlogs
     await ModLogModule.logUserAction(guild, {
       type: 'Ban', title: 'Ban', targetId,
       target: member ? `${member.user.tag} (${targetId})` : targetId,
@@ -1256,7 +1345,6 @@ const CommandLogic = {
       const ban = await guild.bans.fetch(targetId);
       if (!ban) return { success: false, message: '❌ Utente non bannato!' };
       await guild.bans.remove(targetId);
-      // FIX: l'azione ora viene registrata nei modlogs
       await ModLogModule.logUserAction(guild, {
         type: 'Unban', title: 'Unban', targetId,
         target: `${ban.user.tag} (${targetId})`,
@@ -1281,7 +1369,6 @@ const CommandLogic = {
 
     try {
       const deleted = await channel.bulkDelete(amount, true);
-      // FIX: l'azione ora viene registrata nei modlogs
       await ModLogModule.logUserAction(channel.guild, {
         type: 'Clear', title: 'Clear Messaggi',
         moderator: `${actorName(executor)} (${executor.id})`,
@@ -1350,7 +1437,7 @@ const CommandLogic = {
       return { success: false, message: '❌ Non hai il permesso "Gestisci Ruoli"!' };
 
     const targetId = extractUserId(targetUserId);
-    const roleIdMatch = extractRoleId(roleId); // FIX: usa extractRoleId
+    const roleIdMatch = extractRoleId(roleId);
     if (!targetId) return { success: false, message: '❌ ID utente non valido!' };
     if (!roleIdMatch) return { success: false, message: '❌ ID ruolo non valido!' };
 
@@ -1364,7 +1451,6 @@ const CommandLogic = {
       return { success: false, message: '❌ Non ho il permesso "Gestisci Ruoli"!' };
     if (role.position >= botMember.roles.highest.position)
       return { success: false, message: '❌ Non posso assegnare un ruolo più alto o uguale al mio!' };
-    // FIX: l'esecutore non può assegnare ruoli più alti o uguali al suo (evita l'escalation di privilegi)
     if (guild.ownerId !== executor.id && role.position >= executor.roles.highest.position)
       return { success: false, message: '❌ Non puoi assegnare un ruolo più alto o uguale al tuo!' };
     if (member.roles.cache.has(roleIdMatch))
@@ -1379,7 +1465,7 @@ const CommandLogic = {
       return { success: false, message: '❌ Non hai il permesso "Gestisci Ruoli"!' };
 
     const targetId = extractUserId(targetUserId);
-    const roleIdMatch = extractRoleId(roleId); // FIX: usa extractRoleId
+    const roleIdMatch = extractRoleId(roleId);
     if (!targetId) return { success: false, message: '❌ ID utente non valido!' };
     if (!roleIdMatch) return { success: false, message: '❌ ID ruolo non valido!' };
 
@@ -1391,7 +1477,6 @@ const CommandLogic = {
     const botMember = guild.members.me;
     if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles))
       return { success: false, message: '❌ Non ho il permesso "Gestisci Ruoli"!' };
-    // FIX: controlli di gerarchia (prima mancavano in rimozione)
     if (role.position >= botMember.roles.highest.position)
       return { success: false, message: '❌ Non posso rimuovere un ruolo più alto o uguale al mio!' };
     if (guild.ownerId !== executor.id && role.position >= executor.roles.highest.position)
@@ -1432,7 +1517,6 @@ const CommandLogic = {
 
     await channel.permissionOverwrites.edit(everyone, { SendMessages: false });
     const name = executor.user ? executor.user.tag : executor.username;
-    // FIX: l'azione ora viene registrata nei modlogs
     await ModLogModule.logUserAction(channel.guild, {
       type: 'Lock', title: 'Canale Bloccato',
       moderator: `${name} (${executor.id})`,
@@ -1457,7 +1541,6 @@ const CommandLogic = {
 
     await channel.permissionOverwrites.delete(everyone);
     const name = executor.user ? executor.user.tag : executor.username;
-    // FIX: l'azione ora viene registrata nei modlogs
     await ModLogModule.logUserAction(channel.guild, {
       type: 'Unlock', title: 'Canale Sbloccato',
       moderator: `${name} (${executor.id})`,
@@ -1576,7 +1659,6 @@ async function registerSlashCommands(clientId, token) {
 
   try {
     if (GUILD_ID) {
-      // Rimuove solo i comandi globali (evita doppioni), poi sovrascrive quelli della guild
       await rest.put(Routes.applicationCommands(clientId), { body: [] }).catch(err =>
         log.warn(`Cancellazione globali fallita: ${err.message}`));
 
@@ -1610,8 +1692,25 @@ const client = new Client({
 });
 clientRef = client;
 
+// ==================== ANTI-NUKE EVENTI ====================
+client.on(Events.ChannelDelete, async (channel) => {
+  if (!channel.guild) return;
+  const config = storage.getAntiNukeConfig(channel.guild.id);
+  await checkAntiNuke(channel.guild, AuditLogEvent.ChannelDelete, 'channel', config.threshold_channel);
+});
+
+client.on(Events.GuildRoleDelete, async (role) => {
+  if (!role.guild) return;
+  const config = storage.getAntiNukeConfig(role.guild.id);
+  await checkAntiNuke(role.guild, AuditLogEvent.RoleDelete, 'role', config.threshold_role);
+});
+
+client.on(Events.GuildBanAdd, async (ban) => {
+  const config = storage.getAntiNukeConfig(ban.guild.id);
+  await checkAntiNuke(ban.guild, AuditLogEvent.MemberBanAdd, 'ban', config.threshold_ban);
+});
+
 // ==================== REMINDER SCHEDULER ====================
-// Ogni 30 secondi controlla se ci sono reminder scaduti e li invia
 setInterval(async () => {
   try {
     const due = storage.getDueReminders(new Date());
@@ -1657,19 +1756,14 @@ async function handlePrefixCommand(message) {
 
   const { guild, channel, member } = message;
 
-  // ===== COMANDI CUSTOM =====
-  // Se il comando esiste come custom, cancelliamo il messaggio dell'utente
-  // (se il bot ha il permesso) e inviamo la risposta.
   const custom = storage.getCommand(commandName);
   if (custom) {
-    // 1) Cancella il messaggio dell'utente (se possibile)
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
       await message.delete().catch(err => {
         log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`);
       });
     }
 
-    // 2) Invia la risposta con allowedMentions per pingare utenti ed everyone
     return channel.send({
       content: custom,
       allowedMentions: {
@@ -1684,7 +1778,6 @@ async function handlePrefixCommand(message) {
     return message.reply({ content: `⏳ Aspetta ${cd.remaining}s prima di riusare questo comando.`, allowedMentions: { repliedUser: false } });
   }
 
-  // Reply helper automatico in embed
   const replyMethod = async (r) => {
     if (!r || !r.message) return;
     const embed = buildResultEmbed(r, r.title || 'Risultato');
@@ -1886,7 +1979,6 @@ async function handlePrefixCommand(message) {
           if (id) { try { user = await client.users.fetch(id); } catch {} }
         }
         if (!user) user = message.author;
-        // FIX: fetch invece della sola cache
         const m = await guild.members.fetch(user.id).catch(() => null);
         return channel.send({
           embeds: [EmbedManager.info(`Info ${user.username}`, `Info su ${user}`)
@@ -1909,7 +2001,6 @@ async function handlePrefixCommand(message) {
           if (id) { try { target = await client.users.fetch(id); } catch {} }
         }
         if (!target) return message.reply({ embeds: [EmbedManager.error('Sintassi', 'Uso: `-warn <@utente o ID> [motivo]`')] });
-        // FIX: fetch invece della sola cache
         const m = await guild.members.fetch(target.id).catch(() => null);
         if (!m) return message.reply({ embeds: [EmbedManager.error('Errore', 'Utente non nel server.')] });
         if (target.id === message.author.id) return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi warnare te stesso.')] });
@@ -1941,7 +2032,6 @@ async function handlePrefixCommand(message) {
           return message.reply({ embeds: [EmbedManager.error('Sintassi', 'Uso: `-timeout <@utente o ID> <secondi> [motivo]`')] });
         if (seconds < 1 || seconds > 2419200)
           return message.reply({ embeds: [EmbedManager.error('Durata non valida', 'Secondi tra 1 e 2419200 (28 giorni).')] });
-        // FIX: fetch invece della sola cache
         const m = await guild.members.fetch(target.id).catch(() => null);
         if (!m) return message.reply({ embeds: [EmbedManager.error('Errore', 'Utente non nel server.')] });
         if (target.id === message.author.id) return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi timeout te stesso.')] });
@@ -1949,10 +2039,8 @@ async function handlePrefixCommand(message) {
         const bot = guild.members.me;
         if (!bot.permissions.has(PermissionsBitField.Flags.ModerateMembers))
           return message.reply({ embeds: [EmbedManager.error('Permessi', 'Manca "Modera Membri".')] });
-        // FIX: controllo gerarchia esplicito
         if (!m.moderatable)
           return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso timeout questo utente.')] });
-        // FIX: l'esecutore non può mettere in timeout chi ha un ruolo uguale o superiore al suo
         if (!outranks(member, m, guild))
           return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi timeout un utente con ruolo uguale o superiore al tuo.')] });
         const reason = args.slice(2).join(' ') || 'Nessun motivo specificato';
@@ -2138,7 +2226,6 @@ async function handlePrefixCommand(message) {
           .replace(/{server}/g, guild.name)
           .replace(/{memberCount}/g, guild.memberCount);
 
-        // &welcome channel <#canale o ID>
         if (sub === 'channel') {
           const raw = args[0] || '';
           const mm = raw.match(/^<#(\d{17,20})>$/);
@@ -2150,7 +2237,6 @@ async function handlePrefixCommand(message) {
           return message.reply({ embeds: [EmbedManager.success('Canale Impostato', `Benvenuto in ${ch}`)] });
         }
 
-        // &welcome message <testo>
         if (sub === 'message') {
           const testo = args.join(' ').trim();
           if (!testo)
@@ -2159,7 +2245,6 @@ async function handlePrefixCommand(message) {
           return message.reply({ embeds: [EmbedManager.success('Messaggio Impostato', `**Anteprima:**\n\n${fill(testo, message.author)}`)] });
         }
 
-        // &welcome toggle
         if (sub === 'toggle') {
           const current = storage.getWelcomeConfig(gid);
           const newVal = !(current?.embed_enabled);
@@ -2167,7 +2252,6 @@ async function handlePrefixCommand(message) {
           return message.reply({ embeds: [EmbedManager.success('Formato Cambiato', newVal ? 'Ora uso **embed**' : 'Ora uso **testo semplice**')] });
         }
 
-        // &welcome test
         if (sub === 'test') {
           const config = storage.getWelcomeConfig(gid);
           if (!config || !config.channel_id)
@@ -2186,7 +2270,6 @@ async function handlePrefixCommand(message) {
           return message.reply({ content: text, allowedMentions: { parse: [], repliedUser: false } });
         }
 
-        // &welcome disable
         if (sub === 'disable' || sub === 'off') {
           storage.disableWelcome(gid);
           return message.reply({ embeds: [EmbedManager.warning('Benvenuto Disattivato', 'Il sistema di benvenuto è disattivato. Riattivalo con `&welcome channel <#canale>`.')] });
@@ -2269,7 +2352,6 @@ async function handleSlashCommand(interaction) {
 
     case 'userinfo': {
       const user = interaction.options.getUser('utente') || interaction.user;
-      // FIX: fetch invece della sola cache
       const m = await guild.members.fetch(user.id).catch(() => null);
       return interaction.reply({
         embeds: [EmbedManager.info(`Info ${user.username}`, `Info su ${user}`)
@@ -2294,7 +2376,6 @@ async function handleSlashCommand(interaction) {
         return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')], ephemeral: true });
       const target = interaction.options.getUser('utente');
       const reason = interaction.options.getString('motivo') || 'Nessun motivo specificato';
-      // FIX: fetch invece della sola cache
       const m = await guild.members.fetch(target.id).catch(() => null);
       if (!m) return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Utente non nel server.')], ephemeral: true });
       if (target.id === interaction.user.id) return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non puoi warnare te stesso.')], ephemeral: true });
@@ -2321,7 +2402,6 @@ async function handleSlashCommand(interaction) {
       const reason = interaction.options.getString('motivo') || 'Nessun motivo specificato';
       if (seconds < 1 || seconds > 2419200)
         return safeReply(interaction, { embeds: [EmbedManager.error('Durata non valida', 'Tra 1 e 2419200 secondi.')], ephemeral: true });
-      // FIX: fetch invece della sola cache
       const m = await guild.members.fetch(target.id).catch(() => null);
       if (!m) return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Utente non nel server.')], ephemeral: true });
       if (target.id === interaction.user.id) return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non puoi timeout te stesso.')], ephemeral: true });
@@ -2329,10 +2409,8 @@ async function handleSlashCommand(interaction) {
       const bot = guild.members.me;
       if (!bot.permissions.has(PermissionsBitField.Flags.ModerateMembers))
         return safeReply(interaction, { embeds: [EmbedManager.error('Permessi', 'Manca "Modera Membri".')], ephemeral: true });
-      // FIX: controllo gerarchia esplicito
       if (!m.moderatable)
         return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non posso timeout questo utente.')], ephemeral: true });
-      // FIX: l'esecutore non può mettere in timeout chi ha un ruolo uguale o superiore al suo
       if (!outranks(member, m, guild))
         return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non puoi timeout un utente con ruolo uguale o superiore al tuo.')], ephemeral: true });
       try { await m.timeout(seconds * 1000, reason); }
@@ -2570,7 +2648,6 @@ async function handleSlashCommand(interaction) {
     }
 
     default:
-      // Comando sconosciuto: rispondi per evitare "interazione fallita"
       return safeReply(interaction, {
         embeds: [EmbedManager.error('Comando Sconosciuto', `Il comando \`/${commandName}\` non è gestito.`)],
         ephemeral: true
@@ -2584,7 +2661,6 @@ async function handleButton(interaction) {
   if (interaction.customId === 'close_ticket') return closeTicket(interaction, interaction.user);
   if (interaction.customId === 'create_lobby') return createLobby(interaction);
 
-  // NUOVI BOTTONI PER TICKET AVANZATI
   if (interaction.customId === 'claim_ticket') {
     const embed = EmbedManager.success('Ticket Claimato', `Il ticket è stato preso in carico da ${interaction.user}.`);
     await interaction.reply({ embeds: [embed] });
@@ -2691,15 +2767,11 @@ let webServer = null;
 
 (async () => {
   try {
-    // 1) LOGIN PRIMA — priorità assoluta al bot online
     await client.login(TOKEN);
     log.ok('✅ Bot online');
 
-    // 1b) Avvia il web server (dashboard)
     webServer = createWebServer({ storage, client, log, botStartTime });
 
-    // 2) Registrazione comandi DOPO — non bloccante
-    //    Se Discord è in rate limit, fallisce ma il bot resta online
     registerSlashCommands(CLIENT_ID, TOKEN).catch(err => {
       log.err('❌ Registrazione comandi fallita (ma il bot è online)', err);
     });
