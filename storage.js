@@ -176,6 +176,28 @@ class StorageService {
         updated_at TEXT NOT NULL
       );
     `);
+
+    // ==================== MIGRAZIONI MANUALI (PATCH) ====================
+    // Controlla se la colonna esiste, altrimenti la aggiunge.
+    // Questo serve perché CREATE TABLE IF NOT EXISTS non modifica tabelle esistenti.
+
+    const checkColumn = (table, column) => {
+      try {
+        const info = this.db.prepare(`PRAGMA table_info(${table})`).all();
+        return info.some(col => col.name === column);
+      } catch (e) {
+        return false;
+      }
+    };
+
+    if (!checkColumn('antinuke_config', 'threshold_role_update')) {
+      try {
+        this.db.exec(`ALTER TABLE antinuke_config ADD COLUMN threshold_role_update INTEGER DEFAULT 3;`);
+        console.log('✅ Aggiunta colonna threshold_role_update ad antinuke_config');
+      } catch (e) {
+        console.error('❌ Errore aggiunta colonna threshold_role_update:', e.message);
+      }
+    }
   }
 
   _prepare() {
@@ -506,10 +528,10 @@ class StorageService {
     return this._getAntiNuke.get(guildId) || {
       guild_id: guildId,
       whitelist_ids: '',
-      threshold_channel: 1,
-      threshold_role: 1,
+      threshold_channel: 3,
+      threshold_role: 3,
       threshold_ban: 3,
-      threshold_role_update: 1,
+      threshold_role_update: 3,
       window_ms: 10000,
       punishment: 'quarantine'
     };
