@@ -170,6 +170,7 @@ class StorageService {
         threshold_channel INTEGER DEFAULT 3,
         threshold_role INTEGER DEFAULT 3,
         threshold_ban INTEGER DEFAULT 3,
+        threshold_role_update INTEGER DEFAULT 3,
         window_ms INTEGER DEFAULT 10000,
         punishment TEXT DEFAULT 'quarantine',
         updated_at TEXT NOT NULL
@@ -330,13 +331,14 @@ class StorageService {
 
     this._getAntiNuke = this.db.prepare('SELECT * FROM antinuke_config WHERE guild_id = ?');
     this._setAntiNuke = this.db.prepare(`
-      INSERT INTO antinuke_config (guild_id, whitelist_ids, threshold_channel, threshold_role, threshold_ban, window_ms, punishment, updated_at)
-      VALUES (@guildId, @whitelistIds, @thresholdChannel, @thresholdRole, @thresholdBan, @windowMs, @punishment, @updatedAt)
+      INSERT INTO antinuke_config (guild_id, whitelist_ids, threshold_channel, threshold_role, threshold_ban, threshold_role_update, window_ms, punishment, updated_at)
+      VALUES (@guildId, @whitelistIds, @thresholdChannel, @thresholdRole, @thresholdBan, @thresholdRoleUpdate, @windowMs, @punishment, @updatedAt)
       ON CONFLICT(guild_id) DO UPDATE SET
         whitelist_ids = excluded.whitelist_ids,
         threshold_channel = excluded.threshold_channel,
         threshold_role = excluded.threshold_role,
         threshold_ban = excluded.threshold_ban,
+        threshold_role_update = excluded.threshold_role_update,
         window_ms = excluded.window_ms,
         punishment = excluded.punishment,
         updated_at = excluded.updated_at
@@ -504,9 +506,10 @@ class StorageService {
     return this._getAntiNuke.get(guildId) || {
       guild_id: guildId,
       whitelist_ids: '',
-      threshold_channel: 3,
-      threshold_role: 3,
+      threshold_channel: 1,
+      threshold_role: 1,
       threshold_ban: 3,
+      threshold_role_update: 1,
       window_ms: 10000,
       punishment: 'quarantine'
     };
@@ -518,6 +521,7 @@ class StorageService {
       thresholdChannel: config.threshold_channel ?? 3,
       thresholdRole: config.threshold_role ?? 3,
       thresholdBan: config.threshold_ban ?? 3,
+      thresholdRoleUpdate: config.threshold_role_update ?? 3,
       windowMs: config.window_ms ?? 10000,
       punishment: config.punishment || 'quarantine',
       updatedAt: new Date().toISOString()
