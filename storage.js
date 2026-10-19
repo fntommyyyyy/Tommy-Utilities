@@ -163,6 +163,17 @@ class StorageService {
         html_content TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS antinuke_config (
+        guild_id TEXT PRIMARY KEY,
+        whitelist_ids TEXT DEFAULT '',
+        threshold_channel INTEGER DEFAULT 3,
+        threshold_role INTEGER DEFAULT 3,
+        threshold_ban INTEGER DEFAULT 3,
+        window_ms INTEGER DEFAULT 10000,
+        punishment TEXT DEFAULT 'quarantine',
+        updated_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -316,6 +327,20 @@ class StorageService {
     `);
     this._transcriptAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
     this._transcriptGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
+
+    this._getAntiNuke = this.db.prepare('SELECT * FROM antinuke_config WHERE guild_id = ?');
+    this._setAntiNuke = this.db.prepare(`
+      INSERT INTO antinuke_config (guild_id, whitelist_ids, threshold_channel, threshold_role, threshold_ban, window_ms, punishment, updated_at)
+      VALUES (@guildId, @whitelistIds, @thresholdChannel, @thresholdRole, @thresholdBan, @windowMs, @punishment, @updatedAt)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        whitelist_ids = excluded.whitelist_ids,
+        threshold_channel = excluded.threshold_channel,
+        threshold_role = excluded.threshold_role,
+        threshold_ban = excluded.threshold_ban,
+        window_ms = excluded.window_ms,
+        punishment = excluded.punishment,
+        updated_at = excluded.updated_at
+    `);
 
     this._logCounter = 0;
   }
@@ -474,6 +499,30 @@ class StorageService {
   }
   getAllTranscripts() { return this._transcriptAll.all(); }
   getTranscript(id) { return this._transcriptGet.get(id) || null; }
+
+  getAntiNukeConfig(guildId) {
+    return this._getAntiNuke.get(guildId) || {
+      guild_id: guildId,
+      whitelist_ids: '',
+      threshold_channel: 3,
+      threshold_role: 3,
+      threshold_ban: 3,
+      window_ms: 10000,
+      punishment: 'quarantine'
+    };
+  }
+  setAntiNukeConfig(guildId, config) {
+    this._setAntiNuke.run({
+      guildId,
+      whitelistIds: config.whitelist_ids || '',
+      thresholdChannel: config.threshold_channel ?? 3,
+      thresholdRole: config.threshold_role ?? 3,
+      thresholdBan: config.threshold_ban ?? 3,
+      windowMs: config.window_ms ?? 10000,
+      punishment: config.punishment || 'quarantine',
+      updatedAt: new Date().toISOString()
+    });
+  }
 
   close() {
     try { if (this.db && this.db.open) this.db.close(); }
