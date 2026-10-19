@@ -452,6 +452,182 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
 
+  // ==================== MESSAGGI ====================
+  // Lista canali testuali di tutti i server (per il select)
+  app.get('/api/messages/channels', requireAuth, (req, res) => {
+    const out = [];
+    for (const guild of client.guilds.cache.values()) {
+      for (const ch of guild.channels.cache.values()) {
+        if (ch.type === 0) {
+          out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
+        }
+      }
+    }
+    out.sort((a, b) => a.guildName.localeCompare(b.guildName) || a.channelName.localeCompare(b.channelName));
+    res.json(out);
+  });
+
+  // Invio messaggio (testo + embed opzionale)
+  app.post('/api/messages/send', requireAuth, async (req, res) => {
+    try {
+      const { channelId, content, embed } = req.body || {};
+      if (!channelId) return res.status(400).json({ error: 'channelId mancante' });
+      if (!content && !embed) return res.status(400).json({ error: 'Contenuto vuoto' });
+      if (content && content.length > 2000) return res.status(400).json({ error: 'Testo max 2000 caratteri' });
+
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
+
+      const botMember = channel.guild?.members?.me;
+      if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) {
+        return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
+      }
+
+      const payload = {};
+      if (content) payload.content = content;
+
+      if (embed && (embed.title || embed.description)) {
+        const { EmbedBuilder } = require('discord.js');
+        const e = new EmbedBuilder();
+        if (embed.title) e.setTitle(String(embed.title).slice(0, 256));
+        if (embed.description) e.setDescription(String(embed.description).slice(0, 4096));
+        if (embed.color) e.setColor(embed.color);
+        if (embed.image) e.setImage(embed.image);
+        if (embed.thumbnail) e.setThumbnail(embed.thumbnail);
+        if (embed.footer) e.setFooter({ text: String(embed.footer).slice(0, 2048) });
+        payload.embeds = [e];
+      }
+
+      const sent = await channel.send(payload);
+
+      try {
+        storage.saveDashboardAccess(
+          req.session.user.id,
+          `MSG→#${channel.name} (${channel.guild?.name || 'DM'})`,
+          (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-',
+          (req.headers['user-agent'] || '').slice(0, 300)
+        );
+      } catch {}
+
+      res.json({ ok: true, messageId: sent.id, channelId: channel.id });
+    } catch (e) {
+      log.err('api/messages/send', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ==================== GESTIONE UTENTI ====================
+  app.get('/api/user-lookup/:userId', requireAuth, async (req, res) => {
+    const userId = req.params.userId;
+    if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
+    try {
+      const user = await client.users.fetch(userId).catch(() => null);
+      if (!user) return res.status(404).json({ error: 'Utente non trovato' });
+
+      const memberships = [];
+      for (const guild of client.guilds.cache.values()) {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (member) {
+          memberships.push({
+            guildId: guild.id, guildName: guild.name,
+            joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name)
+          });
+        }
+      }
+      res.json({
+        id: user.id, username: user.username, tag: user.tag, bot: user.bot,
+        avatar: user.displayAvatarURL({ size: 128 }), createdAt: user.createdAt,
+        memberships
+      });
+    } catch (e) {
+      log.err('api/user-lookup', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post('/api/user-action', requireAuth, async (req, res) => {
+    const { action, userId, guildId, reason } = req.body || {};
+    if (!['kick', 'ban', 'unban'].includes(action))
+      return res.status(400).json({ error: 'Azione non valida' });
+    if (!/^\d{17,20}$/.test(userId || ''))
+      return res.status(400).json({ error: 'userId non valido' });
+    if (!guildId) return res.status(400).json({ error: 'guildId mancante' });
+
+    try {
+      const guild = client.guilds.cache.get(guildId);
+      if (!guild) return res.status(404).json({ error: 'Server non trovato' });
+
+      const botMember = guild.members.me;
+      const r = (reason || `Azione da dashboard (${req.session.user.username})`).slice(0, 512);
+
+      if (action === 'kick') {
+        if (!botMember.permissions.has('KickMembers'))
+          return res.status(403).json({ error: 'Il bot non ha "Espelli Membri"' });
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (!member) return res.status(404).json({ error: 'Utente non nel server' });
+        if (member.id === guild.ownerId) return res.status(403).json({ error: 'Non puoi espellere il proprietario' });
+        if (member.roles.highest.position >= botMember.roles.highest.position)
+          return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
+        if (!member.kickable) return res.status(403).json({ error: 'Utente non espellibile' });
+        await member.kick(r);
+        storage.saveLog({
+          type: 'Kick (dashboard)', targetId: userId,
+          target: `${member.user.tag} (${userId})`,
+          moderator: `${req.session.user.username} (${req.session.user.id})`,
+          reason: r, channel: 'Web Dashboard'
+        });
+      }
+
+      if (action === 'ban') {
+        if (!botMember.permissions.has('BanMembers'))
+          return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
+        if (userId === guild.ownerId) return res.status(403).json({ error: 'Non puoi bannare il proprietario' });
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (member) {
+          if (member.roles.highest.position >= botMember.roles.highest.position)
+            return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
+          if (!member.bannable) return res.status(403).json({ error: 'Utente non bannabile' });
+        }
+        await guild.members.ban(userId, { reason: r });
+        storage.saveLog({
+          type: 'Ban (dashboard)', targetId: userId,
+          target: member ? `${member.user.tag} (${userId})` : userId,
+          moderator: `${req.session.user.username} (${req.session.user.id})`,
+          reason: r, channel: 'Web Dashboard'
+        });
+      }
+
+      if (action === 'unban') {
+        if (!botMember.permissions.has('BanMembers'))
+          return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
+        let ban = null;
+        try { ban = await guild.bans.fetch(userId); } catch (e) { if (e.code !== 10026) throw e; }
+        if (!ban) return res.status(404).json({ error: 'Utente non bannato' });
+        await guild.members.unban(userId, r);
+        storage.saveLog({
+          type: 'Unban (dashboard)', targetId: userId,
+          target: `${ban.user.tag} (${userId})`,
+          moderator: `${req.session.user.username} (${req.session.user.id})`,
+          reason: r, channel: 'Web Dashboard'
+        });
+      }
+
+      try {
+        storage.saveDashboardAccess(
+          req.session.user.id,
+          `${action.toUpperCase()} ${userId} su ${guild.name}`,
+          (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-',
+          (req.headers['user-agent'] || '').slice(0, 300)
+        );
+      } catch {}
+
+      res.json({ ok: true, action, userId, guildId });
+    } catch (e) {
+      log.err('api/user-action', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   // ==================== PAGINE HTML ====================
   app.get('/dashboard', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'dashboard')));
   app.get('/modlogs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'modlogs')));
@@ -464,6 +640,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/user/:userId', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'user', { userId: req.params.userId })));
   app.get('/search', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'search', { q: (req.query.q || '').toString() })));
   app.get('/access-logs', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'accesslogs')));
+  app.get('/messages', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'messages')));
+  app.get('/user-actions', requireAuth, (req, res) => res.send(renderLayout(req.session.user, 'userActions')));
+  app.get('/user-actions/:userId', requireAuth, (req, res) =>
+    res.send(renderLayout(req.session.user, 'userActions', { userId: req.params.userId })));
 
   // ==================== AVVIO ====================
   const server = app.listen(PORT, HOST, () => {
@@ -503,7 +683,9 @@ function renderLayout(user, page, params = {}) {
     top: renderTopContent(),
     user: renderUserContent(params.userId),
     search: renderSearchContent(params.q || ''),
-    accesslogs: renderAccessLogsContent()
+    accesslogs: renderAccessLogsContent(),
+    messages: renderMessagesContent(),
+    userActions: renderUserActionsContent(params.userId || '')
   };
 
   return `<!DOCTYPE html>
@@ -595,6 +777,8 @@ function renderLayout(user, page, params = {}) {
     <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
     <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
     <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
+    <a href="/messages" class="${page === 'messages' ? 'active' : ''}">✉️ Messaggi</a>
+    <a href="/user-actions" class="${page === 'userActions' ? 'active' : ''}">🛠️ Gestione Utenti</a>
     <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
   </nav>
 
@@ -1103,6 +1287,7 @@ function renderUserContent(userId) {
   <div class="section">
     <h2>👤 Utente <code>${userId}</code></h2>
     <p style="color:#888;font-size:13px;">Dettagli completi su questo utente.</p>
+    <a href="/user-actions/${userId}"><button class="secondary small" style="margin-top:10px;">🛠️ Gestisci utente</button></a>
   </div>
 
   <div class="grid">
@@ -1279,6 +1464,155 @@ function renderAccessLogsContent() {
       '</tr>').join('') + '</tbody></table>';
   }
   loadAccess();
+  </script>`;
+}
+
+// ---------- MESSAGGI ----------
+function renderMessagesContent() {
+  return `
+  <div class="section">
+    <h2>✉️ Invia Messaggio</h2>
+    <label style="font-size:13px;color:#888;">Canale</label>
+    <select id="msg-channel"></select>
+
+    <label style="font-size:13px;color:#888;">Testo (max 2000)</label>
+    <textarea id="msg-content" rows="3" placeholder="Ciao {user}..."></textarea>
+
+    <details style="margin:14px 0;">
+      <summary style="cursor:pointer;color:#5865F2;">➕ Aggiungi embed (opzionale)</summary>
+      <div style="margin-top:12px;">
+        <input id="emb-title" placeholder="Titolo">
+        <textarea id="emb-desc" rows="3" placeholder="Descrizione"></textarea>
+        <input id="emb-color" placeholder="Colore (es. #5865F2)">
+        <input id="emb-image" placeholder="URL immagine">
+        <input id="emb-thumb" placeholder="URL thumbnail">
+        <input id="emb-footer" placeholder="Footer">
+      </div>
+    </details>
+
+    <button onclick="sendMessage()">📤 Invia</button>
+    <div id="msg-result"></div>
+  </div>
+
+  <script>
+  let channelsCache = [];
+  async function loadChannels() {
+    const res = await fetch('/api/messages/channels');
+    channelsCache = await res.json();
+    const sel = document.getElementById('msg-channel');
+    sel.innerHTML = channelsCache.map(c =>
+      '<option value="' + c.channelId + '">' + c.guildName + ' → #' + c.channelName + '</option>'
+    ).join('') || '<option value="">Nessun canale</option>';
+  }
+
+  async function sendMessage() {
+    const channelId = document.getElementById('msg-channel').value;
+    const content = document.getElementById('msg-content').value.trim();
+    const embed = {
+      title: document.getElementById('emb-title').value.trim() || undefined,
+      description: document.getElementById('emb-desc').value.trim() || undefined,
+      color: document.getElementById('emb-color').value.trim() || undefined,
+      image: document.getElementById('emb-image').value.trim() || undefined,
+      thumbnail: document.getElementById('emb-thumb').value.trim() || undefined,
+      footer: document.getElementById('emb-footer').value.trim() || undefined
+    };
+    const result = document.getElementById('msg-result');
+    if (!channelId) { result.innerHTML = '<span class="error">❌ Seleziona un canale</span>'; return; }
+    if (!content && !embed.title && !embed.description) {
+      result.innerHTML = '<span class="error">❌ Testo o embed obbligatorio</span>'; return;
+    }
+    const btn = document.querySelector('button[onclick="sendMessage()"]');
+    btn.disabled = true; btn.textContent = '⏳ Invio...';
+    const res = await fetch('/api/messages/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channelId, content, embed })
+    });
+    const data = await res.json();
+    btn.disabled = false; btn.textContent = '📤 Invia';
+    if (res.ok) {
+      result.innerHTML = '<span class="success">✅ Inviato! ID: ' + data.messageId + '</span>';
+      document.getElementById('msg-content').value = '';
+    } else {
+      result.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>';
+    }
+  }
+  loadChannels();
+  </script>`;
+}
+
+// ---------- GESTIONE UTENTI ----------
+function renderUserActionsContent(userId = '') {
+  return `
+  <div class="section">
+    <h2>🛠️ Gestione Utenti</h2>
+    <div class="form-row">
+      <input id="ua-userid" placeholder="ID utente (17-20 cifre)" value="${userId}">
+      <button onclick="lookupUser()">🔍 Cerca</button>
+    </div>
+    <div id="ua-userinfo"></div>
+  </div>
+
+  <div class="section" id="ua-actions" style="display:none;">
+    <h2>⚡ Azioni</h2>
+    <label style="font-size:13px;color:#888;">Server</label>
+    <select id="ua-guild"></select>
+    <label style="font-size:13px;color:#888;">Motivo (opzionale)</label>
+    <input id="ua-reason" placeholder="Motivo dell'azione">
+    <div style="display:flex;gap:8px;margin-top:8px;">
+      <button class="secondary" onclick="doAction('kick')">👢 Kick</button>
+      <button class="danger" onclick="doAction('ban')">🔨 Ban</button>
+      <button class="secondary" onclick="doAction('unban')">🔓 Unban</button>
+    </div>
+    <div id="ua-result"></div>
+  </div>
+
+  <script>
+  let currentUser = null;
+
+  async function lookupUser() {
+    const userId = document.getElementById('ua-userid').value.trim();
+    const info = document.getElementById('ua-userinfo');
+    const actions = document.getElementById('ua-actions');
+    if (!/^\\d{17,20}$/.test(userId)) { info.innerHTML = '<span class="error">❌ ID non valido</span>'; return; }
+    info.innerHTML = '<p class="loading">Ricerca...</p>';
+    const res = await fetch('/api/user-lookup/' + userId);
+    const data = await res.json();
+    if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + (data.error || 'Errore') + '</span>'; actions.style.display='none'; return; }
+    currentUser = data;
+
+    info.innerHTML =
+      '<div style="display:flex;gap:14px;align-items:center;margin-top:12px;">' +
+      '<img src="' + data.avatar + '" style="width:64px;height:64px;border-radius:50%;">' +
+      '<div><b>' + data.tag + '</b><br><small style="color:#666;">' + data.id + (data.bot ? ' • BOT' : '') + '</small></div>' +
+      '</div>' +
+      '<p style="margin-top:12px;color:#888;font-size:13px;">Server in comune: ' + data.memberships.length + '</p>';
+
+    const sel = document.getElementById('ua-guild');
+    sel.innerHTML = data.memberships.map(m =>
+      '<option value="' + m.guildId + '">' + m.guildName + ' (ruoli: ' + m.roles.join(', ') + ')</option>'
+    ).join('') || '<option value="">Nessun server</option>';
+
+    actions.style.display = 'block';
+  }
+
+  async function doAction(action) {
+    if (!currentUser) return;
+    const guildId = document.getElementById('ua-guild').value;
+    const reason = document.getElementById('ua-reason').value.trim();
+    const result = document.getElementById('ua-result');
+    if (!guildId) { result.innerHTML = '<span class="error">❌ Seleziona un server</span>'; return; }
+    if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + currentUser.tag + '?')) return;
+    const res = await fetch('/api/user-action', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, userId: currentUser.id, guildId, reason })
+    });
+    const data = await res.json();
+    result.innerHTML = res.ok
+      ? '<span class="success">✅ ' + action.toUpperCase() + ' eseguito</span>'
+      : '<span class="error">❌ ' + (data.error || 'Errore') + '</span>';
+  }
+
+  ${userId ? 'lookupUser();' : ''}
   </script>`;
 }
 
