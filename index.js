@@ -346,8 +346,11 @@ async function createTicket(source, user) {
       permissionOverwrites: overwrites
     });
 
+    // Aggiunti bottoni Claim e Priorità
     const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('close_ticket').setLabel('Chiudi Ticket').setStyle(ButtonStyle.Danger)
+      new ButtonBuilder().setCustomId('close_ticket').setLabel('Chiudi Ticket').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('claim_ticket').setLabel('Prendi in carico').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('priority_ticket').setLabel('Imposta Priorità').setStyle(ButtonStyle.Secondary)
     );
 
     const ticketEmbed = EmbedManager.createEmbed({
@@ -2580,6 +2583,28 @@ async function handleButton(interaction) {
   if (interaction.customId === 'create_ticket') return createTicket(interaction, interaction.user);
   if (interaction.customId === 'close_ticket') return closeTicket(interaction, interaction.user);
   if (interaction.customId === 'create_lobby') return createLobby(interaction);
+
+  // NUOVI BOTTONI PER TICKET AVANZATI
+  if (interaction.customId === 'claim_ticket') {
+    const embed = EmbedManager.success('Ticket Claimato', `Il ticket è stato preso in carico da ${interaction.user}.`);
+    await interaction.reply({ embeds: [embed] });
+    return;
+  }
+
+  if (interaction.customId === 'priority_ticket') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('prio_low').setLabel('🟢 Bassa').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('prio_med').setLabel('🟡 Media').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('prio_high').setLabel('🟠 Alta').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('prio_urgent').setLabel('🔴 Urgente').setStyle(ButtonStyle.Danger)
+    );
+    return interaction.reply({ content: 'Scegli la priorità:', components: [row], ephemeral: true });
+  }
+
+  if (['prio_low', 'prio_med', 'prio_high', 'prio_urgent'].includes(interaction.customId)) {
+    await interaction.update({ content: `✅ Priorità impostata a: **${interaction.customId.replace('prio_', '').toUpperCase()}**`, components: [] });
+    return;
+  }
 }
 
 // ==================== FEATURES ====================
@@ -2683,3 +2708,11 @@ let webServer = null;
     process.exit(1);
   }
 })();
+
+process.on('SIGINT', () => {
+  log.warn('Shutdown...');
+  if (webServer) try { webServer.close(); } catch {}
+  if (typeof storage.close === 'function') storage.close();
+  client.destroy();
+  process.exit(0);
+});
