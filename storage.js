@@ -144,7 +144,7 @@ class StorageService {
       );
       CREATE INDEX IF NOT EXISTS idx_reports_guild ON reports(guild_id, status);
 
-      CREATE TABLE IF NOT EXISTS dashboard_access_logs (
+      CREATE TABLE IF NOT EXISTS dashboard_access (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id TEXT NOT NULL,
         username TEXT NOT NULL,
@@ -163,42 +163,32 @@ class StorageService {
         html_content TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS idx_tr_channel ON ticket_transcripts(channel_id);
+
+      CREATE TABLE IF NOT EXISTS ticket_meta (
+        channel_id TEXT PRIMARY KEY,
+        claimed_by_id TEXT,
+        claimed_by_tag TEXT,
+        priority TEXT,
+        updated_at TEXT NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS antinuke_config (
         guild_id TEXT PRIMARY KEY,
-        whitelist_ids TEXT DEFAULT '',
         threshold_channel INTEGER DEFAULT 3,
         threshold_role INTEGER DEFAULT 3,
         threshold_ban INTEGER DEFAULT 3,
         threshold_role_update INTEGER DEFAULT 3,
         window_ms INTEGER DEFAULT 10000,
         punishment TEXT DEFAULT 'quarantine',
+        whitelist_ids TEXT DEFAULT '',
         updated_at TEXT NOT NULL
       );
     `);
-
-    // ==================== MIGRAZIONI MANUALI ====================
-    const checkColumn = (table, column) => {
-      try {
-        const info = this.db.prepare(`PRAGMA table_info(${table})`).all();
-        return info.some(col => col.name === column);
-      } catch (e) {
-        return false;
-      }
-    };
-
-    if (!checkColumn('antinuke_config', 'threshold_role_update')) {
-      try {
-        this.db.exec(`ALTER TABLE antinuke_config ADD COLUMN threshold_role_update INTEGER DEFAULT 3;`);
-        console.log('✅ Aggiunta colonna threshold_role_update ad antinuke_config');
-      } catch (e) {
-        console.error('❌ Errore aggiunta colonna threshold_role_update:', e.message);
-      }
-    }
   }
 
   _prepare() {
-    // ==================== CUSTOM COMMANDS ====================
+    // ===== CUSTOM COMMANDS =====
     this._allCmds = this.db.prepare('SELECT name, response FROM custom_commands');
     this._getCmd = this.db.prepare('SELECT response FROM custom_commands WHERE name = ?');
     this._upsertCmd = this.db.prepare(`
@@ -208,12 +198,13 @@ class StorageService {
     `);
     this._delCmd = this.db.prepare('DELETE FROM custom_commands WHERE name = ?');
 
-    // ==================== MOD LOGS ====================
+    // ===== MOD LOGS =====
     this._insertLog = this.db.prepare(`
       INSERT INTO mod_logs (type, target_id, target, moderator, reason, duration, channel, timestamp)
       VALUES (@type, @targetId, @target, @moderator, @reason, @duration, @channel, @timestamp)
     `);
     this._logsByTarget = this.db.prepare('SELECT * FROM mod_logs WHERE target_id = ? ORDER BY id DESC');
+    this._allLogs = this.db.prepare('SELECT * FROM mod_logs ORDER BY id DESC LIMIT ?');
     this._countLogs = this.db.prepare('SELECT COUNT(*) as c FROM mod_logs');
     this._countByType = this.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type');
     this._trimLogs = this.db.prepare(`
@@ -222,7 +213,7 @@ class StorageService {
       )
     `);
 
-    // ==================== BLACKLIST ====================
+    // ===== BLACKLIST =====
     this._blGet = this.db.prepare('SELECT * FROM blacklist WHERE user_id = ?');
     this._blAll = this.db.prepare('SELECT * FROM blacklist ORDER BY added_at DESC');
     this._blInsert = this.db.prepare(`
@@ -232,7 +223,7 @@ class StorageService {
     this._blDelete = this.db.prepare('DELETE FROM blacklist WHERE user_id = ?');
     this._blCount = this.db.prepare('SELECT COUNT(*) as c FROM blacklist');
 
-    // ==================== GUILD CONFIG ====================
+    // ===== GUILD CONFIG =====
     this._getConfig = this.db.prepare('SELECT * FROM guild_config WHERE guild_id = ?');
     this._upsertConfig = this.db.prepare(`
       INSERT INTO guild_config (guild_id, autorole_id, log_channel_id, updated_at)
@@ -243,17 +234,19 @@ class StorageService {
         updated_at = excluded.updated_at
     `);
 
-    // ==================== MEMBER NOTES ====================
+    // ===== MEMBER NOTES =====
     this._insertNote = this.db.prepare(`
       INSERT INTO member_notes (guild_id, user_id, author_id, author_tag, content, created_at)
       VALUES (@guildId, @userId, @authorId, @authorTag, @content, @createdAt)
     `);
     this._notesForUser = this.db.prepare('SELECT * FROM member_notes WHERE guild_id = ? AND user_id = ? ORDER BY id DESC');
+    this._allNotes = this.db.prepare('SELECT * FROM member_notes ORDER BY id DESC LIMIT 500');
     this._getNote = this.db.prepare('SELECT * FROM member_notes WHERE id = ? AND guild_id = ?');
     this._deleteNote = this.db.prepare('DELETE FROM member_notes WHERE id = ? AND guild_id = ?');
+    this._deleteNoteById = this.db.prepare('DELETE FROM member_notes WHERE id = ?');
     this._countNotes = this.db.prepare('SELECT COUNT(*) as c FROM member_notes WHERE guild_id = ?');
 
-    // ==================== WELCOME ====================
+    // ===== WELCOME =====
     this._getWelcome = this.db.prepare(`
       SELECT guild_id, channel_id, message,
              COALESCE(embed_enabled, 1) AS embed_enabled,
@@ -273,7 +266,7 @@ class StorageService {
       'UPDATE welcome_config SET channel_id = NULL, updated_at = ? WHERE guild_id = ?'
     );
 
-    // ==================== REACTION ROLES ====================
+    // ===== REACTION ROLES =====
     this._rrInsert = this.db.prepare(`
       INSERT INTO reaction_roles (guild_id, message_id, channel_id, emoji, role_id, created_at)
       VALUES (@guildId, @messageId, @channelId, @emoji, @roleId, @createdAt)
@@ -283,7 +276,7 @@ class StorageService {
     this._rrDelete = this.db.prepare('DELETE FROM reaction_roles WHERE id = ? AND guild_id = ?');
     this._rrDeleteByMessage = this.db.prepare('DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ?');
 
-    // ==================== AUTORESPONSES ====================
+    // ===== AUTORESPONSES =====
     this._arInsert = this.db.prepare(`
       INSERT INTO autoresponses (guild_id, trigger, response, created_at)
       VALUES (@guildId, @trigger, @response, @createdAt)
@@ -292,7 +285,7 @@ class StorageService {
     this._arByTrigger = this.db.prepare('SELECT * FROM autoresponses WHERE guild_id = ? AND trigger = ?');
     this._arDelete = this.db.prepare('DELETE FROM autoresponses WHERE id = ? AND guild_id = ?');
 
-    // ==================== BIRTHDAYS ====================
+    // ===== BIRTHDAYS =====
     this._bdSet = this.db.prepare(`
       INSERT INTO birthdays (user_id, guild_id, day, month, year, updated_at)
       VALUES (@userId, @guildId, @day, @month, @year, @updatedAt)
@@ -308,17 +301,18 @@ class StorageService {
     this._bdAll = this.db.prepare('SELECT * FROM birthdays WHERE guild_id = ? ORDER BY month, day');
     this._bdDelete = this.db.prepare('DELETE FROM birthdays WHERE user_id = ? AND guild_id = ?');
 
-    // ==================== REMINDERS ====================
+    // ===== REMINDERS =====
     this._remInsert = this.db.prepare(`
       INSERT INTO reminders (user_id, guild_id, channel_id, content, remind_at, created_at)
       VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
     `);
     this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ?');
+    this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200');
     this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
     this._remByUser = this.db.prepare('SELECT * FROM reminders WHERE user_id = ? AND guild_id = ? ORDER BY remind_at ASC');
-    this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200');
+    this._remCount = this.db.prepare('SELECT COUNT(*) as c FROM reminders');
 
-    // ==================== PERSONAL NOTES ====================
+    // ===== PERSONAL NOTES =====
     this._pnInsert = this.db.prepare(`
       INSERT INTO personal_notes (user_id, guild_id, content, created_at)
       VALUES (@userId, @guildId, @content, @createdAt)
@@ -326,7 +320,7 @@ class StorageService {
     this._pnByUser = this.db.prepare('SELECT * FROM personal_notes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC');
     this._pnDelete = this.db.prepare('DELETE FROM personal_notes WHERE id = ? AND user_id = ?');
 
-    // ==================== CASES ====================
+    // ===== CASES =====
     this._caseInsert = this.db.prepare(`
       INSERT INTO cases (guild_id, user_id, moderator_id, action, reason, duration, status, created_at, updated_at)
       VALUES (@guildId, @userId, @moderatorId, @action, @reason, @duration, 'active', @now, @now)
@@ -341,7 +335,7 @@ class StorageService {
     `);
     this._caseDelete = this.db.prepare('DELETE FROM cases WHERE id = ? AND guild_id = ?');
 
-    // ==================== REPORTS ====================
+    // ===== REPORTS =====
     this._repInsert = this.db.prepare(`
       INSERT INTO reports (guild_id, reporter_id, target_id, reason, status, created_at)
       VALUES (@guildId, @reporterId, @targetId, @reason, 'open', @createdAt)
@@ -349,34 +343,49 @@ class StorageService {
     this._repAllOpen = this.db.prepare("SELECT * FROM reports WHERE guild_id = ? AND status = 'open' ORDER BY id DESC");
     this._repSetStatus = this.db.prepare('UPDATE reports SET status = ? WHERE id = ? AND guild_id = ?');
 
-    // ==================== DASHBOARD ACCESS LOGS ====================
-    this._dashLogInsert = this.db.prepare(`
-      INSERT INTO dashboard_access_logs (user_id, username, ip, user_agent, timestamp)
-      VALUES (@userId, @username, @ip, @userAgent, @timestamp)
+    // ===== DASHBOARD ACCESS =====
+    this._saveAccess = this.db.prepare(`
+      INSERT INTO dashboard_access (user_id, username, ip, user_agent, timestamp)
+      VALUES (?, ?, ?, ?, ?)
     `);
-    this._dashLogAll = this.db.prepare('SELECT * FROM dashboard_access_logs ORDER BY id DESC LIMIT 500');
+    this._getAccess = this.db.prepare('SELECT * FROM dashboard_access ORDER BY id DESC LIMIT ?');
 
-    // ==================== TRANSCRIPTS ====================
-    this._transcriptInsert = this.db.prepare(`
+    // ===== TICKET TRANSCRIPTS =====
+    this._trInsert = this.db.prepare(`
       INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, created_at)
-      VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @htmlContent, @createdAt)
+      VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @html, @createdAt)
     `);
-    this._transcriptAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
-    this._transcriptGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
+    this._trAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
+    this._trGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
+    this._trCount = this.db.prepare('SELECT COUNT(*) as c FROM ticket_transcripts');
 
-    // ==================== ANTINUKE ====================
+    // ===== TICKET META =====
+    this._tmGet = this.db.prepare('SELECT * FROM ticket_meta WHERE channel_id = ?');
+    this._tmUpsert = this.db.prepare(`
+      INSERT INTO ticket_meta (channel_id, claimed_by_id, claimed_by_tag, priority, updated_at)
+      VALUES (@channelId, @claimedById, @claimedByTag, @priority, @updatedAt)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        claimed_by_id = COALESCE(@claimedById, claimed_by_id),
+        claimed_by_tag = COALESCE(@claimedByTag, claimed_by_tag),
+        priority = COALESCE(@priority, priority),
+        updated_at = @updatedAt
+    `);
+
+    // ===== ANTI-NUKE =====
     this._getAntiNuke = this.db.prepare('SELECT * FROM antinuke_config WHERE guild_id = ?');
-    this._setAntiNuke = this.db.prepare(`
-      INSERT INTO antinuke_config (guild_id, whitelist_ids, threshold_channel, threshold_role, threshold_ban, threshold_role_update, window_ms, punishment, updated_at)
-      VALUES (@guildId, @whitelistIds, @thresholdChannel, @thresholdRole, @thresholdBan, @thresholdRoleUpdate, @windowMs, @punishment, @updatedAt)
+    this._upsertAntiNuke = this.db.prepare(`
+      INSERT INTO antinuke_config
+        (guild_id, threshold_channel, threshold_role, threshold_ban, threshold_role_update, window_ms, punishment, whitelist_ids, updated_at)
+      VALUES
+        (@guildId, @threshold_channel, @threshold_role, @threshold_ban, @threshold_role_update, @window_ms, @punishment, @whitelist_ids, @updatedAt)
       ON CONFLICT(guild_id) DO UPDATE SET
-        whitelist_ids = excluded.whitelist_ids,
         threshold_channel = excluded.threshold_channel,
         threshold_role = excluded.threshold_role,
         threshold_ban = excluded.threshold_ban,
         threshold_role_update = excluded.threshold_role_update,
         window_ms = excluded.window_ms,
         punishment = excluded.punishment,
+        whitelist_ids = excluded.whitelist_ids,
         updated_at = excluded.updated_at
     `);
 
@@ -403,7 +412,7 @@ class StorageService {
     } catch (err) { console.error('❌ saveLog error:', err); }
   }
   getLogsForUser(userId) { return this._logsByTarget.all(userId); }
-  getAllLogs(limit = 500) { return this.db.prepare('SELECT * FROM mod_logs ORDER BY id DESC LIMIT ?').all(limit); }
+  getAllLogs(limit = 500) { return this._allLogs.all(limit); }
   getStats() {
     return { total: this._countLogs.get().c, byType: this._countByType.all(), blacklist: this._blCount.get().c };
   }
@@ -440,7 +449,7 @@ class StorageService {
     this._upsertConfig.run({ guildId, autoroleId: current.autorole_id, logChannelId: null, updatedAt: new Date().toISOString() });
   }
 
-  // ==================== MEMBER NOTES ====================
+  // ==================== NOTES ====================
   addNote(guildId, userId, authorId, authorTag, content) {
     const res = this._insertNote.run({ guildId, userId, authorId, authorTag, content, createdAt: new Date().toISOString() });
     return res.lastInsertRowid;
@@ -448,9 +457,9 @@ class StorageService {
   getNotesForUser(guildId, userId) { return this._notesForUser.all(guildId, userId); }
   getNote(guildId, noteId) { return this._getNote.get(noteId, guildId) || null; }
   deleteNote(guildId, noteId) { return this._deleteNote.run(noteId, guildId).changes > 0; }
+  deleteNoteById(noteId) { return this._deleteNoteById.run(noteId).changes > 0; }
   countNotes(guildId) { return this._countNotes.get(guildId).c; }
-  getAllNotes() { return this.db.prepare('SELECT * FROM member_notes ORDER BY id DESC LIMIT 500').all(); }
-  deleteNoteById(id) { return this.db.prepare('DELETE FROM member_notes WHERE id = ?').run(id).changes > 0; }
+  getAllNotes() { return this._allNotes.all(); }
 
   // ==================== WELCOME ====================
   getWelcomeConfig(guildId) { return this._getWelcome.get(guildId) || null; }
@@ -503,9 +512,10 @@ class StorageService {
     return res.lastInsertRowid;
   }
   getDueReminders(now = new Date()) { return this._remDue.all(now.toISOString()); }
+  getAllReminders(limit = 200) { return this._remAll.all(limit); }
+  countReminders() { return this._remCount.get().c; }
   deleteReminder(id) { return this._remDelete.run(id).changes > 0; }
   getRemindersForUser(userId, guildId) { return this._remByUser.all(userId, guildId); }
-  getAllReminders() { return this._remAll.all(); }
 
   // ==================== PERSONAL NOTES ====================
   addPersonalNote(userId, guildId, content) {
@@ -536,58 +546,73 @@ class StorageService {
   getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
   setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
 
-  // ==================== DASHBOARD ACCESS LOGS ====================
+  // ==================== DASHBOARD ACCESS ====================
   saveDashboardAccess(userId, username, ip, userAgent) {
-    try {
-      this._dashLogInsert.run({ userId, username, ip, userAgent, timestamp: new Date().toISOString() });
-    } catch (err) { console.error('saveDashboardAccess', err); }
+    this._saveAccess.run(userId, username, ip || null, userAgent || null, new Date().toISOString());
   }
-  getDashboardAccessLogs() { return this._dashLogAll.all(); }
+  getDashboardAccessLogs(limit = 500) { return this._getAccess.all(limit); }
 
-  // ==================== TRANSCRIPTS ====================
-  saveTranscript(channelId, channelName, userId, claimedBy, priority, htmlContent) {
-    this._transcriptInsert.run({
-      channelId, channelName, userId, claimedBy, priority, htmlContent,
+  // ==================== TICKET TRANSCRIPTS ====================
+  saveTranscript(channelId, channelName, userId, claimedBy, priority, html) {
+    const res = this._trInsert.run({
+      channelId, channelName, userId,
+      claimedBy: claimedBy || null,
+      priority: priority || null,
+      html,
       createdAt: new Date().toISOString()
     });
+    return res.lastInsertRowid;
   }
-  getAllTranscripts() { return this._transcriptAll.all(); }
-  getTranscript(id) { return this._transcriptGet.get(id) || null; }
+  getAllTranscripts() { return this._trAll.all(); }
+  getTranscript(id) { return this._trGet.get(id) || null; }
+  countTranscripts() { return this._trCount.get().c; }
 
-  // ==================== ANTINUKE ====================
+  // ==================== TICKET META ====================
+  getTicketMeta(channelId) { return this._tmGet.get(channelId) || null; }
+  setTicketMeta(channelId, { claimedById, claimedByTag, priority }) {
+    this._tmUpsert.run({
+      channelId,
+      claimedById: claimedById ?? null,
+      claimedByTag: claimedByTag ?? null,
+      priority: priority ?? null,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  // ==================== ANTI-NUKE ====================
   getAntiNukeConfig(guildId) {
     const row = this._getAntiNuke.get(guildId);
-    if (!row) {
-      return {
-        guild_id: guildId,
-        whitelist_ids: '',
-        threshold_channel: 3,
-        threshold_role: 3,
-        threshold_ban: 3,
-        threshold_role_update: 3,
-        window_ms: 10000,
-        punishment: 'quarantine'
-      };
-    }
-    return row;
+    const defaults = {
+      threshold_channel: 3,
+      threshold_role: 3,
+      threshold_ban: 3,
+      threshold_role_update: 3,
+      window_ms: 10000,
+      punishment: 'quarantine',
+      whitelist_ids: ''
+    };
+    if (!row) return defaults;
+    return {
+      threshold_channel: row.threshold_channel ?? defaults.threshold_channel,
+      threshold_role: row.threshold_role ?? defaults.threshold_role,
+      threshold_ban: row.threshold_ban ?? defaults.threshold_ban,
+      threshold_role_update: row.threshold_role_update ?? defaults.threshold_role_update,
+      window_ms: row.window_ms ?? defaults.window_ms,
+      punishment: row.punishment ?? defaults.punishment,
+      whitelist_ids: row.whitelist_ids ?? defaults.whitelist_ids
+    };
   }
-
-  setAntiNukeConfig(guildId, config) {
-    // Supporta sia il formato "generico" (threshold) sia quello specifico (threshold_channel, ...)
-    const thresholdChannel = config.threshold_channel ?? config.threshold ?? 3;
-    const thresholdRole = config.threshold_role ?? config.threshold ?? 3;
-    const thresholdBan = config.threshold_ban ?? 3;
-    const thresholdRoleUpdate = config.threshold_role_update ?? config.threshold ?? 3;
-
-    this._setAntiNuke.run({
+  setAntiNukeConfig(guildId, data = {}) {
+    const current = this.getAntiNukeConfig(guildId);
+    this._upsertAntiNuke.run({
       guildId,
-      whitelistIds: config.whitelist_ids || '',
-      thresholdChannel: Number(thresholdChannel) || 3,
-      thresholdRole: Number(thresholdRole) || 3,
-      thresholdBan: Number(thresholdBan) || 3,
-      thresholdRoleUpdate: Number(thresholdRoleUpdate) || 3,
-      windowMs: Number(config.window_ms) || 10000,
-      punishment: config.punishment || 'quarantine',
+      threshold_channel: data.threshold_channel ?? current.threshold_channel,
+      threshold_role: data.threshold_role ?? current.threshold_role,
+      threshold_ban: data.threshold_ban ?? current.threshold_ban,
+      threshold_role_update: data.threshold_role_update ?? current.threshold_role_update,
+      window_ms: data.window_ms ?? current.window_ms,
+      punishment: data.punishment ?? current.punishment,
+      whitelist_ids: data.whitelist_ids ?? current.whitelist_ids,
       updatedAt: new Date().toISOString()
     });
   }
