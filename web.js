@@ -1,4 +1,3 @@
-// web.js — Dashboard web con Sicurezza (Helmet, Rate Limit, CSRF, Zod) + Transcripts
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -6,7 +5,6 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
-// ==================== SICUREZZA — import ====================
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
@@ -25,12 +23,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
   const DASHBOARD_URL = (process.env.DASHBOARD_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
   const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questo-segreto-ora';
-  const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
-
+  const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
   const DASHBOARD_ROLES = ['Senior Admin'];
 
-  // ==================== AUTORIZZAZIONE CON CACHE ====================
+  // Cache autorizzazione
   const AUTH_CACHE_TTL = 60 * 1000;
   const authCache = new Map();
 
@@ -45,10 +41,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
         for (const guild of client.guilds.cache.values()) {
           const member = await guild.members.fetch(userId).catch(() => null);
           if (!member) continue;
-          if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) {
-            authorized = true;
-            break;
-          }
+          if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) { authorized = true; break; }
         }
       } catch (err) { log.err('isAuthorizedByRole', err); }
     }
@@ -56,7 +49,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     return authorized;
   }
 
-  // ==================== HELMET ====================
+  // Helmet
   app.use(helmet({
     contentSecurityPolicy: {
       useDefaults: true,
@@ -77,11 +70,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     referrerPolicy: { policy: 'no-referrer' }
   }));
 
-  // ==================== BODY LIMITS ====================
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-  // ==================== SESSION STORE ====================
   const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
   try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 
@@ -97,18 +88,12 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
   }));
 
-  // ==================== CSRF ====================
   const CSRF_SECRET = process.env.CSRF_SECRET || SESSION_SECRET;
   const { generateCsrfToken, validateRequest } = doubleCsrf({
     getSecret: () => CSRF_SECRET,
     getSessionIdentifier: (req) => (req.session && req.session.user && req.session.user.id) || 'anon',
     cookieName: '_csrf',
-    cookieOptions: {
-      httpOnly: true,
-      sameSite: IS_PROD ? 'none' : 'lax',
-      secure: IS_PROD,
-      path: '/'
-    },
+    cookieOptions: { httpOnly: true, sameSite: IS_PROD ? 'none' : 'lax', secure: IS_PROD, path: '/' },
     size: 64,
     ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
     getCsrfTokenFromRequest: (req) => (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
@@ -117,7 +102,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.use((req, res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
     if (req.path === '/auth/login') return next();
-    return validateRequest(req, res, next);
+    try { return validateRequest(req, res, next); }
+    catch (e) { return res.status(403).json({ error: 'CSRF non valido' }); }
   });
 
   app.get('/api/csrf-token', (req, res) => {
@@ -125,62 +111,23 @@ function createWebServer({ storage, client, log, botStartTime }) {
     catch (e) { res.status(500).json({ error: 'Errore CSRF' }); }
   });
 
-  // ==================== RATE LIMIT ====================
-  const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 10,
-    standardHeaders: true, legacyHeaders: false,
-    message: { error: 'Troppe richieste di login, riprova più tardi.' }
-  });
-  const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 300,
-    standardHeaders: true, legacyHeaders: false,
-    message: { error: 'Troppe richieste, riprova più tardi.' }
-  });
-  const actionLimiter = rateLimit({
-    windowMs: 60 * 1000, max: 10,
-    standardHeaders: true, legacyHeaders: false,
-    message: { error: 'Troppe azioni distruttive, riprova tra un minuto.' }
-  });
-  const messageLimiter = rateLimit({
-    windowMs: 60 * 1000, max: 20,
-    standardHeaders: true, legacyHeaders: false,
-    message: { error: 'Troppi messaggi inviati, riprova tra un minuto.' }
-  });
+  const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste di login, riprova più tardi.' } });
+  const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste, riprova più tardi.' } });
+  const actionLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe azioni distruttive, riprova tra un minuto.' } });
+  const messageLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppi messaggi inviati, riprova tra un minuto.' } });
 
   app.use('/auth', authLimiter);
   app.use('/api', apiLimiter);
-  app.use('/api/user-action', actionLimiter);
-  app.use('/api/messages/send', messageLimiter);
-  app.use('/api/tickets', (req, res, next) => {
-    if (req.method === 'DELETE') return actionLimiter(req, res, next);
-    next();
-  });
 
   // ==================== SCHEMI ZOD ====================
   const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
   const guildIdSchema = z.string().regex(/^\d{17,20}$/, 'ID server non valido');
 
-  const schemaBlacklistAdd = z.object({
-    userId: userIdSchema,
-    username: z.string().min(1).max(64),
-    reason: z.string().min(1).max(500)
-  });
-  const schemaBulkDelete = z.object({
-    ids: z.array(z.union([z.string(), z.number()])).min(1).max(500)
-  });
-  const schemaConfig = z.object({
-    autoroleId: z.string().regex(/^\d{17,20}$/).nullable().optional(),
-    logChannelId: z.string().regex(/^\d{17,20}$/).nullable().optional()
-  });
-  const schemaWelcome = z.object({
-    channelId: z.string().regex(/^\d{17,20}$/).nullable().optional(),
-    message: z.string().max(2000).nullable().optional(),
-    embedEnabled: z.boolean().optional()
-  });
-  const schemaCommandAdd = z.object({
-    name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i, 'Nome comando non valido'),
-    response: z.string().min(1).max(4096)
-  });
+  const schemaBlacklistAdd = z.object({ userId: userIdSchema, username: z.string().min(1).max(64), reason: z.string().min(1).max(500) });
+  const schemaBulkDelete = z.object({ ids: z.array(z.union([z.string(), z.number()])).min(1).max(500) });
+  const schemaConfig = z.object({ autoroleId: z.string().regex(/^\d{17,20}$/).nullable().optional(), logChannelId: z.string().regex(/^\d{17,20}$/).nullable().optional() });
+  const schemaWelcome = z.object({ channelId: z.string().regex(/^\d{17,20}$/).nullable().optional(), message: z.string().max(2000).nullable().optional(), embedEnabled: z.boolean().optional() });
+  const schemaCommandAdd = z.object({ name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i), response: z.string().min(1).max(4096) });
   const schemaMessagesSend = z.object({
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
@@ -192,9 +139,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       thumbnail: z.string().url().max(500).optional(),
       footer: z.string().max(2048).optional()
     }).optional()
-  }).refine(d => (d.content && d.content.length > 0) || (d.embed && (d.embed.title || d.embed.description)), {
-    message: 'Testo o embed obbligatorio'
-  });
+  }).refine(d => (d.content && d.content.length > 0) || (d.embed && (d.embed.title || d.embed.description)), { message: 'Testo o embed obbligatorio' });
   const schemaUserAction = z.object({
     action: z.enum(['kick', 'ban', 'unban']),
     userId: userIdSchema,
@@ -227,7 +172,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     return r.data;
   }
 
-  // ==================== UTILITY ====================
   function escapeHtml(str) {
     if (str === null || str === undefined) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -254,9 +198,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
         if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Ruolo non più valido' });
         return res.status(403).send('Accesso negato: il ruolo "Senior Admin" non è più presente.');
       }
-    } catch (e) {
-      log.err('requireAuth recheck', e);
-    }
+    } catch (e) { log.err('requireAuth recheck', e); }
     next();
   }
 
@@ -265,7 +207,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.2.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.3.0', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH2 ====================
@@ -311,7 +253,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.get('/auth/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
   app.get('/auth/me', (req, res) => res.json({ user: req.session.user || null }));
 
-  // ==================== LOGOUT GLOBALE ====================
   app.post('/api/logout-all', requireAuth, (req, res) => {
     const userId = req.session.user.id;
     try {
@@ -320,10 +261,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       for (const f of files) {
         try {
           const content = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), 'utf8'));
-          if (content?.user?.id === userId) {
-            fs.unlinkSync(path.join(SESSION_DIR, f));
-            removed++;
-          }
+          if (content?.user?.id === userId) { fs.unlinkSync(path.join(SESSION_DIR, f)); removed++; }
         } catch {}
       }
       authCache.delete(userId);
@@ -336,19 +274,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try {
       const s = storage.getStats();
       let ticketsCount = 0;
-      let notesCount = 0;
-      let transcriptsCount = 0;
-      let remindersCount = 0;
-      try {
-        for (const guild of client.guilds.cache.values()) {
-          for (const ch of guild.channels.cache.values()) {
-            if (ch.name && ch.name.startsWith('ticket-')) ticketsCount++;
-          }
+      for (const guild of client.guilds.cache.values()) {
+        for (const ch of guild.channels.cache.values()) {
+          if (ch.name && ch.name.startsWith('ticket-')) ticketsCount++;
         }
-        notesCount = storage.db.prepare('SELECT COUNT(*) as c FROM member_notes').get()?.c || 0;
-        transcriptsCount = storage.db.prepare('SELECT COUNT(*) as c FROM ticket_transcripts').get()?.c || 0;
-        remindersCount = storage.db.prepare('SELECT COUNT(*) as c FROM reminders').get()?.c || 0;
-      } catch {}
+      }
+      let notesCount = 0, transcriptsCount = 0, remindersCount = 0;
+      try { notesCount = storage.db.prepare('SELECT COUNT(*) as c FROM member_notes').get()?.c || 0; } catch {}
+      try { transcriptsCount = storage.countTranscripts ? storage.countTranscripts() : 0; } catch {}
+      try { remindersCount = storage.countReminders ? storage.countReminders() : 0; } catch {}
       res.json({
         logs: s.total, blacklist: s.blacklist,
         guilds: client.guilds.cache.size, ping: client.ws.ping,
@@ -359,6 +293,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
 
+  // ===== BLACKLIST =====
   app.get('/api/blacklist', requireAuth, (req, res) => {
     try { res.json(storage.getAllBlacklist()); } catch (e) { apiError(res, e); }
   });
@@ -387,6 +322,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  // ===== LOGS =====
   app.get('/api/logs/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
   });
@@ -395,6 +331,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getLogsForUser(req.params.userId)); } catch (e) { apiError(res, e); }
   });
 
+  // ===== NOTES =====
   app.get('/api/notes/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
   });
@@ -413,6 +350,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  // ===== CONFIG =====
   app.get('/api/config/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
     try { res.json(storage.getGuildConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
@@ -435,6 +373,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  // ===== WELCOME =====
   app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
     try { res.json(storage.getWelcomeConfig(req.params.guildId) || {}); } catch (e) { apiError(res, e); }
@@ -498,13 +437,21 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore test welcome'); }
   });
 
+  // ===== TICKETS =====
   app.get('/api/tickets', requireAuth, (req, res) => {
     try {
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-')) {
-            tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id, userId: ch.name.replace('ticket-', '') });
+            const meta = storage.getTicketMeta(ch.id) || {};
+            tickets.push({
+              guild: guild.name, guildId: guild.id,
+              channel: ch.name, channelId: ch.id,
+              userId: ch.name.replace('ticket-', ''),
+              claimedBy: meta.claimed_by_tag || null,
+              priority: meta.priority || null
+            });
           }
         }
       }
@@ -512,7 +459,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ==================== TICKET CLOSE CON TRANSCRIPT ====================
   app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.channelId)) return res.status(400).json({ error: 'ID canale non valido' });
     try {
@@ -520,47 +466,41 @@ function createWebServer({ storage, client, log, botStartTime }) {
       if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
       if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
 
-      const messages = await ch.messages.fetch({ limit: 100 });
-
-      const esc = (s) => String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-
-      let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + esc(ch.name) + '</title>'
-        + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
-        + '.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}'
-        + '.avatar{width:40px;height:40px;border-radius:50%}'
-        + '.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}'
-        + '.content{flex:1;word-wrap:break-word;white-space:pre-wrap}'
-        + 'img.attach{max-width:300px;border-radius:6px;margin-top:6px}</style></head><body>';
-      html += '<h1>Transcript: #' + esc(ch.name) + '</h1>';
-
-      const sorted = [...messages.values()].reverse();
-      for (const m of sorted) {
-        const avatar = esc(m.author.displayAvatarURL());
-        const username = esc(m.author.username);
-        const time = esc(m.createdAt.toLocaleString('it-IT'));
-        if (m.author.bot && m.embeds.length > 0) {
-          const desc = m.embeds.map(e => esc(e.description || '')).join('<br>');
-          html += '<div class="msg"><div class="content"><span class="author">[BOT] ' + username + '</span>'
-            + '<span class="time">' + time + '</span><br>' + desc + '</div></div>';
-        } else {
-          let attach = '';
-          for (const att of m.attachments.values()) {
-            if ((att.contentType || '').startsWith('image/')) {
-              attach += '<br><img class="attach" src="' + esc(att.url) + '" alt="attachment">';
-            } else {
-              attach += '<br><a href="' + esc(att.url) + '" target="_blank" rel="noopener">📎 ' + esc(att.name) + '</a>';
+      const msgs = await ch.messages.fetch({ limit: 100 }).catch(() => null);
+      if (msgs) {
+        const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + esc(ch.name) + '</title>'
+          + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
+          + '.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}'
+          + '.avatar{width:40px;height:40px;border-radius:50%}'
+          + '.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}'
+          + '.content{flex:1;word-wrap:break-word;white-space:pre-wrap}'
+          + 'img.attach{max-width:300px;border-radius:6px;margin-top:6px}</style></head><body>';
+        html += '<h1>Transcript: #' + esc(ch.name) + '</h1>';
+        const sorted = [...msgs.values()].reverse();
+        for (const m of sorted) {
+          const avatar = esc(m.author.displayAvatarURL());
+          const username = esc(m.author.username);
+          const time = esc(m.createdAt.toLocaleString('it-IT'));
+          if (m.author.bot && m.embeds.length > 0) {
+            const desc = m.embeds.map(e => esc(e.description || '')).join('<br>');
+            html += '<div class="msg"><div class="content"><span class="author">[BOT] ' + username + '</span>'
+              + '<span class="time">' + time + '</span><br>' + desc + '</div></div>';
+          } else {
+            let attach = '';
+            for (const att of m.attachments.values()) {
+              if ((att.contentType || '').startsWith('image/')) attach += '<br><img class="attach" src="' + esc(att.url) + '" alt="attachment">';
+              else attach += '<br><a href="' + esc(att.url) + '" target="_blank" rel="noopener">📎 ' + esc(att.name) + '</a>';
             }
+            html += '<div class="msg"><img src="' + avatar + '" class="avatar">'
+              + '<div class="content"><span class="author">' + username + '</span>'
+              + '<span class="time">' + time + '</span><br>' + esc(m.content) + attach + '</div></div>';
           }
-          html += '<div class="msg"><img src="' + avatar + '" class="avatar">'
-            + '<div class="content"><span class="author">' + username + '</span>'
-            + '<span class="time">' + time + '</span><br>' + esc(m.content) + attach + '</div></div>';
         }
+        html += '</body></html>';
+        const meta = storage.getTicketMeta(ch.id);
+        storage.saveTranscript(ch.id, ch.name, ch.name.replace('ticket-', ''), meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html);
       }
-      html += '</body></html>';
-
-      storage.saveTranscript(ch.id, ch.name, ch.name.replace('ticket-', ''), 'Staff (Dashboard)', 'N/D', html);
       await ch.delete('Chiuso dalla dashboard web');
       res.json({ ok: true });
     } catch (e) { apiError(res, e); }
@@ -575,11 +515,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
 
       const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-      const embed = new EmbedBuilder()
-        .setTitle('Pannello Ticket')
-        .setDescription('Premi il bottone qui sotto per aprire un ticket.')
-        .setColor(0x0099FF)
-        .setTimestamp();
+      const embed = new EmbedBuilder().setTitle('Pannello Ticket').setDescription('Premi il bottone qui sotto per aprire un ticket.').setColor(0x0099FF).setTimestamp();
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('create_ticket').setLabel('Apri Ticket').setStyle(ButtonStyle.Primary)
       );
@@ -603,6 +539,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  // ===== COMMANDS =====
   app.get('/api/commands', requireAuth, (req, res) => {
     try {
       const cmds = storage.loadCommands();
@@ -612,10 +549,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.post('/api/commands', requireAuth, (req, res) => {
     const data = parseOrFail(schemaCommandAdd, req.body || {}, res);
     if (!data) return;
-    try {
-      storage.saveCommand(data.name.toLowerCase(), data.response);
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
+    try { storage.saveCommand(data.name.toLowerCase(), data.response); res.json({ ok: true }); }
+    catch (e) { apiError(res, e); }
   });
   app.delete('/api/commands/:name', requireAuth, (req, res) => {
     const name = String(req.params.name || '').toLowerCase();
@@ -633,6 +568,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  // ===== CHARTS / TOP =====
   app.get('/api/charts', requireAuth, (req, res) => {
     try {
       const byType = storage.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type').all();
@@ -648,10 +584,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const types = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type ORDER BY c DESC`).all();
       const byMonth = storage.db.prepare(`SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs GROUP BY month ORDER BY month DESC LIMIT 12`).all();
       res.json({ moderators, targets, types, byMonth });
-    } catch (e) {
-      log.err('api/top', e);
-      res.json({ moderators: [], targets: [], types: [], byMonth: [] });
-    }
+    } catch (e) { log.err('api/top', e); res.json({ moderators: [], targets: [], types: [], byMonth: [] }); }
   });
 
   app.get('/api/guilds', requireAuth, (req, res) => {
@@ -665,6 +598,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
+  // ===== USER =====
   app.get('/api/user/:userId', requireAuth, (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
@@ -676,7 +610,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name === `ticket-${userId}`) {
-            tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id });
+            const meta = storage.getTicketMeta(ch.id) || {};
+            tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id, claimedBy: meta.claimed_by_tag || null, priority: meta.priority || null });
           }
         }
       }
@@ -685,6 +620,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore caricamento utente'); }
   });
 
+  // ===== SEARCH =====
   app.get('/api/search', requireAuth, (req, res) => {
     const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
@@ -704,6 +640,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore ricerca'); }
   });
 
+  // ===== CSV EXPORT =====
   function sanitizeCsvCell(v) {
     const s = (v === null || v === undefined) ? '' : String(v);
     if (/^[=+\-@\t\r]/.test(s)) return "'" + s;
@@ -755,7 +692,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
 
-  // ==================== MESSAGGI ====================
+  // ===== MESSAGES =====
   app.get('/api/messages/channels', requireAuth, (req, res) => {
     try {
       const out = [];
@@ -769,7 +706,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  app.post('/api/messages/send', requireAuth, async (req, res) => {
+  app.post('/api/messages/send', messageLimiter, requireAuth, async (req, res) => {
     const data = parseOrFail(schemaMessagesSend, req.body || {}, res);
     if (!data) return;
     try {
@@ -800,7 +737,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore invio messaggio'); }
   });
 
-  // ==================== AZIONI UTENTE ====================
+  // ===== USER ACTIONS =====
   app.get('/api/user-lookup/:userId', requireAuth, async (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
@@ -810,21 +747,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const memberships = [];
       for (const guild of client.guilds.cache.values()) {
         const member = await guild.members.fetch(userId).catch(() => null);
-        if (member) {
-          memberships.push({ guildId: guild.id, guildName: guild.name, joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name) });
-        }
+        if (member) memberships.push({ guildId: guild.id, guildName: guild.name, joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name) });
       }
       res.json({ id: user.id, username: user.username, tag: user.tag, bot: user.bot, avatar: user.displayAvatarURL({ size: 128 }), createdAt: user.createdAt, memberships });
     } catch (e) { apiError(res, e, 'Errore lookup utente'); }
   });
 
-  app.post('/api/user-action', requireAuth, async (req, res) => {
+  app.post('/api/user-action', actionLimiter, requireAuth, async (req, res) => {
     const data = parseOrFail(schemaUserAction, req.body || {}, res);
     if (!data) return;
     const { action, userId, guildId, reason } = data;
-    if (userId === req.session.user.id) {
-      return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
-    }
+    if (userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
     try {
       const guild = client.guilds.cache.get(guildId);
       if (!guild) return res.status(404).json({ error: 'Server non trovato' });
@@ -872,43 +805,31 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore azione utente'); }
   });
 
-  // ==================== REMINDER ====================
+  // ===== REMINDERS =====
   app.get('/api/reminders', requireAuth, (req, res) => {
-    try {
-      const rows = storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all();
-      res.json(rows);
-    } catch (e) { apiError(res, e); }
+    try { res.json(storage.getAllReminders(200)); } catch (e) { apiError(res, e); }
   });
 
   app.post('/api/reminders', requireAuth, (req, res) => {
     const data = parseOrFail(schemaReminder, req.body || {}, res);
     if (!data) return;
-
     const m = data.when.trim().match(/^(\d+)\s*(s|m|h|d)$/i);
     if (!m) return res.status(400).json({ error: 'Formato tempo non valido (es. 10m, 1h, 2d)' });
     const n = parseInt(m[1], 10);
     const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2].toLowerCase()];
     const ms = n * mult;
-    if (ms < 5000 || ms > 30 * 24 * 60 * 60 * 1000) {
-      return res.status(400).json({ error: 'Durata tra 5s e 30g' });
-    }
-
+    if (ms < 5000 || ms > 30 * 24 * 60 * 60 * 1000) return res.status(400).json({ error: 'Durata tra 5s e 30g' });
     try {
       const id = storage.addReminder(req.session.user.id, data.guildId, data.channelId, data.content, new Date(Date.now() + ms));
       res.json({ ok: true, id });
     } catch (e) { apiError(res, e); }
   });
 
-  // ==================== ANTINUKE ====================
+  // ===== ANTINUKE =====
   app.get('/api/antinuke/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    try {
-      const cfg = storage.getAntiNukeConfig(req.params.guildId);
-      res.json(cfg || {});
-    } catch (e) {
-      log.err('GET antinuke', e);
-      res.status(500).json({ error: 'Errore lettura config' });
-    }
+    try { res.json(storage.getAntiNukeConfig(req.params.guildId)); }
+    catch (e) { apiError(res, e, 'Errore lettura config'); }
   });
 
   app.post('/api/antinuke/:guildId', requireAuth, (req, res) => {
@@ -916,13 +837,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const data = parseOrFail(schemaAntinuke, req.body || {}, res);
     if (!data) return;
     try {
-      const current = storage.getAntiNukeConfig(req.params.guildId) || {};
-      storage.setAntiNukeConfig(req.params.guildId, { ...current, ...data });
+      storage.setAntiNukeConfig(req.params.guildId, data);
       res.json({ ok: true });
-    } catch (e) {
-      log.err('POST antinuke', e);
-      res.status(500).json({ error: 'Errore salvataggio: ' + (e.message || 'sconosciuto') });
-    }
+    } catch (e) { apiError(res, e, 'Errore salvataggio'); }
   });
 
   // ==================== PAGINE HTML ====================
@@ -1072,7 +989,6 @@ function renderLayout(user, page, params = {}, security = {}) {
   input, select, textarea { background: #1a1a1a; border: 1px solid #444; color: #eee; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 10px; font-family: inherit; }
   .form-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
   .form-row input, .form-row select { flex: 1; min-width: 150px; }
-  .form-row > button { margin-top: 0; }
   .loading { color: #888; font-style: italic; }
   a { color: #5865F2; text-decoration: none; }
   a.user-link { color: #5865F2; text-decoration: none; border-bottom: 1px dashed #5865F2; }
@@ -1095,9 +1011,6 @@ function renderLayout(user, page, params = {}, security = {}) {
   .export-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
   .export-bar a { padding: 6px 12px; background: #444; border-radius: 6px; font-size: 12px; color: #eee; }
   .export-bar a:hover { background: #555; }
-  .pager { display: flex; gap: 6px; margin-top: 12px; align-items: center; justify-content: center; }
-  .pager button { padding: 4px 10px; }
-  .pager span { color: #888; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -1137,7 +1050,6 @@ function renderLayout(user, page, params = {}, security = {}) {
 </html>`;
 }
 
-// ==================== UTILITY HTML ====================
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -1179,9 +1091,7 @@ function renderDashboardContent() {
   </div>
 
   <script>
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   async function loadStats() {
     const res = await apiFetch('/api/stats'); if (!res.ok) return;
     const s = await res.json();
@@ -1213,10 +1123,7 @@ function renderDashboardContent() {
     const ids = Array.from(document.querySelectorAll('.bl-check:checked')).map(c => c.value);
     if (!ids.length) { alert('Nessun utente selezionato'); return; }
     if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist?')) return;
-    const res = await apiFetch('/api/blacklist/bulk-delete', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids })
-    });
+    const res = await apiFetch('/api/blacklist/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
     const data = await res.json();
     if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); loadStats(); }
     else alert('❌ ' + (data.error || 'Errore'));
@@ -1227,10 +1134,7 @@ function renderDashboardContent() {
     const reason = document.getElementById('bl-reason').value.trim();
     const msg = document.getElementById('bl-msg');
     if (!userId || !username || !reason) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/blacklist', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId, username, reason })
-    });
+    const res = await apiFetch('/api/blacklist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, username, reason }) });
     const data = await res.json();
     if (res.ok) {
       msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
@@ -1267,6 +1171,9 @@ function renderModlogsContent() {
         <option value="Purge">Purge</option>
         <option value="Lock">Lock</option>
         <option value="Unlock">Unlock</option>
+        <option value="Anti-Nuke">Anti-Nuke</option>
+        <option value="Ticket Claim">Ticket Claim</option>
+        <option value="Ticket Priorità">Ticket Priorità</option>
       </select>
       <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()" maxlength="20">
     </div>
@@ -1329,10 +1236,7 @@ function renderNotesContent() {
     const ids = Array.from(document.querySelectorAll('.note-check:checked')).map(c => c.value);
     if (!ids.length) { alert('Nessuna nota selezionata'); return; }
     if (!confirm('Eliminare ' + ids.length + ' note?')) return;
-    const res = await apiFetch('/api/notes/bulk-delete', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids })
-    });
+    const res = await apiFetch('/api/notes/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
     const data = await res.json();
     if (res.ok) { alert('✅ Eliminate ' + data.count + ' note'); loadNotes(); }
     else alert('❌ ' + (data.error || 'Errore'));
@@ -1347,7 +1251,7 @@ function renderNotesContent() {
   </script>`;
 }
 
-// ---------- TICKET (CON TRANSCRIPT) ----------
+// ---------- TICKET ----------
 function renderTicketsContent() {
   return `
   <div class="section">
@@ -1379,10 +1283,7 @@ function renderTicketsContent() {
     const channelId = document.getElementById('tp-channel').value;
     if (!channelId) { alert('Seleziona un canale'); return; }
     if (!confirm('Inviare il pannello ticket in questo canale?')) return;
-    const res = await apiFetch('/api/ticketpanel', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelId })
-    });
+    const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
     if (res.ok) alert('✅ Pannello inviato');
     else { const d = await res.json(); alert('❌ ' + (d.error || 'Errore')); }
   }
@@ -1392,11 +1293,13 @@ function renderTicketsContent() {
     const tickets = await res.json();
     const el = document.getElementById('tickets-content');
     if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Azioni</th></tr></thead><tbody>' +
+    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Azioni</th></tr></thead><tbody>' +
       tickets.map(t => '<tr>' +
         '<td>' + esc(t.guild) + '</td>' +
         '<td>#' + esc(t.channel) + '</td>' +
         '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
+        '<td>' + esc(t.claimedBy || '-') + '</td>' +
+        '<td>' + esc(t.priority || '-') + '</td>' +
         '<td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
       '</tr>').join('') + '</tbody></table>';
   }
@@ -1470,10 +1373,7 @@ function renderCommandsContent() {
     const names = Array.from(document.querySelectorAll('.cmd-check:checked')).map(c => c.value);
     if (!names.length) { alert('Nessun comando selezionato'); return; }
     if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
-    const res = await apiFetch('/api/commands/bulk-delete', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ names })
-    });
+    const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
     const data = await res.json();
     if (res.ok) { alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(); }
     else alert('❌ ' + (data.error || 'Errore'));
@@ -1483,10 +1383,7 @@ function renderCommandsContent() {
     const response = document.getElementById('cmd-response').value.trim();
     const msg = document.getElementById('cmd-msg');
     if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/commands', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, response })
-    });
+    const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
     if (res.ok) {
       msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
       document.getElementById('cmd-name').value = '';
@@ -1584,32 +1481,20 @@ function renderConfigContent() {
 
   async function saveAutorole(guildId) {
     const autoroleId = document.getElementById('cfg-autorole').value || null;
-    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoroleId })
-    });
-    document.getElementById('autorole-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
+    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autoroleId }) });
+    document.getElementById('autorole-msg').innerHTML = res.ok ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
   }
   async function saveLogChannel(guildId) {
     const logChannelId = document.getElementById('cfg-logchannel').value || null;
-    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ logChannelId })
-    });
-    document.getElementById('logchannel-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
+    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ logChannelId }) });
+    document.getElementById('logchannel-msg').innerHTML = res.ok ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
   }
   async function saveWelcome(guildId) {
     const channelId = document.getElementById('cfg-welcomechannel').value || null;
     const message = document.getElementById('cfg-welcomemessage').value;
     const embedEnabled = document.getElementById('cfg-welcomeembed').checked;
-    const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelId, message, embedEnabled })
-    });
-    document.getElementById('welcome-msg').innerHTML = res.ok
-      ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
+    const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, message, embedEnabled }) });
+    document.getElementById('welcome-msg').innerHTML = res.ok ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
   }
   async function testWelcome(guildId) {
     if (!confirm('Inviare un messaggio di test nel canale welcome?')) return;
@@ -1800,8 +1685,8 @@ function renderUserContent(userId) {
 
     const ticketsEl = document.getElementById('user-tickets-content');
     if (!data.tickets.length) ticketsEl.innerHTML = '<p class="loading">Nessun ticket aperto.</p>';
-    else ticketsEl.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th></th></tr></thead><tbody>' +
-      data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td><td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td></tr>').join('') + '</tbody></table>';
+    else ticketsEl.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Claim</th><th>Priorità</th><th></th></tr></thead><tbody>' +
+      data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td><td>' + esc(t.claimedBy || '-') + '</td><td>' + esc(t.priority || '-') + '</td><td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td></tr>').join('') + '</tbody></table>';
   }
 
   async function removeBL() {
@@ -1968,10 +1853,7 @@ function renderMessagesContent() {
     }
     const btn = document.querySelector('button[onclick="sendMessage()"]');
     btn.disabled = true; btn.textContent = '⏳ Invio...';
-    const res = await apiFetch('/api/messages/send', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channelId, content, embed })
-    });
+    const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed }) });
     const data = await res.json();
     btn.disabled = false; btn.textContent = '📤 Invia';
     if (res.ok) {
@@ -2048,10 +1930,7 @@ function renderUserActionsContent(userId = '') {
     const result = document.getElementById('ua-result');
     if (!guildId) { result.innerHTML = '<span class="error">❌ Seleziona un server</span>'; return; }
     if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + currentUser.tag + '?')) return;
-    const res = await apiFetch('/api/user-action', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, userId: currentUser.id, guildId, reason })
-    });
+    const res = await apiFetch('/api/user-action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, userId: currentUser.id, guildId, reason }) });
     const data = await res.json();
     result.innerHTML = res.ok
       ? '<span class="success">✅ ' + esc(action.toUpperCase()) + ' eseguito</span>'
@@ -2087,21 +1966,23 @@ function renderRemindersContent() {
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let guildsData = [];
-  let channelsData = [];
+  let channelsCache = [];
 
   async function loadGuilds() {
     const res = await apiFetch('/api/guilds');
     guildsData = await res.json();
     const sel = document.getElementById('rm-guild');
     sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
+    if (!channelsCache.length) {
+      const cRes = await apiFetch('/api/messages/channels');
+      channelsCache = await cRes.json();
+    }
     if (guildsData.length) loadChannels();
   }
-  async function loadChannels() {
+  function loadChannels() {
     const guildId = document.getElementById('rm-guild').value;
-    const res = await apiFetch('/api/messages/channels');
-    const all = await res.json();
-    channelsData = all.filter(c => c.guildId === guildId);
-    document.getElementById('rm-channel').innerHTML = channelsData.map(c => '<option value="' + esc(c.channelId) + '">#' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
+    const filtered = channelsCache.filter(c => c.guildId === guildId);
+    document.getElementById('rm-channel').innerHTML = filtered.map(c => '<option value="' + esc(c.channelId) + '">#' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
   }
   async function createReminder() {
     const guildId = document.getElementById('rm-guild').value;
@@ -2110,10 +1991,7 @@ function renderRemindersContent() {
     const when = document.getElementById('rm-when').value.trim();
     const result = document.getElementById('rm-result');
     if (!guildId || !channelId || !content || !when) { result.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/reminders', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ guildId, channelId, content, when })
-    });
+    const res = await apiFetch('/api/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ guildId, channelId, content, when }) });
     const data = await res.json();
     if (res.ok) {
       result.innerHTML = '<span class="success">✅ Reminder #' + esc(data.id) + ' creato</span>';
@@ -2148,7 +2026,7 @@ function renderAntinukeContent() {
   <div class="section">
     <h2>🛡️ Configurazione Anti-Nuke</h2>
     <p style="color:#888;font-size:13px;margin-bottom:14px;">Configura soglie e punizioni per il sistema Anti-Nuke.</p>
-    <select id="an-guild"></select>
+    <select id="an-guild" onchange="loadConfig()"></select>
 
     <div class="config-block" style="margin-top:14px;">
       <h3>Soglie</h3>
@@ -2191,7 +2069,6 @@ function renderAntinukeContent() {
     guildsData = await res.json();
     const sel = document.getElementById('an-guild');
     sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
-    sel.onchange = loadConfig;
     if (guildsData.length) loadConfig();
   }
   async function loadConfig() {
@@ -2219,10 +2096,7 @@ function renderAntinukeContent() {
       punishment: document.getElementById('an-punishment').value,
       whitelist_ids: document.getElementById('an-whitelist').value.trim()
     };
-    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
+    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const data = await res.json();
     const el = document.getElementById('an-result');
     if (res.ok) el.innerHTML = '<span class="success">✅ Salvato</span>';
