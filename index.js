@@ -161,9 +161,7 @@ async function safeReply(interaction, data) {
 }
 
 async function safeReplySource(source, data, isSlash) {
-  if (isSlash) {
-    return safeReply(source, data);
-  }
+  if (isSlash) return safeReply(source, data);
   const payload = { ...data };
   delete payload.ephemeral;
   try {
@@ -184,12 +182,7 @@ function buildResultEmbed(result, defaultTitle = 'Risultato') {
   const title = isSuccess ? `✅ ${customTitle}` : isError ? `❌ ${customTitle}` : `ℹ️ ${customTitle}`;
   const color = isSuccess ? 0x00FF00 : isError ? 0xFF0000 : 0x0099FF;
 
-  return EmbedManager.createEmbed({
-    title,
-    description: cleanText || 'Operazione completata.',
-    color,
-    timestamp: true
-  });
+  return EmbedManager.createEmbed({ title, description: cleanText || 'Operazione completata.', color, timestamp: true });
 }
 
 // ==================== EMBED MANAGER ====================
@@ -226,6 +219,53 @@ let clientRef = null;
 const storage = new StorageService(process.env.DB_PATH || './data/bot.db');
 const botStartTime = Date.now();
 
+// ==================== GENERA TRANSCRIPT ====================
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function buildTranscriptHtml(channel) {
+  const msgs = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+  if (!msgs) return null;
+
+  let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + escHtml(channel.name) + '</title>'
+    + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
+    + '.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}'
+    + '.avatar{width:40px;height:40px;border-radius:50%}'
+    + '.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}'
+    + '.content{flex:1;word-wrap:break-word;white-space:pre-wrap}'
+    + 'img.attach{max-width:300px;border-radius:6px;margin-top:6px}</style></head><body>';
+  html += '<h1>Transcript: #' + escHtml(channel.name) + '</h1>';
+
+  const sorted = [...msgs.values()].reverse();
+  for (const m of sorted) {
+    const avatar = escHtml(m.author.displayAvatarURL());
+    const username = escHtml(m.author.username);
+    const time = escHtml(m.createdAt.toLocaleString('it-IT'));
+    if (m.author.bot && m.embeds.length > 0) {
+      const desc = m.embeds.map(e => escHtml(e.description || '')).join('<br>');
+      html += '<div class="msg"><div class="content"><span class="author">[BOT] ' + username + '</span>'
+        + '<span class="time">' + time + '</span><br>' + desc + '</div></div>';
+    } else {
+      let attach = '';
+      for (const att of m.attachments.values()) {
+        if ((att.contentType || '').startsWith('image/')) {
+          attach += '<br><img class="attach" src="' + escHtml(att.url) + '" alt="attachment">';
+        } else {
+          attach += '<br><a href="' + escHtml(att.url) + '" target="_blank" rel="noopener">📎 ' + escHtml(att.name) + '</a>';
+        }
+      }
+      html += '<div class="msg"><img src="' + avatar + '" class="avatar">'
+        + '<div class="content"><span class="author">' + username + '</span>'
+        + '<span class="time">' + time + '</span><br>' + escHtml(m.content) + attach + '</div></div>';
+    }
+  }
+  html += '</body></html>';
+  return html;
+}
+
 // ==================== ANTI-NUKE ====================
 const antinukeTracker = new Map();
 
@@ -240,8 +280,13 @@ function trackAction(guildId, userId, actionType, windowMs) {
 }
 
 async function quarantineUser(guild, member, reason) {
+  const botMember = guild.members.me;
+  if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    log.warn(`Anti-Nuke: manca ManageRoles in ${guild.name}, salto quarantena`);
+    return false;
+  }
+
   let quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantena' || r.name === 'Quarantine');
-  
   if (!quarantineRole) {
     try {
       quarantineRole = await guild.roles.create({
@@ -257,7 +302,6 @@ async function quarantineUser(guild, member, reason) {
     }
   }
 
-  const botMember = guild.members.me;
   if (quarantineRole.position >= botMember.roles.highest.position) {
     log.warn(`Il ruolo "Quarantena" è troppo in alto per essere assegnato in ${guild.name}`);
     return false;
@@ -275,7 +319,8 @@ async function quarantineUser(guild, member, reason) {
   }
 }
 
-async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId = null) {
+async function checkAntiNuke(guild, auditAction, actionType, threshold) {
+  if (!guild) return;
   let executorId = null;
   try {
     const logs = await guild.fetchAuditLogs({ limit: 1, type: auditAction });
@@ -284,14 +329,12 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId
     if (entry.executor.id === clientRef.user.id) return;
     if (Date.now() - entry.createdTimestamp > 15000) return;
     executorId = entry.executor.id;
-  } catch (e) {
-    return;
-  }
+  } catch (e) { return; }
 
   if (!executorId) return;
 
   const config = storage.getAntiNukeConfig(guild.id);
-  const whitelist = config.whitelist_ids.split(',').map(s => s.trim()).filter(Boolean);
+  const whitelist = (config.whitelist_ids || '').split(',').map(s => s.trim()).filter(Boolean);
   if (whitelist.includes(executorId)) return;
   if (executorId === guild.ownerId) return;
 
@@ -309,12 +352,10 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId
     }
 
     const punishReason = `[ANTI-NUKE] Superata soglia ${actionType} (${count} in ${windowMs}ms)`;
-    
+
     if (config.punishment === 'quarantine') {
       const success = await quarantineUser(guild, member, punishReason);
-      if (!success) {
-        await member.ban({ reason: punishReason }).catch(() => {});
-      }
+      if (!success) await member.ban({ reason: punishReason }).catch(() => {});
     } else if (config.punishment === 'ban') {
       await member.ban({ reason: punishReason }).catch(() => {});
     } else if (config.punishment === 'kick') {
@@ -323,14 +364,13 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId
 
     antinukeTracker.delete(`${guild.id}-${executorId}-${actionType}`);
 
-    // LOG NEL CANALE DI MODERAZIONE
     await ModLogModule.logUserAction(guild, {
-      type: 'Anti-Nuke (Ruoli)',
-      title: '🛡️ Anti-Nuke Attivato (Cambio Ruoli)',
+      type: 'Anti-Nuke',
+      title: '🛡️ Anti-Nuke Attivato',
       targetId: executorId,
       target: `${member.user.tag} (${executorId})`,
       moderator: 'Sistema Anti-Nuke',
-      reason: `Ha modificato i ruoli di ${count} membri in ${windowMs}ms (soglia: ${threshold}). Punizione: ${config.punishment}`
+      reason: `Ha eseguito ${count} azioni di tipo "${actionType}" in ${windowMs}ms (soglia: ${threshold}). Punizione: ${config.punishment}`
     }).catch(() => {});
   }
 }
@@ -371,6 +411,7 @@ const ModLogModule = {
   }
 };
 
+// ==================== TICKETS ====================
 const TICKET_COOLDOWN_MS = 5 * 60 * 1000;
 const CLOSE_DELAY_MS = 3000;
 const closingTickets = new Set();
@@ -535,7 +576,18 @@ async function closeTicket(source, user) {
     setTimeout(async () => {
       try {
         const still = channel.guild.channels.cache.get(channel.id);
-        if (still && channel.deletable) await channel.delete();
+        if (!still) return;
+        const html = await buildTranscriptHtml(still);
+        if (html) {
+          const meta = storage.getTicketMeta(still.id);
+          storage.saveTranscript(
+            still.id, still.name, still.name.replace('ticket-', ''),
+            meta?.claimed_by_tag || 'N/D',
+            meta?.priority || 'N/D',
+            html
+          );
+        }
+        if (channel.deletable) await channel.delete();
       } catch (err) {
         log.err('delete ticket', err);
       } finally {
@@ -620,6 +672,7 @@ async function createLobby(interaction) {
     });
   }
 }
+
 // ==================== MODLOGS ====================
 async function handleModlogs(source, target, isSlash) {
   if (!target) {
@@ -852,11 +905,8 @@ async function removeBlacklist(source, targetUser, moderator, isSlash) {
     clientRef.guilds.cache.map(async (guild) => {
       try {
         let ban = null;
-        try {
-          ban = await guild.bans.fetch(targetUser.id);
-        } catch (e) {
-          if (e.code !== 10026) throw e;
-        }
+        try { ban = await guild.bans.fetch(targetUser.id); }
+        catch (e) { if (e.code !== 10026) throw e; }
         if (ban) {
           await guild.members.unban(targetUser.id, `[BLACKLIST RIMOSSA] ${moderator.username}`);
           await ModLogModule.logUserAction(guild, {
@@ -1118,6 +1168,7 @@ async function addNote(source, targetUser, content, author, isSlash) {
     ephemeral: isSlash
   }, isSlash);
 }
+
 async function listNotes(source, targetUser, isSlash) {
   const guildId = source.guild.id;
   const notes = storage.getNotesForUser(guildId, targetUser.id);
@@ -1260,7 +1311,7 @@ function buildHelpEmbed() {
       { name: '👤 Utente', value: '`/userinfo` `/roles` `/stats` `/ping` `/uptime`', inline: true },
       { name: '📨 Inviti & Ruoli', value: '`/invite` `/giverole` `/removerole`', inline: true },
       { name: '🔒 Canali', value: '`/lock` `/unlock`', inline: true },
-      { name: '🎮 Lobby', value: '`/dashboard`', inline: true },
+      { name: '🛡️ Anti-Nuke', value: '`/antinuke whitelist`', inline: true },
       { name: '⏰ Reminder', value: '`/remind`', inline: true },
       { name: '🔧 Custom', value: '`/addcmd` `/delcmd` `/listcmd`', inline: true }
     )
@@ -1550,7 +1601,7 @@ const CommandLogic = {
   }
 };
 
-// ==================== SLASH COMMANDS ====================
+// ==================== SLASH COMMANDS (PRIMA delle features) ====================
 const slashCommands = [
   new SlashCommandBuilder().setName('help').setDescription('Mostra la lista dei comandi'),
   new SlashCommandBuilder().setName('stats').setDescription('Mostra le statistiche del bot'),
@@ -1643,6 +1694,28 @@ const slashCommands = [
       .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true)))
 ];
 
+// ==================== FEATURES (dopo slashCommands!) ====================
+let features = [];
+try {
+  features = require('./features');
+  log.ok(`📦 Caricamento ${features.length} feature(s)...`);
+  const ctx = {
+    client: null, storage, log, EmbedManager,
+    safeReply, safeReplySource, hasStaffOrAdmin, isAdmin
+  };
+  for (const feature of features) {
+    if (feature.setup) {
+      try { feature.setup(ctx); log.ok(`   ✅ Feature "${feature.name}" caricata`); }
+      catch (e) { log.err(`Feature "${feature.name}" setup`, e); }
+    }
+    if (Array.isArray(feature.slashCommands)) {
+      slashCommands.push(...feature.slashCommands);
+    }
+  }
+} catch (err) {
+  log.warn('⚠️ features.js non trovato o non valido. Il bot parte senza feature extra.');
+}
+
 // ==================== REGISTRAZIONE COMANDI ====================
 async function registerSlashCommands(clientId, token) {
   const rest = new REST({ version: '10', timeout: 30000 }).setToken(token);
@@ -1653,19 +1726,14 @@ async function registerSlashCommands(clientId, token) {
 
   const validCommands = [];
   for (const cmd of slashCommands) {
-    try {
-      const json = cmd.toJSON();
-      validCommands.push(json);
-    } catch (err) {
-      log.err(`❌ Comando "/${cmd.name}" non valido: ${err.message}`);
-    }
+    try { validCommands.push(cmd.toJSON()); }
+    catch (err) { log.err(`❌ Comando "/${cmd.name}" non valido: ${err.message}`); }
   }
 
   try {
     if (GUILD_ID) {
       await rest.put(Routes.applicationCommands(clientId), { body: [] }).catch(err =>
         log.warn(`Cancellazione globali fallita: ${err.message}`));
-
       log.info(`Registrazione ISTANTANEA sul server ${GUILD_ID}...`);
       await rest.put(Routes.applicationGuildCommands(clientId, GUILD_ID), { body: validCommands });
       log.ok(`✅ ${validCommands.length} comandi registrati ISTANTANEAMENTE su guild ${GUILD_ID}`);
@@ -1683,6 +1751,7 @@ async function registerSlashCommands(clientId, token) {
     }
   }
 }
+
 // ==================== CLIENT ====================
 const client = new Client({
   intents: [
@@ -1690,22 +1759,51 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildVoiceStates
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildModeration
   ],
   partials: [Partials.Channel, Partials.Message, Partials.User, Partials.GuildMember]
 });
 clientRef = client;
 
+// Setta client nelle features dopo la creazione
+for (const f of features) {
+  if (f.setup && !f._ctxClient) {
+    try {
+      f.setup({ client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin });
+      f._ctxClient = true;
+    } catch (e) { log.err(`Feature "${f.name}" re-setup`, e); }
+  }
+}
+
 // ==================== ANTI-NUKE EVENTI ====================
 client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   if (!newMember.guild) return;
-  
-  // Controlla se i ruoli sono effettivamente cambiati
   if (oldMember.roles.cache.size === newMember.roles.cache.size) return;
-
-  const config = storage.getAntiNukeConfig(newMember.guild.id);
-  // Passiamo il targetId per il log (l'utente a cui sono stati cambiati i ruoli)
-  await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', config.threshold_role_update, newMember.id);
+  const cfg = storage.getAntiNukeConfig(newMember.guild.id);
+  await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', cfg.threshold_role_update);
+});
+client.on(Events.ChannelCreate, async (channel) => {
+  if (!channel.guild) return;
+  const cfg = storage.getAntiNukeConfig(channel.guild.id);
+  await checkAntiNuke(channel.guild, AuditLogEvent.ChannelCreate, 'channel_create', cfg.threshold_channel);
+});
+client.on(Events.ChannelDelete, async (channel) => {
+  if (!channel.guild) return;
+  const cfg = storage.getAntiNukeConfig(channel.guild.id);
+  await checkAntiNuke(channel.guild, AuditLogEvent.ChannelDelete, 'channel_delete', cfg.threshold_channel);
+});
+client.on(Events.GuildBanAdd, async (ban) => {
+  const cfg = storage.getAntiNukeConfig(ban.guild.id);
+  await checkAntiNuke(ban.guild, AuditLogEvent.MemberBanAdd, 'ban_add', cfg.threshold_ban);
+});
+client.on(Events.GuildRoleCreate, async (role) => {
+  const cfg = storage.getAntiNukeConfig(role.guild.id);
+  await checkAntiNuke(role.guild, AuditLogEvent.RoleCreate, 'role_create', cfg.threshold_role);
+});
+client.on(Events.GuildRoleDelete, async (role) => {
+  const cfg = storage.getAntiNukeConfig(role.guild.id);
+  await checkAntiNuke(role.guild, AuditLogEvent.RoleDelete, 'role_delete', cfg.threshold_role);
 });
 
 // ==================== REMINDER SCHEDULER ====================
@@ -1715,15 +1813,9 @@ setInterval(async () => {
     for (const r of due) {
       try {
         const guild = client.guilds.cache.get(r.guild_id);
-        if (!guild) {
-          storage.deleteReminder(r.id);
-          continue;
-        }
+        if (!guild) { storage.deleteReminder(r.id); continue; }
         const channel = guild.channels.cache.get(r.channel_id);
-        if (!channel) {
-          storage.deleteReminder(r.id);
-          continue;
-        }
+        if (!channel) { storage.deleteReminder(r.id); continue; }
         await channel.send({
           content: `<@${r.user_id}> ⏰ **Reminder:** ${r.content}`,
           allowedMentions: { users: [r.user_id], roles: [] }
@@ -1757,17 +1849,11 @@ async function handlePrefixCommand(message) {
   const custom = storage.getCommand(commandName);
   if (custom) {
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
-      await message.delete().catch(err => {
-        log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`);
-      });
+      await message.delete().catch(err => log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`));
     }
-
     return channel.send({
       content: custom,
-      allowedMentions: {
-        parse: ['users', 'everyone'],
-        repliedUser: false
-      }
+      allowedMentions: { parse: ['users', 'everyone'], repliedUser: false }
     }).catch(err => log.err('custom command send', err));
   }
 
@@ -1917,10 +2003,7 @@ async function handlePrefixCommand(message) {
         const extra = names.length > 50 ? `\n\n*...e altri ${names.length - 50} comandi*` : '';
 
         return message.reply({
-          embeds: [EmbedManager.info(
-            `Comandi Custom (${names.length})`,
-            `${list}${extra}`
-          )]
+          embeds: [EmbedManager.info(`Comandi Custom (${names.length})`, `${list}${extra}`)]
         });
       }
 
@@ -1934,18 +2017,10 @@ async function handlePrefixCommand(message) {
         }
 
         const ms = parseDuration(timeArg);
-        if (!ms) {
-          return message.reply('❌ Formato tempo non valido. Usa `10m`, `1h`, `2d`, `30s`.');
-        }
-        if (ms < 5000) {
-          return message.reply('❌ Il tempo minimo è 5 secondi.');
-        }
-        if (ms > 30 * 24 * 60 * 60 * 1000) {
-          return message.reply('❌ Il tempo massimo è 30 giorni.');
-        }
-        if (content.length > 500) {
-          return message.reply('❌ Il testo è troppo lungo (max 500 caratteri).');
-        }
+        if (!ms) return message.reply('❌ Formato tempo non valido. Usa `10m`, `1h`, `2d`, `30s`.');
+        if (ms < 5000) return message.reply('❌ Il tempo minimo è 5 secondi.');
+        if (ms > 30 * 24 * 60 * 60 * 1000) return message.reply('❌ Il tempo massimo è 30 giorni.');
+        if (content.length > 500) return message.reply('❌ Il testo è troppo lungo (max 500 caratteri).');
 
         const remindAt = new Date(Date.now() + ms);
         const id = storage.addReminder(member.id, guild.id, channel.id, content, remindAt);
@@ -2517,18 +2592,10 @@ async function handleSlashCommand(interaction) {
       const content = interaction.options.getString('testo');
 
       const ms = parseDuration(timeArg);
-      if (!ms) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Formato non valido', 'Usa `10m`, `1h`, `2d`, `30s`.')], ephemeral: true });
-      }
-      if (ms < 5000) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Troppo corto', 'Minimo 5 secondi.')], ephemeral: true });
-      }
-      if (ms > 30 * 24 * 60 * 60 * 1000) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Troppo lungo', 'Massimo 30 giorni.')], ephemeral: true });
-      }
-      if (content.length > 500) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Testo troppo lungo', 'Max 500 caratteri.')], ephemeral: true });
-      }
+      if (!ms) return safeReply(interaction, { embeds: [EmbedManager.error('Formato non valido', 'Usa `10m`, `1h`, `2d`, `30s`.')], ephemeral: true });
+      if (ms < 5000) return safeReply(interaction, { embeds: [EmbedManager.error('Troppo corto', 'Minimo 5 secondi.')], ephemeral: true });
+      if (ms > 30 * 24 * 60 * 60 * 1000) return safeReply(interaction, { embeds: [EmbedManager.error('Troppo lungo', 'Massimo 30 giorni.')], ephemeral: true });
+      if (content.length > 500) return safeReply(interaction, { embeds: [EmbedManager.error('Testo troppo lungo', 'Max 500 caratteri.')], ephemeral: true });
 
       const remindAt = new Date(Date.now() + ms);
       const id = storage.addReminder(interaction.user.id, interaction.guild.id, interaction.channel.id, content, remindAt);
@@ -2653,14 +2720,11 @@ async function handleSlashCommand(interaction) {
       if (sub === 'whitelist') {
         const target = interaction.options.getUser('utente');
         const config = storage.getAntiNukeConfig(guild.id);
-        const currentWhitelist = config.whitelist_ids.split(',').map(s => s.trim()).filter(Boolean);
-        
+        const currentWhitelist = (config.whitelist_ids || '').split(',').map(s => s.trim()).filter(Boolean);
+
         if (!currentWhitelist.includes(target.id)) {
           currentWhitelist.push(target.id);
-          storage.setAntiNukeConfig(guild.id, {
-            ...config,
-            whitelist_ids: currentWhitelist.join(',')
-          });
+          storage.setAntiNukeConfig(guild.id, { ...config, whitelist_ids: currentWhitelist.join(',') });
           return interaction.reply({
             embeds: [EmbedManager.success('Whitelist Aggiornata', `${target.username} è ora immune all'Anti-Nuke.`)],
             ephemeral: true
@@ -2690,12 +2754,28 @@ async function handleButton(interaction) {
   if (interaction.customId === 'create_lobby') return createLobby(interaction);
 
   if (interaction.customId === 'claim_ticket') {
-    const embed = EmbedManager.success('Ticket Claimato', `Il ticket è stato preso in carico da ${interaction.user}.`);
-    await interaction.reply({ embeds: [embed] });
-    return;
+    const ch = interaction.channel;
+    if (!isTicketChannel(ch)) return interaction.reply({ embeds: [EmbedManager.error('Errore', 'Solo nei ticket.')], ephemeral: true });
+    if (!hasStaffOrAdmin(interaction.member)) return interaction.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Solo Staff.')], ephemeral: true });
+    storage.setTicketMeta(ch.id, {
+      claimedById: interaction.user.id,
+      claimedByTag: interaction.user.tag
+    });
+    await ModLogModule.logUserAction(interaction.guild, {
+      type: 'Ticket Claim',
+      title: 'Ticket preso in carico',
+      targetId: ch.name.replace('ticket-', ''),
+      target: ch.name,
+      moderator: `${interaction.user.tag} (${interaction.user.id})`,
+      channel: ch.name
+    });
+    return interaction.reply({ embeds: [EmbedManager.success('Ticket Claimato', `Il ticket è stato preso in carico da ${interaction.user}.`)] });
   }
 
   if (interaction.customId === 'priority_ticket') {
+    const ch = interaction.channel;
+    if (!isTicketChannel(ch)) return interaction.reply({ embeds: [EmbedManager.error('Errore', 'Solo nei ticket.')], ephemeral: true });
+    if (!hasStaffOrAdmin(interaction.member)) return interaction.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Solo Staff.')], ephemeral: true });
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('prio_low').setLabel('🟢 Bassa').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('prio_med').setLabel('🟡 Media').setStyle(ButtonStyle.Secondary),
@@ -2706,38 +2786,20 @@ async function handleButton(interaction) {
   }
 
   if (['prio_low', 'prio_med', 'prio_high', 'prio_urgent'].includes(interaction.customId)) {
-    await interaction.update({ content: `✅ Priorità impostata a: **${interaction.customId.replace('prio_', '').toUpperCase()}**`, components: [] });
-    return;
+    const ch = interaction.channel;
+    const priority = interaction.customId.replace('prio_', '');
+    storage.setTicketMeta(ch.id, { priority });
+    await ModLogModule.logUserAction(interaction.guild, {
+      type: 'Ticket Priorità',
+      title: 'Priorità ticket',
+      targetId: ch.name.replace('ticket-', ''),
+      target: ch.name,
+      moderator: `${interaction.user.tag} (${interaction.user.id})`,
+      channel: ch.name,
+      reason: `Priorità: ${priority.toUpperCase()}`
+    });
+    return interaction.update({ content: `✅ Priorità impostata a: **${priority.toUpperCase()}**`, components: [] });
   }
-}
-
-// ==================== FEATURES ====================
-let features = [];
-try {
-  features = require('./features');
-  log.ok(`📦 Caricamento ${features.length} feature(s)...`);
-  const ctx = {
-    client,
-    storage,
-    log,
-    EmbedManager,
-    safeReply,
-    safeReplySource,
-    hasStaffOrAdmin,
-    isAdmin
-  };
-  for (const feature of features) {
-    if (feature.setup) {
-      feature.setup(ctx);
-      log.ok(`   ✅ Feature "${feature.name}" caricata`);
-    }
-    if (Array.isArray(feature.slashCommands)) {
-      slashCommands.push(...feature.slashCommands);
-    }
-  }
-} catch (err) {
-  log.warn('⚠️ features.js non trovato o non valido. Il bot parte senza feature extra.');
-  log.err('Dettagli', err);
 }
 
 // ==================== EVENTS ====================
@@ -2751,14 +2813,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
       for (const feature of features) {
-        if (
-          feature.handleSlash &&
-          feature.slashCommands?.some(c => c.name === interaction.commandName)
-        ) {
-          const ctx = {
-            client, storage, log, EmbedManager,
-            safeReply, safeReplySource, hasStaffOrAdmin, isAdmin
-          };
+        if (feature.handleSlash && feature.slashCommands?.some(c => c.name === interaction.commandName)) {
+          const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin };
           return await feature.handleSlash(interaction, ctx);
         }
       }
@@ -2766,10 +2822,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } else if (interaction.isButton()) {
       for (const feature of features) {
         if (feature.handleButton) {
-          const ctx = {
-            client, storage, log, EmbedManager,
-            safeReply, safeReplySource, hasStaffOrAdmin, isAdmin
-          };
+          const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin };
           const handled = await feature.handleButton(interaction, ctx);
           if (handled) return;
         }
@@ -2809,10 +2862,10 @@ let webServer = null;
   }
 })();
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   log.warn('Shutdown...');
   if (webServer) try { webServer.close(); } catch {}
-  if (typeof storage.close === 'function') storage.close();
-  client.destroy();
-  process.exit(0);
+  if (typeof storage.close === 'function') { try { storage.close(); } catch {} }
+  try { client.destroy(); } catch {}
+  setTimeout(() => process.exit(0), 500);
 });
