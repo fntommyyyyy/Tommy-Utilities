@@ -1,3 +1,4 @@
+// web.js — Dashboard web (sicurezza + pulsanti funzionanti)
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -26,7 +27,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
   const DASHBOARD_ROLES = ['Senior Admin'];
 
-  // Cache autorizzazione
   const AUTH_CACHE_TTL = 60 * 1000;
   const authCache = new Map();
 
@@ -49,7 +49,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     return authorized;
   }
 
-  // Helmet
+  // ==================== HELMET ====================
   app.use(helmet({
     contentSecurityPolicy: {
       useDefaults: true,
@@ -73,13 +73,16 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
+  // ==================== SESSION ====================
   const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
   try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
 
   app.use(session({
     store: new FileStore({ path: SESSION_DIR, ttl: 7 * 24 * 60 * 60, retries: 0 }),
     secret: SESSION_SECRET,
-    resave: false, saveUninitialized: false, proxy: true,
+    resave: false,
+    saveUninitialized: true,
+    proxy: true,
     cookie: {
       secure: IS_PROD,
       httpOnly: true,
@@ -88,38 +91,56 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
   }));
 
+  // ==================== CSRF (configurazione corretta) ====================
   const CSRF_SECRET = process.env.CSRF_SECRET || SESSION_SECRET;
-  const { generateCsrfToken, validateRequest } = doubleCsrf({
+
+  const {
+    doubleCsrfProtection,
+    generateCsrfToken
+  } = doubleCsrf({
     getSecret: () => CSRF_SECRET,
-    getSessionIdentifier: (req) => (req.session && req.session.user && req.session.user.id) || 'anon',
-    cookieName: '_csrf',
-    cookieOptions: { httpOnly: true, sameSite: IS_PROD ? 'none' : 'lax', secure: IS_PROD, path: '/' },
+    getSessionIdentifier: (req) => {
+      try { return (req.session && req.session.user && req.session.user.id) || req.sessionID || 'anon'; }
+      catch { return 'anon'; }
+    },
+    cookieName: IS_PROD ? '__Host-psifi.x-csrf-token' : 'x-csrf-token',
+    cookieOptions: {
+      httpOnly: true,
+      sameSite: IS_PROD ? 'none' : 'lax',
+      secure: IS_PROD,
+      path: '/'
+    },
     size: 64,
     ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
-    getCsrfTokenFromRequest: (req) => (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
+    getCsrfTokenFromRequest: (req) =>
+      (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
   });
 
-  app.use((req, res, next) => {
-    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-    if (req.path === '/auth/login') return next();
-    try { return validateRequest(req, res, next); }
-    catch (e) { return res.status(403).json({ error: 'CSRF non valido' }); }
-  });
+  app.use(doubleCsrfProtection);
 
   app.get('/api/csrf-token', (req, res) => {
-    try { res.json({ csrfToken: generateCsrfToken(req, res) }); }
-    catch (e) { res.status(500).json({ error: 'Errore CSRF' }); }
+    req.session.save((err) => {
+      if (err) { log.err('csrf session save', err); return res.status(500).json({ error: 'Errore sessione' }); }
+      try {
+        const token = generateCsrfToken(req, res);
+        res.json({ csrfToken: token });
+      } catch (e) {
+        log.err('csrf-token', e);
+        res.status(500).json({ error: 'Errore CSRF' });
+      }
+    });
   });
 
+  // ==================== RATE LIMIT ====================
   const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste di login, riprova più tardi.' } });
-  const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste, riprova più tardi.' } });
-  const actionLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe azioni distruttive, riprova tra un minuto.' } });
-  const messageLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppi messaggi inviati, riprova tra un minuto.' } });
+  const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste, riprova più tardi.' } });
+  const actionLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe azioni distruttive, riprova tra un minuto.' } });
+  const messageLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppi messaggi inviati, riprova tra un minuto.' } });
 
   app.use('/auth', authLimiter);
   app.use('/api', apiLimiter);
 
-  // ==================== SCHEMI ZOD ====================
+  // ==================== ZOD ====================
   const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
   const guildIdSchema = z.string().regex(/^\d{17,20}$/, 'ID server non valido');
 
@@ -189,14 +210,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
     if (!req.session.user.dashboardAuthorized) {
       if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Non autorizzato' });
-      return res.status(403).send('Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.');
+      return res.status(403).send('Accesso negato.');
     }
     try {
       const ok = await isAuthorizedByRole(req.session.user.id);
       if (!ok) {
         req.session.user.dashboardAuthorized = false;
         if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Ruolo non più valido' });
-        return res.status(403).send('Accesso negato: il ruolo "Senior Admin" non è più presente.');
+        return res.status(403).send('Accesso negato.');
       }
     } catch (e) { log.err('requireAuth recheck', e); }
     next();
@@ -207,10 +228,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.3.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.4.0', loggedIn: !!req.session.user });
   });
 
-  // ==================== OAUTH2 ====================
+  // ==================== OAUTH ====================
   app.get('/auth/login', (req, res) => {
     if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('OAuth2 non configurato.');
     const params = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: `${DASHBOARD_URL}/auth/callback`, response_type: 'code', scope: 'identify' });
@@ -229,14 +250,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const user = userRes.data;
 
       if (!(await isAuthorizedByRole(user.id))) {
-        return res.status(403).send('Accesso negato: devi avere il ruolo "Senior Admin" su un server del bot.');
+        return res.status(403).send('Accesso negato.');
       }
-      log.ok(`OAuth login riuscito per ${user.username} (${user.id})`);
+      log.ok(`OAuth login: ${user.username} (${user.id})`);
 
       try {
         const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'sconosciuto';
-        const ua = (req.headers['user-agent'] || '').slice(0, 300);
-        storage.saveDashboardAccess(user.id, user.username, ip, ua);
+        storage.saveDashboardAccess(user.id, user.username, ip, (req.headers['user-agent'] || '').slice(0, 300));
       } catch (e) { log.err('saveDashboardAccess', e); }
 
       req.session.regenerate((err) => {
@@ -284,10 +304,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
       try { transcriptsCount = storage.countTranscripts ? storage.countTranscripts() : 0; } catch {}
       try { remindersCount = storage.countReminders ? storage.countReminders() : 0; } catch {}
       res.json({
-        logs: s.total, blacklist: s.blacklist,
-        guilds: client.guilds.cache.size, ping: client.ws.ping,
-        uptime: Math.floor((Date.now() - botStartTime) / 1000),
-        byType: s.byType,
+        logs: s.total, blacklist: s.blacklist, guilds: client.guilds.cache.size, ping: client.ws.ping,
+        uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType,
         tickets: ticketsCount, notes: notesCount, transcripts: transcriptsCount, reminders: remindersCount
       });
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
@@ -423,12 +441,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
           ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
           : `https://cdn.discordapp.com/embed/avatars/0.png`;
         const embed = new EmbedBuilder()
-          .setTitle('👋 Benvenuto!')
-          .setDescription(text)
-          .setColor(0x00FF00)
-          .setThumbnail(avatarUrl)
-          .setFooter({ text: `Sei il membro #${guild.memberCount}` })
-          .setTimestamp();
+          .setTitle('👋 Benvenuto!').setDescription(text).setColor(0x00FF00)
+          .setThumbnail(avatarUrl).setFooter({ text: `Sei il membro #${guild.memberCount}` }).setTimestamp();
         await channel.send({ embeds: [embed] });
       } else {
         await channel.send({ content: text, allowedMentions: { parse: ['users'] } });
@@ -444,7 +458,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-')) {
-            const meta = storage.getTicketMeta(ch.id) || {};
+            const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
             tickets.push({
               guild: guild.name, guildId: guild.id,
               channel: ch.name, channelId: ch.id,
@@ -467,7 +481,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
 
       const msgs = await ch.messages.fetch({ limit: 100 }).catch(() => null);
-      if (msgs) {
+      if (msgs && storage.saveTranscript) {
         const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + esc(ch.name) + '</title>'
           + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
@@ -498,7 +512,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
           }
         }
         html += '</body></html>';
-        const meta = storage.getTicketMeta(ch.id);
+        const meta = storage.getTicketMeta ? storage.getTicketMeta(ch.id) : null;
         storage.saveTranscript(ch.id, ch.name, ch.name.replace('ticket-', ''), meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html);
       }
       await ch.delete('Chiuso dalla dashboard web');
@@ -525,13 +539,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   app.get('/api/tickets/transcripts', requireAuth, (req, res) => {
-    try { res.json(storage.getAllTranscripts()); } catch (e) { apiError(res, e); }
+    try { res.json(storage.getAllTranscripts ? storage.getAllTranscripts() : []); } catch (e) { apiError(res, e); }
   });
   app.get('/api/tickets/transcripts/:id', requireAuth, (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).send('ID non valido');
     try {
-      const t = storage.getTranscript(id);
+      const t = storage.getTranscript ? storage.getTranscript(id) : null;
       if (!t) return res.status(404).send('Transcript non trovato');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -610,7 +624,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       for (const guild of client.guilds.cache.values()) {
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name === `ticket-${userId}`) {
-            const meta = storage.getTicketMeta(ch.id) || {};
+            const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
             tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id, claimedBy: meta.claimed_by_tag || null, priority: meta.priority || null });
           }
         }
@@ -807,7 +821,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // ===== REMINDERS =====
   app.get('/api/reminders', requireAuth, (req, res) => {
-    try { res.json(storage.getAllReminders(200)); } catch (e) { apiError(res, e); }
+    try {
+      if (storage.getAllReminders) res.json(storage.getAllReminders(200));
+      else res.json(storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all());
+    } catch (e) { apiError(res, e); }
   });
 
   app.post('/api/reminders', requireAuth, (req, res) => {
@@ -828,8 +845,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
   // ===== ANTINUKE =====
   app.get('/api/antinuke/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    try { res.json(storage.getAntiNukeConfig(req.params.guildId)); }
-    catch (e) { apiError(res, e, 'Errore lettura config'); }
+    try {
+      if (storage.getAntiNukeConfig) res.json(storage.getAntiNukeConfig(req.params.guildId));
+      else res.json({});
+    } catch (e) { apiError(res, e, 'Errore lettura config'); }
   });
 
   app.post('/api/antinuke/:guildId', requireAuth, (req, res) => {
@@ -837,22 +856,27 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const data = parseOrFail(schemaAntinuke, req.body || {}, res);
     if (!data) return;
     try {
-      storage.setAntiNukeConfig(req.params.guildId, data);
+      if (storage.setAntiNukeConfig) storage.setAntiNukeConfig(req.params.guildId, data);
+      else throw new Error('setAntiNukeConfig non disponibile in storage');
       res.json({ ok: true });
     } catch (e) { apiError(res, e, 'Errore salvataggio'); }
   });
 
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
-    try {
-      const params = paramsFn ? paramsFn(req) : {};
-      res.send(renderLayout(req.session.user, page, params, {
-        csrfToken: (() => { try { return generateCsrfToken(req, res); } catch { return ''; } })()
-      }));
-    } catch (e) {
-      log.err(`page ${page}`, e);
-      res.status(500).send('Errore rendering');
-    }
+    req.session.save((saveErr) => {
+      if (saveErr) { log.err('session save', saveErr); return res.status(500).send('Errore sessione'); }
+      try {
+        const params = paramsFn ? paramsFn(req) : {};
+        let token = '';
+        try { token = generateCsrfToken(req, res); }
+        catch (e) { log.err(`csrf gen ${page}`, e); }
+        res.send(renderLayout(req.session.user, page, params, { csrfToken: token }));
+      } catch (e) {
+        log.err(`page ${page}`, e);
+        res.status(500).send('Errore rendering');
+      }
+    });
   };
 
   app.get('/dashboard', requireAuth, pageHandler('dashboard'));
@@ -935,10 +959,27 @@ function renderLayout(user, page, params = {}, security = {}) {
 <meta name="csrf-token" content="${escapeHtml(csrfToken)}">
 <title>Dashboard - ${escapeHtml(page)}</title>
 <script>
-  window.__CSRF__ = document.querySelector('meta[name="csrf-token"]').content;
-  window.apiFetch = async function(url, options = {}) {
+  window.__CSRF__ = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+
+  window.__refreshCsrf = async function () {
+    try {
+      const res = await fetch('/api/csrf-token', { credentials: 'same-origin' });
+      if (res.ok) {
+        const data = await res.json();
+        window.__CSRF__ = data.csrfToken || '';
+        const meta = document.querySelector('meta[name="csrf-token"]');
+        if (meta) meta.content = window.__CSRF__;
+      }
+    } catch (e) { console.error('csrf refresh', e); }
+  };
+
+  window.apiFetch = async function (url, options = {}) {
+    if (!window.__CSRF__) await window.__refreshCsrf();
+
     const opts = Object.assign({}, options);
+    opts.credentials = 'same-origin';
     opts.headers = Object.assign({}, opts.headers || {});
+
     const method = (opts.method || 'GET').toUpperCase();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
       opts.headers['X-CSRF-Token'] = window.__CSRF__;
@@ -946,8 +987,22 @@ function renderLayout(user, page, params = {}, security = {}) {
         opts.headers['Content-Type'] = 'application/json';
       }
     }
-    return fetch(url, opts);
+
+    let res = await fetch(url, opts);
+
+    if (res.status === 403) {
+      let body = null;
+      try { body = await res.clone().json(); } catch {}
+      if (body && /csrf/i.test(body.error || '')) {
+        await window.__refreshCsrf();
+        opts.headers['X-CSRF-Token'] = window.__CSRF__;
+        res = await fetch(url, opts);
+      }
+    }
+
+    return res;
   };
+
   async function logoutAll() {
     if (!confirm('Vuoi disconnetterti da TUTTE le sessioni?')) return;
     const res = await apiFetch('/api/logout-all', { method: 'POST' });
@@ -981,6 +1036,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   th { color: #888; font-size: 11px; text-transform: uppercase; }
   button { background: #5865F2; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
   button:hover { background: #4752c4; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
   button.danger { background: #ed4245; }
   button.danger:hover { background: #c93b3e; }
   button.small { padding: 5px 10px; font-size: 12px; }
@@ -1124,7 +1180,7 @@ function renderDashboardContent() {
     if (!ids.length) { alert('Nessun utente selezionato'); return; }
     if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist?')) return;
     const res = await apiFetch('/api/blacklist/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); loadStats(); }
     else alert('❌ ' + (data.error || 'Errore'));
   }
@@ -1135,18 +1191,19 @@ function renderDashboardContent() {
     const msg = document.getElementById('bl-msg');
     if (!userId || !username || !reason) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
     const res = await apiFetch('/api/blacklist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, username, reason }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (res.ok) {
       msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
       document.getElementById('bl-userId').value = '';
       document.getElementById('bl-username').value = '';
       document.getElementById('bl-reason').value = '';
       loadBlacklist(); loadStats();
-    } else { msg.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; }
+    } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
   }
   async function removeBL(userId) {
     if (!confirm('Rimuovere ' + userId + ' dalla blacklist?')) return;
-    await apiFetch('/api/blacklist/' + encodeURIComponent(userId), { method: 'DELETE' });
+    const res = await apiFetch('/api/blacklist/' + encodeURIComponent(userId), { method: 'DELETE' });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadBlacklist(); loadStats();
   }
   loadStats(); loadBlacklist();
@@ -1237,15 +1294,15 @@ function renderNotesContent() {
     if (!ids.length) { alert('Nessuna nota selezionata'); return; }
     if (!confirm('Eliminare ' + ids.length + ' note?')) return;
     const res = await apiFetch('/api/notes/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (res.ok) { alert('✅ Eliminate ' + data.count + ' note'); loadNotes(); }
-    else alert('❌ ' + (data.error || 'Errore'));
+    else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
   }
   async function deleteNote(id) {
     if (!confirm('Eliminare la nota #' + id + '?')) return;
     const res = await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
     if (res.ok) loadNotes();
-    else alert('Errore durante l\\'eliminazione');
+    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
   }
   loadNotes();
   </script>`;
@@ -1285,7 +1342,7 @@ function renderTicketsContent() {
     if (!confirm('Inviare il pannello ticket in questo canale?')) return;
     const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
     if (res.ok) alert('✅ Pannello inviato');
-    else { const d = await res.json(); alert('❌ ' + (d.error || 'Errore')); }
+    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
   }
 
   async function loadTickets() {
@@ -1324,7 +1381,7 @@ function renderTicketsContent() {
     if (!confirm('Chiudere ed eliminare questo ticket? Verrà salvato un transcript.')) return;
     const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
     if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(); loadTranscripts(); }
-    else { const data = await res.json(); alert('Errore: ' + (data.error || 'sconosciuto')); }
+    else { const data = await res.json().catch(() => ({})); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
 
   loadChannelsForPanel();
@@ -1374,9 +1431,9 @@ function renderCommandsContent() {
     if (!names.length) { alert('Nessun comando selezionato'); return; }
     if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
     const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (res.ok) { alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(); }
-    else alert('❌ ' + (data.error || 'Errore'));
+    else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
   }
   async function addCmd() {
     const name = document.getElementById('cmd-name').value.trim();
@@ -1384,16 +1441,18 @@ function renderCommandsContent() {
     const msg = document.getElementById('cmd-msg');
     if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
     const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
+    const data = await res.json().catch(() => ({}));
     if (res.ok) {
       msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
       document.getElementById('cmd-name').value = '';
       document.getElementById('cmd-response').value = '';
       loadCmds();
-    } else { msg.innerHTML = '<span class="error">❌ Errore</span>'; }
+    } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
   }
   async function removeCmd(name) {
     if (!confirm('Eliminare il comando -' + name + '?')) return;
-    await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
+    const res = await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadCmds();
   }
   loadCmds();
@@ -1500,7 +1559,7 @@ function renderConfigContent() {
     if (!confirm('Inviare un messaggio di test nel canale welcome?')) return;
     const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId) + '/test', { method: 'POST' });
     if (res.ok) alert('✅ Test inviato');
-    else { const d = await res.json(); alert('❌ ' + (d.error || 'Errore')); }
+    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
   }
   loadGuilds();
   </script>`;
@@ -1691,17 +1750,20 @@ function renderUserContent(userId) {
 
   async function removeBL() {
     if (!confirm('Rimuovere ' + USER_ID + ' dalla blacklist?')) return;
-    await apiFetch('/api/blacklist/' + encodeURIComponent(USER_ID), { method: 'DELETE' });
+    const res = await apiFetch('/api/blacklist/' + encodeURIComponent(USER_ID), { method: 'DELETE' });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadUser();
   }
   async function deleteNote(id) {
     if (!confirm('Eliminare la nota #' + id + '?')) return;
-    await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
+    const res = await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadUser();
   }
   async function closeTicket(channelId) {
     if (!confirm('Chiudere questo ticket? Il canale verrà cancellato.')) return;
-    await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
+    const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadUser();
   }
   loadUser();
@@ -1854,13 +1916,13 @@ function renderMessagesContent() {
     const btn = document.querySelector('button[onclick="sendMessage()"]');
     btn.disabled = true; btn.textContent = '⏳ Invio...';
     const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     btn.disabled = false; btn.textContent = '📤 Invia';
     if (res.ok) {
       result.innerHTML = '<span class="success">✅ Inviato! ID: ' + esc(data.messageId) + '</span>';
       document.getElementById('msg-content').value = '';
     } else {
-      result.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>';
+      result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
     }
   }
   loadChannels();
@@ -1904,7 +1966,7 @@ function renderUserActionsContent(userId = '') {
     if (!/^\\d{17,20}$/.test(userId)) { info.innerHTML = '<span class="error">❌ ID non valido</span>'; return; }
     info.innerHTML = '<p class="loading">Ricerca...</p>';
     const res = await apiFetch('/api/user-lookup/' + encodeURIComponent(userId));
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; actions.style.display='none'; return; }
     currentUser = data;
 
@@ -1931,10 +1993,10 @@ function renderUserActionsContent(userId = '') {
     if (!guildId) { result.innerHTML = '<span class="error">❌ Seleziona un server</span>'; return; }
     if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + currentUser.tag + '?')) return;
     const res = await apiFetch('/api/user-action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, userId: currentUser.id, guildId, reason }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     result.innerHTML = res.ok
       ? '<span class="success">✅ ' + esc(action.toUpperCase()) + ' eseguito</span>'
-      : '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>';
+      : '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
   }
 
   ${userId ? 'lookupUser();' : ''}
@@ -1992,13 +2054,13 @@ function renderRemindersContent() {
     const result = document.getElementById('rm-result');
     if (!guildId || !channelId || !content || !when) { result.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
     const res = await apiFetch('/api/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ guildId, channelId, content, when }) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (res.ok) {
       result.innerHTML = '<span class="success">✅ Reminder #' + esc(data.id) + ' creato</span>';
       document.getElementById('rm-content').value = '';
       document.getElementById('rm-when').value = '';
       loadReminders();
-    } else { result.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; }
+    } else { result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
   }
   async function loadReminders() {
     const res = await apiFetch('/api/reminders');
@@ -2075,7 +2137,7 @@ function renderAntinukeContent() {
     const guildId = document.getElementById('an-guild').value;
     if (!guildId) return;
     const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId));
-    const c = await res.json();
+    const c = await res.json().catch(() => ({}));
     document.getElementById('an-threshold-channel').value = c.threshold_channel ?? 3;
     document.getElementById('an-threshold-role').value = c.threshold_role ?? 3;
     document.getElementById('an-threshold-ban').value = c.threshold_ban ?? 3;
@@ -2096,11 +2158,16 @@ function renderAntinukeContent() {
       punishment: document.getElementById('an-punishment').value,
       whitelist_ids: document.getElementById('an-whitelist').value.trim()
     };
-    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    const data = await res.json();
     const el = document.getElementById('an-result');
-    if (res.ok) el.innerHTML = '<span class="success">✅ Salvato</span>';
-    else el.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>';
+    el.innerHTML = '<span class="loading">Salvataggio...</span>';
+    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      el.innerHTML = '<span class="success">✅ Salvato</span>';
+      loadConfig();
+    } else {
+      el.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
+    }
   }
   loadGuilds();
   </script>`;
