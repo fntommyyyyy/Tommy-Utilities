@@ -3,15 +3,31 @@ const fs = require('fs');
 const Database = require('better-sqlite3');
 
 class StorageService {
-  constructor(dbPath = './data/bot.db') {
-    const dir = path.dirname(dbPath);
+  // FIX #1: path assoluto relativo a __dirname (non al CWD)
+  // Accetta sia path assoluti che relativi (risolti rispetto a __dirname)
+  constructor(dbPath) {
+    let finalPath;
+    if (dbPath) {
+      finalPath = path.isAbsolute(dbPath)
+        ? dbPath
+        : path.join(__dirname, dbPath);
+    } else {
+      finalPath = path.join(__dirname, 'data', 'bot.db');
+    }
+
+    const dir = path.dirname(finalPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-    this.db = new Database(dbPath);
+    this.dbPath = finalPath;
+    this.db = new Database(finalPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('foreign_keys = ON');
     this._migrate();
     this._prepare();
+
+    // FIX #5: trim dei log all'avvio
+    try { this._trimLogs.run(); } catch {}
   }
 
   _migrate() {
@@ -265,6 +281,10 @@ class StorageService {
     this._disableWelcome = this.db.prepare(
       'UPDATE welcome_config SET channel_id = NULL, updated_at = ? WHERE guild_id = ?'
     );
+    // FIX #3: metodo esplicito per svuotare il messaggio (non era possibile prima)
+    this._clearWelcomeMessage = this.db.prepare(
+      'UPDATE welcome_config SET message = NULL, updated_at = ? WHERE guild_id = ?'
+    );
 
     // ===== REACTION ROLES =====
     this._rrInsert = this.db.prepare(`
@@ -306,8 +326,8 @@ class StorageService {
       INSERT INTO reminders (user_id, guild_id, channel_id, content, remind_at, created_at)
       VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
     `);
-    this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ?');
-    // FIX: aggiunto placeholder LIMIT ? (prima era hardcoded a 200)
+    // FIX #6: LIMIT sui reminder scaduti (evita raffiche enormi al primo giro dopo un down)
+    this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ? ORDER BY remind_at ASC LIMIT 100');
     this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT ?');
     this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
     this._remByUser = this.db.prepare('SELECT * FROM reminders WHERE user_id = ? AND guild_id = ? ORDER BY remind_at ASC');
@@ -472,6 +492,8 @@ class StorageService {
     });
   }
   disableWelcome(guildId) { return this._disableWelcome.run(new Date().toISOString(), guildId).changes > 0; }
+  // FIX #3: nuovo metodo per svuotare il messaggio (prima non era possibile)
+  clearWelcomeMessage(guildId) { return this._clearWelcomeMessage.run(new Date().toISOString(), guildId).changes > 0; }
   setWelcomeChannel(guildId, channelId) {
     const current = this.getWelcomeConfig(guildId);
     this.setWelcomeConfig(guildId, { channelId, message: current?.message ?? null, embedEnabled: current?.embed_enabled });
@@ -513,7 +535,6 @@ class StorageService {
     return res.lastInsertRowid;
   }
   getDueReminders(now = new Date()) { return this._remDue.all(now.toISOString()); }
-  // FIX: ora passa il parametro limit alla query che ha il placeholder
   getAllReminders(limit = 200) { return this._remAll.all(limit); }
   countReminders() { return this._remCount.get().c; }
   deleteReminder(id) { return this._remDelete.run(id).changes > 0; }
