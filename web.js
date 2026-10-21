@@ -84,14 +84,15 @@ function createWebServer({ storage, client, log, botStartTime }) {
     saveUninitialized: true,
     proxy: true,
     cookie: {
+      // IMPORTANTE: stesso dominio → secure ok anche in prod, sameSite lax sempre
       secure: IS_PROD,
       httpOnly: true,
-      sameSite: IS_PROD ? 'none' : 'lax',
+      sameSite: 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000
     }
   }));
 
-  // ==================== CSRF (configurazione corretta) ====================
+  // ==================== CSRF ====================
   const CSRF_SECRET = process.env.CSRF_SECRET || SESSION_SECRET;
 
   const {
@@ -103,10 +104,11 @@ function createWebServer({ storage, client, log, botStartTime }) {
       try { return (req.session && req.session.user && req.session.user.id) || req.sessionID || 'anon'; }
       catch { return 'anon'; }
     },
-    cookieName: IS_PROD ? '__Host-psifi.x-csrf-token' : 'x-csrf-token',
+    // Niente prefisso __Host-: Railway fa proxy e il browser può rifiutare il cookie
+    cookieName: 'x-csrf-token',
     cookieOptions: {
       httpOnly: true,
-      sameSite: IS_PROD ? 'none' : 'lax',
+      sameSite: 'lax',
       secure: IS_PROD,
       path: '/'
     },
@@ -119,6 +121,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.use(doubleCsrfProtection);
 
   app.get('/api/csrf-token', (req, res) => {
+    // Forza il salvataggio della sessione PRIMA di generare il token
     req.session.save((err) => {
       if (err) { log.err('csrf session save', err); return res.status(500).json({ error: 'Errore sessione' }); }
       try {
@@ -228,7 +231,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.4.0', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.4.1', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH ====================
@@ -864,13 +867,16 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
+    // Forza il salvataggio della sessione PRIMA di generare il token CSRF
     req.session.save((saveErr) => {
       if (saveErr) { log.err('session save', saveErr); return res.status(500).send('Errore sessione'); }
       try {
         const params = paramsFn ? paramsFn(req) : {};
         let token = '';
-        try { token = generateCsrfToken(req, res); }
-        catch (e) { log.err(`csrf gen ${page}`, e); }
+        try {
+          token = generateCsrfToken(req, res);
+          if (!token) log.warn(`csrf token vuoto per ${page} (sessione: ${req.sessionID})`);
+        } catch (e) { log.err(`csrf gen ${page}`, e); }
         res.send(renderLayout(req.session.user, page, params, { csrfToken: token }));
       } catch (e) {
         log.err(`page ${page}`, e);
@@ -960,6 +966,7 @@ function renderLayout(user, page, params = {}, security = {}) {
 <title>Dashboard - ${escapeHtml(page)}</title>
 <script>
   window.__CSRF__ = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+  console.log('[csrf] iniziale:', window.__CSRF__ ? 'OK (' + window.__CSRF__.length + ' char)' : 'VUOTO');
 
   window.__refreshCsrf = async function () {
     try {
@@ -969,8 +976,9 @@ function renderLayout(user, page, params = {}, security = {}) {
         window.__CSRF__ = data.csrfToken || '';
         const meta = document.querySelector('meta[name="csrf-token"]');
         if (meta) meta.content = window.__CSRF__;
+        console.log('[csrf] refresh:', window.__CSRF__ ? 'OK (' + window.__CSRF__.length + ' char)' : 'VUOTO');
       }
-    } catch (e) { console.error('csrf refresh', e); }
+    } catch (e) { console.error('[csrf] refresh error', e); }
   };
 
   window.apiFetch = async function (url, options = {}) {
@@ -988,15 +996,20 @@ function renderLayout(user, page, params = {}, security = {}) {
       }
     }
 
+    console.log('[apiFetch]', method, url, '| CSRF:', opts.headers['X-CSRF-Token'] ? 'sì' : 'NO');
+
     let res = await fetch(url, opts);
+    console.log('[apiFetch]', method, url, '→', res.status);
 
     if (res.status === 403) {
       let body = null;
       try { body = await res.clone().json(); } catch {}
       if (body && /csrf/i.test(body.error || '')) {
+        console.warn('[apiFetch] CSRF 403, rigenero token e riprovo');
         await window.__refreshCsrf();
         opts.headers['X-CSRF-Token'] = window.__CSRF__;
         res = await fetch(url, opts);
+        console.log('[apiFetch] retry →', res.status);
       }
     }
 
