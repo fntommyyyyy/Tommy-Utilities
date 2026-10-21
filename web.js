@@ -17,7 +17,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const HOST = process.env.WEB_HOST || '0.0.0.0';
   const IS_PROD = process.env.NODE_ENV === 'production';
 
-  app.set('trust proxy', 1);
+  // FIX #1: trust proxy numerico (express-rate-limit su Railway)
+  app.set('trust proxy', parseInt(process.env.TRUST_PROXY, 10) || 1);
   app.disable('x-powered-by');
 
   const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
@@ -50,15 +51,18 @@ function createWebServer({ storage, client, log, botStartTime }) {
   }
 
   // ==================== HELMET ====================
+  // FIX #2: aggiunto script-src-attr 'unsafe-inline' per onclick
+  // FIX #3: aggiunto cdn.jsdelivr.net a connect-src per source map Chart.js
   app.use(helmet({
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
         'default-src': ["'self'"],
         'script-src': ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+        'script-src-attr': ["'unsafe-inline'"],
         'style-src': ["'self'", "'unsafe-inline'"],
         'img-src': ["'self'", "data:", "https://cdn.discordapp.com"],
-        'connect-src': ["'self'"],
+        'connect-src': ["'self'", "https://cdn.jsdelivr.net"],
         'frame-ancestors': ["'none'"],
         'object-src': ["'none'"],
         'base-uri': ["'self'"],
@@ -84,7 +88,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     saveUninitialized: true,
     proxy: true,
     cookie: {
-      // IMPORTANTE: stesso dominio → secure ok anche in prod, sameSite lax sempre
       secure: IS_PROD,
       httpOnly: true,
       sameSite: 'lax',
@@ -104,7 +107,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
       try { return (req.session && req.session.user && req.session.user.id) || req.sessionID || 'anon'; }
       catch { return 'anon'; }
     },
-    // Niente prefisso __Host-: Railway fa proxy e il browser può rifiutare il cookie
     cookieName: 'x-csrf-token',
     cookieOptions: {
       httpOnly: true,
@@ -120,16 +122,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   app.use(doubleCsrfProtection);
 
+  // FIX #4: /api/csrf-token registrato PRIMA del rate limiter
   app.get('/api/csrf-token', (req, res) => {
-    // Forza il salvataggio della sessione PRIMA di generare il token
     req.session.save((err) => {
       if (err) { log.err('csrf session save', err); return res.status(500).json({ error: 'Errore sessione' }); }
       try {
         const token = generateCsrfToken(req, res);
+        if (!token) return res.status(500).json({ error: 'Token CSRF vuoto' });
         res.json({ csrfToken: token });
       } catch (e) {
         log.err('csrf-token', e);
-        res.status(500).json({ error: 'Errore CSRF' });
+        res.status(500).json({ error: 'Errore CSRF', detail: e.message });
       }
     });
   });
@@ -231,7 +234,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.4.1', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.4.2', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH ====================
@@ -867,7 +870,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
-    // Forza il salvataggio della sessione PRIMA di generare il token CSRF
     req.session.save((saveErr) => {
       if (saveErr) { log.err('session save', saveErr); return res.status(500).send('Errore sessione'); }
       try {
@@ -977,6 +979,8 @@ function renderLayout(user, page, params = {}, security = {}) {
         const meta = document.querySelector('meta[name="csrf-token"]');
         if (meta) meta.content = window.__CSRF__;
         console.log('[csrf] refresh:', window.__CSRF__ ? 'OK (' + window.__CSRF__.length + ' char)' : 'VUOTO');
+      } else {
+        console.error('[csrf] refresh HTTP', res.status);
       }
     } catch (e) { console.error('[csrf] refresh error', e); }
   };
