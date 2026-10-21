@@ -17,7 +17,13 @@ const {
 const welcomeFeature = {
   name: 'welcome',
 
+  // FIX: aggiunto controllo null su client per evitare crash se chiamato prima della creazione
   setup({ client, storage, log }) {
+    if (!client || typeof client.on !== 'function') {
+      log.warn('welcome: client non ancora disponibile, setup saltato');
+      return;
+    }
+
     client.on('guildMemberAdd', async member => {
       try {
         // FIX: gli utenti in blacklist vengono kickati da index.js, niente messaggio di benvenuto.
