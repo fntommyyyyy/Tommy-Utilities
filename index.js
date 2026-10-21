@@ -764,6 +764,7 @@ function isServerAuthorized(guildId) {
   return BLACKLIST_ADMIN_SERVERS.includes(guildId);
 }
 
+// FIX #3: return SEMPRE fuori dal try/catch → nessun autorole a utenti blacklisted
 async function handleGuildMemberAdd(member) {
   if (storage.isBlacklisted(member.user.id)) {
     const entry = storage.getBlacklistEntry(member.user.id);
@@ -780,10 +781,10 @@ async function handleGuildMemberAdd(member) {
         reason: entry.reason,
         moderator: 'Sistema Automatico'
       });
-      return;
     } catch (err) {
       log.err('handleGuildMemberAdd blacklist', err);
     }
+    return; // ← FIX: sempre, anche se il kick fallisce
   }
 
   try {
@@ -1715,6 +1716,7 @@ try {
 } catch (err) {
   log.warn('⚠️ features.js non trovato o non valido. Il bot parte senza feature extra.');
 }
+
 // ==================== CLIENT ====================
 const client = new Client({
   intents: [
@@ -2805,6 +2807,33 @@ client.on(Events.GuildMemberAdd, handleGuildMemberAdd);
 
 process.on('unhandledRejection', (err) => log.err('unhandledRejection', err));
 process.on('uncaughtException', (err) => log.err('uncaughtException', err));
+
+// ==================== REGISTRAZIONE SLASH COMMANDS ====================
+async function registerSlashCommands(clientId, token) {
+  const rest = new REST({ version: '10' }).setToken(token);
+  try {
+    log.info('🔄 Registrazione slash commands...');
+    const commandsData = slashCommands.map(c => c.toJSON());
+
+    if (GUILD_ID) {
+      await rest.put(
+        Routes.applicationGuildCommands(clientId, GUILD_ID),
+        { body: commandsData }
+      );
+      log.ok(`✅ ${commandsData.length} slash commands registrati nella guild ${GUILD_ID} (istantaneo)`);
+    } else {
+      await rest.put(
+        Routes.applicationCommands(clientId),
+        { body: commandsData }
+      );
+      log.ok(`✅ ${commandsData.length} slash commands registrati globalmente (fino a 1h di propagazione)`);
+    }
+  } catch (err) {
+    log.err('registerSlashCommands', err);
+    if (err.rawError) log.err('Dettaglio API Discord:', JSON.stringify(err.rawError, null, 2));
+    throw err;
+  }
+}
 
 // ==================== STARTUP ====================
 let webServer = null;
