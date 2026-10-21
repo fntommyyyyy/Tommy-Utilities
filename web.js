@@ -2,6 +2,7 @@
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
+const cookieParser = require('cookie-parser'); // FIX: necessario per csrf-csrf
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
@@ -17,7 +18,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const HOST = process.env.WEB_HOST || '0.0.0.0';
   const IS_PROD = process.env.NODE_ENV === 'production';
 
-  // FIX #1: trust proxy numerico (express-rate-limit su Railway)
+  // FIX: trust proxy numerico (express-rate-limit su Railway)
   app.set('trust proxy', parseInt(process.env.TRUST_PROXY, 10) || 1);
   app.disable('x-powered-by');
 
@@ -51,8 +52,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
   }
 
   // ==================== HELMET ====================
-  // FIX #2: aggiunto script-src-attr 'unsafe-inline' per onclick
-  // FIX #3: aggiunto cdn.jsdelivr.net a connect-src per source map Chart.js
   app.use(helmet({
     contentSecurityPolicy: {
       useDefaults: true,
@@ -76,6 +75,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
+
+  // ==================== COOKIE PARSER (prima della sessione) ====================
+  app.use(cookieParser());
 
   // ==================== SESSION ====================
   const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
@@ -104,8 +106,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
   } = doubleCsrf({
     getSecret: () => CSRF_SECRET,
     getSessionIdentifier: (req) => {
-      try { return (req.session && req.session.user && req.session.user.id) || req.sessionID || 'anon'; }
-      catch { return 'anon'; }
+      if (!req.sessionID) {
+        throw new Error('Sessione non inizializzata: req.sessionID mancante');
+      }
+      return req.sessionID;
     },
     cookieName: 'x-csrf-token',
     cookieOptions: {
@@ -114,7 +118,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
       secure: IS_PROD,
       path: '/'
     },
-    size: 64,
+    size: 32,
     ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
     getCsrfTokenFromRequest: (req) =>
       (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
@@ -122,8 +126,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   app.use(doubleCsrfProtection);
 
-  // FIX #4: /api/csrf-token registrato PRIMA del rate limiter
   app.get('/api/csrf-token', (req, res) => {
+    if (!req.sessionID) {
+      return res.status(500).json({ error: 'Sessione non inizializzata (sessionID mancante)' });
+    }
     req.session.save((err) => {
       if (err) { log.err('csrf session save', err); return res.status(500).json({ error: 'Errore sessione' }); }
       try {
@@ -132,7 +138,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
         res.json({ csrfToken: token });
       } catch (e) {
         log.err('csrf-token', e);
-        res.status(500).json({ error: 'Errore CSRF', detail: e.message });
+        res.status(500).json({ error: 'Errore CSRF', detail: e.message, stack: e.stack });
       }
     });
   });
@@ -234,7 +240,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.4.2', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.4.3', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH ====================
@@ -317,7 +323,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
 
-  // ===== BLACKLIST =====
   app.get('/api/blacklist', requireAuth, (req, res) => {
     try { res.json(storage.getAllBlacklist()); } catch (e) { apiError(res, e); }
   });
@@ -346,7 +351,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== LOGS =====
   app.get('/api/logs/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
   });
@@ -355,7 +359,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getLogsForUser(req.params.userId)); } catch (e) { apiError(res, e); }
   });
 
-  // ===== NOTES =====
   app.get('/api/notes/all', requireAuth, (req, res) => {
     try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
   });
@@ -374,7 +377,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== CONFIG =====
   app.get('/api/config/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
     try { res.json(storage.getGuildConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
@@ -397,7 +399,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== WELCOME =====
   app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
     try { res.json(storage.getWelcomeConfig(req.params.guildId) || {}); } catch (e) { apiError(res, e); }
@@ -457,7 +458,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore test welcome'); }
   });
 
-  // ===== TICKETS =====
   app.get('/api/tickets', requireAuth, (req, res) => {
     try {
       const tickets = [];
@@ -559,7 +559,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== COMMANDS =====
   app.get('/api/commands', requireAuth, (req, res) => {
     try {
       const cmds = storage.loadCommands();
@@ -588,7 +587,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== CHARTS / TOP =====
   app.get('/api/charts', requireAuth, (req, res) => {
     try {
       const byType = storage.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type').all();
@@ -618,7 +616,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== USER =====
   app.get('/api/user/:userId', requireAuth, (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
@@ -640,7 +637,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore caricamento utente'); }
   });
 
-  // ===== SEARCH =====
   app.get('/api/search', requireAuth, (req, res) => {
     const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
@@ -660,7 +656,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore ricerca'); }
   });
 
-  // ===== CSV EXPORT =====
   function sanitizeCsvCell(v) {
     const s = (v === null || v === undefined) ? '' : String(v);
     if (/^[=+\-@\t\r]/.test(s)) return "'" + s;
@@ -712,7 +707,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
 
-  // ===== MESSAGES =====
   app.get('/api/messages/channels', requireAuth, (req, res) => {
     try {
       const out = [];
@@ -757,7 +751,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore invio messaggio'); }
   });
 
-  // ===== USER ACTIONS =====
   app.get('/api/user-lookup/:userId', requireAuth, async (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
@@ -825,7 +818,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore azione utente'); }
   });
 
-  // ===== REMINDERS =====
   app.get('/api/reminders', requireAuth, (req, res) => {
     try {
       if (storage.getAllReminders) res.json(storage.getAllReminders(200));
@@ -848,7 +840,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  // ===== ANTINUKE =====
   app.get('/api/antinuke/:guildId', requireAuth, (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
     try {
@@ -870,6 +861,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
+    if (!req.sessionID) {
+      return res.status(500).send('Errore: sessione non inizializzata');
+    }
     req.session.save((saveErr) => {
       if (saveErr) { log.err('session save', saveErr); return res.status(500).send('Errore sessione'); }
       try {
@@ -919,7 +913,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const server = app.listen(PORT, HOST, () => {
     log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
     log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
-    log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓ cache-auth ✓`);
+    log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓ cache-auth ✓ cookie-parser ✓`);
   });
 
   server.on('error', (err) => {
@@ -980,7 +974,8 @@ function renderLayout(user, page, params = {}, security = {}) {
         if (meta) meta.content = window.__CSRF__;
         console.log('[csrf] refresh:', window.__CSRF__ ? 'OK (' + window.__CSRF__.length + ' char)' : 'VUOTO');
       } else {
-        console.error('[csrf] refresh HTTP', res.status);
+        const err = await res.json().catch(() => ({}));
+        console.error('[csrf] refresh HTTP', res.status, err);
       }
     } catch (e) { console.error('[csrf] refresh error', e); }
   };
