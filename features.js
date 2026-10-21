@@ -1,12 +1,4 @@
 // ==================== FEATURES ====================
-// Ogni feature è un oggetto con:
-//   - name: nome della feature
-//   - setup(ctx): inizializzazione (opzionale) — registra eventi, timer, ecc.
-//   - slashCommands: array di SlashCommandBuilder (opzionale)
-//   - handleSlash(interaction, ctx): handler slash (opzionale)
-//   - handleButton(interaction, ctx): handler bottoni (opzionale)
-// NB: index.js al momento NON chiama handlePrefix, quindi non è supportato.
-
 const {
   SlashCommandBuilder,
   ChannelType,
@@ -17,16 +9,16 @@ const {
 const welcomeFeature = {
   name: 'welcome',
 
-  // FIX: aggiunto controllo null su client per evitare crash se chiamato prima della creazione
   setup({ client, storage, log }) {
     if (!client || typeof client.on !== 'function') {
       log.warn('welcome: client non ancora disponibile, setup saltato');
       return;
     }
+    if (this._listenerRegistered) return;   // fix doppio listener
+    this._listenerRegistered = true;
 
     client.on('guildMemberAdd', async member => {
       try {
-        // FIX: gli utenti in blacklist vengono kickati da index.js, niente messaggio di benvenuto.
         if (storage.isBlacklisted(member.user.id)) return;
 
         const config = storage.getWelcomeConfig(member.guild.id);
@@ -100,12 +92,17 @@ const welcomeFeature = {
       });
     }
 
+    if (!['channel', 'message', 'toggle', 'test', 'disable'].includes(sub)) {
+      return safeReply(interaction, {
+        embeds: [new EmbedBuilder().setTitle('❌ Subcommand sconosciuto').setDescription(`\`${sub}\` non è gestito.`).setColor(0xFF0000)],
+        ephemeral: true
+      });
+    }
+
     const gid = interaction.guild.id;
 
-    // /welcome channel
     if (sub === 'channel') {
       const channel = interaction.options.getChannel('canale');
-      // Non tocchiamo message né embedEnabled: passiamo null/undefined per lasciare i valori esistenti.
       storage.setWelcomeConfig(gid, { channelId: channel.id, message: null, embedEnabled: undefined });
       return safeReply(interaction, {
         embeds: [new EmbedBuilder().setTitle('✅ Canale Impostato').setDescription(`Benvenuto in ${channel}`).setColor(0x00FF00)],
@@ -113,10 +110,8 @@ const welcomeFeature = {
       });
     }
 
-    // /welcome message
     if (sub === 'message') {
       const testo = interaction.options.getString('testo');
-      // Non tocchiamo channel né embedEnabled: passiamo null/undefined per lasciare i valori esistenti.
       storage.setWelcomeConfig(gid, { channelId: null, message: testo, embedEnabled: undefined });
 
       const preview = testo
@@ -134,11 +129,9 @@ const welcomeFeature = {
       });
     }
 
-    // /welcome toggle
     if (sub === 'toggle') {
       const current = storage.getWelcomeConfig(gid);
       const newVal = !(current?.embed_enabled);
-      // Cambiamo solo embedEnabled, lasciamo canale e messaggio invariati.
       storage.setWelcomeConfig(gid, { channelId: null, message: null, embedEnabled: newVal });
       return safeReply(interaction, {
         embeds: [new EmbedBuilder()
@@ -149,7 +142,6 @@ const welcomeFeature = {
       });
     }
 
-    // /welcome test
     if (sub === 'test') {
       const config = storage.getWelcomeConfig(gid);
       if (!config || !config.channel_id) {
@@ -178,9 +170,7 @@ const welcomeFeature = {
       }
     }
 
-    // /welcome disable
     if (sub === 'disable') {
-      // FIX: azzera il canale (il listener esce se channel_id è NULL). Messaggio e formato restano salvati.
       storage.disableWelcome(gid);
       return safeReply(interaction, {
         embeds: [new EmbedBuilder().setTitle('✅ Benvenuto Disattivato').setDescription('Il sistema di benvenuto è ora disattivato. Riattivalo con `/welcome channel`.').setColor(0xFFA500)],
