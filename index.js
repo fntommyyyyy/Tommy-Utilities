@@ -1715,43 +1715,6 @@ try {
 } catch (err) {
   log.warn('⚠️ features.js non trovato o non valido. Il bot parte senza feature extra.');
 }
-
-// ==================== REGISTRAZIONE COMANDI ====================
-async function registerSlashCommands(clientId, token) {
-  const rest = new REST({ version: '10', timeout: 30000 }).setToken(token);
-  rest.on('rateLimited', (info) =>
-    log.warn(`Rate limit Discord: ${info.method} ${info.route}, riprovo tra ${Math.ceil(info.timeToReset / 1000)}s`));
-
-  log.info(`Preparazione registrazione ${slashCommands.length} comandi...`);
-
-  const validCommands = [];
-  for (const cmd of slashCommands) {
-    try { validCommands.push(cmd.toJSON()); }
-    catch (err) { log.err(`❌ Comando "/${cmd.name}" non valido: ${err.message}`); }
-  }
-
-  try {
-    if (GUILD_ID) {
-      await rest.put(Routes.applicationCommands(clientId), { body: [] }).catch(err =>
-        log.warn(`Cancellazione globali fallita: ${err.message}`));
-      log.info(`Registrazione ISTANTANEA sul server ${GUILD_ID}...`);
-      await rest.put(Routes.applicationGuildCommands(clientId, GUILD_ID), { body: validCommands });
-      log.ok(`✅ ${validCommands.length} comandi registrati ISTANTANEAMENTE su guild ${GUILD_ID}`);
-    } else {
-      log.info('Registrazione globale (può richiedere fino a 1 ora)...');
-      await rest.put(Routes.applicationCommands(clientId), { body: validCommands });
-      log.ok(`✅ ${validCommands.length} comandi registrati globalmente`);
-    }
-  } catch (err) {
-    log.err('Registrazione fallita', err);
-    if (err.rawError) {
-      console.error('\n=== DETTAGLI ERRORE DISCORD ===');
-      console.error(JSON.stringify(err.rawError, null, 2));
-      console.error('=== FINE DETTAGLI ===\n');
-    }
-  }
-}
-
 // ==================== CLIENT ====================
 const client = new Client({
   intents: [
