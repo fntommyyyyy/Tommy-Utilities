@@ -307,7 +307,8 @@ class StorageService {
       VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
     `);
     this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ?');
-    this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200');
+    // FIX: aggiunto placeholder LIMIT ? (prima era hardcoded a 200)
+    this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT ?');
     this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
     this._remByUser = this.db.prepare('SELECT * FROM reminders WHERE user_id = ? AND guild_id = ? ORDER BY remind_at ASC');
     this._remCount = this.db.prepare('SELECT COUNT(*) as c FROM reminders');
@@ -512,6 +513,7 @@ class StorageService {
     return res.lastInsertRowid;
   }
   getDueReminders(now = new Date()) { return this._remDue.all(now.toISOString()); }
+  // FIX: ora passa il parametro limit alla query che ha il placeholder
   getAllReminders(limit = 200) { return this._remAll.all(limit); }
   countReminders() { return this._remCount.get().c; }
   deleteReminder(id) { return this._remDelete.run(id).changes > 0; }
