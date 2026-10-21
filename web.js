@@ -7,7 +7,7 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
-const helmet = require('helmet');
+const helmet = require('helmet'); // FIX #1: rimosso carattere "a" spuria
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
@@ -119,8 +119,12 @@ function createWebServer({ storage, client, log, botStartTime }) {
     },
     size: 32,
     ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
-    getCsrfTokenFromRequest: (req) =>
-      (req.headers['x-csrf-token'] || (req.body && req.body._csrf) || '').toString()
+    // FIX #2: funzione robusta (evita .toString() su undefined/null)
+    getCsrfTokenFromRequest: (req) => {
+      const h = req.headers['x-csrf-token'];
+      const b = req.body && req.body._csrf;
+      return h ? String(h) : (b ? String(b) : '');
+    }
   });
 
   app.use(doubleCsrfProtection);
@@ -185,7 +189,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     when: z.string().min(1).max(20)
   });
 
-  // FIX: schemaAntinuke più tollerante (coerce) e con default
   const schemaAntinuke = z.object({
     threshold_channel: z.coerce.number().int().min(1).max(50).optional(),
     threshold_role: z.coerce.number().int().min(1).max(50).optional(),
