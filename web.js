@@ -2,7 +2,7 @@
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
-const cookieParser = require('cookie-parser'); // FIX: necessario per csrf-csrf
+const cookieParser = require('cookie-parser');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
@@ -18,7 +18,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const HOST = process.env.WEB_HOST || '0.0.0.0';
   const IS_PROD = process.env.NODE_ENV === 'production';
 
-  // FIX: trust proxy numerico (express-rate-limit su Railway)
   app.set('trust proxy', parseInt(process.env.TRUST_PROXY, 10) || 1);
   app.disable('x-powered-by');
 
@@ -76,7 +75,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: true, limit: '100kb' }));
 
-  // ==================== COOKIE PARSER (prima della sessione) ====================
+  // ==================== COOKIE PARSER ====================
   app.use(cookieParser());
 
   // ==================== SESSION ====================
@@ -185,12 +184,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
     content: z.string().min(1).max(500),
     when: z.string().min(1).max(20)
   });
+
+  // FIX: schemaAntinuke più tollerante (coerce) e con default
   const schemaAntinuke = z.object({
-    threshold_channel: z.number().int().min(1).max(50).optional(),
-    threshold_role: z.number().int().min(1).max(50).optional(),
-    threshold_ban: z.number().int().min(1).max(50).optional(),
-    threshold_role_update: z.number().int().min(1).max(50).optional(),
-    window_ms: z.number().int().min(1000).max(600000).optional(),
+    threshold_channel: z.coerce.number().int().min(1).max(50).optional(),
+    threshold_role: z.coerce.number().int().min(1).max(50).optional(),
+    threshold_ban: z.coerce.number().int().min(1).max(50).optional(),
+    threshold_role_update: z.coerce.number().int().min(1).max(50).optional(),
+    window_ms: z.coerce.number().int().min(1000).max(600000).optional(),
     punishment: z.enum(['quarantine', 'ban', 'kick']).optional(),
     whitelist_ids: z.string().max(2000).optional()
   });
@@ -199,7 +200,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const r = schema.safeParse(data);
     if (!r.success) {
       const issues = r.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
-      res.status(400).json({ error: `Dati non validi — ${issues}` });
+      log.warn(`Validazione fallita: ${issues} — body: ${JSON.stringify(data)}`);
+      res.status(400).json({ error: `Dati non validi — ${issues}`, issues: r.error.issues });
       return null;
     }
     return r.data;
@@ -212,7 +214,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   function apiError(res, e, msg = 'Errore interno') {
     try { log.err('api-error', e); } catch {}
-    res.status(500).json({ error: msg });
+    res.status(500).json({ error: msg, detail: e?.message });
   }
 
   async function requireAuth(req, res, next) {
@@ -240,7 +242,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
   app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.4.3', loggedIn: !!req.session.user });
+    res.json({ message: 'Bot Dashboard', version: '5.4.4', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH ====================
@@ -2161,15 +2163,24 @@ function renderAntinukeContent() {
   async function saveAntinuke() {
     const guildId = document.getElementById('an-guild').value;
     if (!guildId) return;
-    const payload = {
-      threshold_channel: parseInt(document.getElementById('an-threshold-channel').value, 10) || 3,
-      threshold_role: parseInt(document.getElementById('an-threshold-role').value, 10) || 3,
-      threshold_ban: parseInt(document.getElementById('an-threshold-ban').value, 10) || 3,
-      threshold_role_update: parseInt(document.getElementById('an-threshold-role-update').value, 10) || 3,
-      window_ms: parseInt(document.getElementById('an-window').value, 10) || 10000,
-      punishment: document.getElementById('an-punishment').value,
-      whitelist_ids: document.getElementById('an-whitelist').value.trim()
+    // FIX: invia solo i campi valorizzati, con parseInt sicuro
+    const parseNum = (id) => {
+      const v = document.getElementById(id).value.trim();
+      if (!v) return undefined;
+      const n = parseInt(v, 10);
+      return isNaN(n) ? undefined : n;
     };
+    const payload = {
+      threshold_channel: parseNum('an-threshold-channel'),
+      threshold_role: parseNum('an-threshold-role'),
+      threshold_ban: parseNum('an-threshold-ban'),
+      threshold_role_update: parseNum('an-threshold-role-update'),
+      window_ms: parseNum('an-window'),
+      punishment: document.getElementById('an-punishment').value || undefined,
+      whitelist_ids: document.getElementById('an-whitelist').value.trim() || undefined
+    };
+    // Rimuovi i campi undefined
+    Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
     const el = document.getElementById('an-result');
     el.innerHTML = '<span class="loading">Salvataggio...</span>';
     const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
