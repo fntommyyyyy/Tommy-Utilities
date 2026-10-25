@@ -319,7 +319,7 @@ async function quarantineUser(guild, member, reason) {
   }
 }
 
-async function checkAntiNuke(guild, auditAction, actionType, threshold) {
+async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId = null) {
   if (!guild) return;
   let executorId = null;
   try {
@@ -329,6 +329,11 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold) {
     if (entry.executor.id === clientRef.user.id) return;
     if (Date.now() - entry.createdTimestamp > 15000) return;
     executorId = entry.executor.id;
+    
+    // Se il target non è passato, proviamo a prenderlo dall'audit log
+    if (!targetId && entry.target) {
+      targetId = entry.target.id;
+    }
   } catch (e) { return; }
 
   if (!executorId) return;
@@ -342,36 +347,55 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold) {
   const count = trackAction(guild.id, executorId, actionType, windowMs);
 
   if (count >= (threshold || 3)) {
-    const member = await guild.members.fetch(executorId).catch(() => null);
-    if (!member) return;
-
+    const executor = await guild.members.fetch(executorId).catch(() => null);
+    const targetMember = targetId ? await guild.members.fetch(targetId).catch(() => null) : null;
+    
     const botMember = guild.members.me;
-    if (member.roles.highest.position >= botMember.roles.highest.position) {
-      log.warn(`Anti-Nuke: impossibile punire ${executorId} (ruolo troppo alto)`);
-      return;
-    }
-
     const punishReason = `[ANTI-NUKE] Superata soglia ${actionType} (${count} in ${windowMs}ms)`;
 
-    if (config.punishment === 'quarantine') {
-      const success = await quarantineUser(guild, member, punishReason);
-      if (!success) await member.ban({ reason: punishReason }).catch(() => {});
-    } else if (config.punishment === 'ban') {
-      await member.ban({ reason: punishReason }).catch(() => {});
-    } else if (config.punishment === 'kick') {
-      await member.kick(punishReason).catch(() => {});
+    const punishMember = async (member, reason) => {
+      if (!member) return;
+      if (member.roles.highest.position >= botMember.roles.highest.position) {
+        log.warn(`Anti-Nuke: impossibile punire ${member.id} (ruolo troppo alto)`);
+        return;
+      }
+      if (config.punishment === 'quarantine') {
+        const success = await quarantineUser(guild, member, reason);
+        if (!success) await member.ban({ reason }).catch(() => {});
+      } else if (config.punishment === 'ban') {
+        await member.ban({ reason }).catch(() => {});
+      } else if (config.punishment === 'kick') {
+        await member.kick(reason).catch(() => {});
+      }
+    };
+
+    // 1. Puniamo l'esecutore
+    if (executor) {
+      await punishMember(executor, punishReason);
+      await ModLogModule.logUserAction(guild, {
+        type: 'Anti-Nuke (Esecutore)',
+        title: '🛡️ Anti-Nuke: Esecutore Punito',
+        targetId: executorId,
+        target: `${executor.user.tag} (${executorId})`,
+        moderator: 'Sistema Anti-Nuke',
+        reason: `Ha eseguito ${count} azioni di tipo "${actionType}" in ${windowMs}ms.`
+      }).catch(() => {});
+    }
+
+    // 2. Puniamo il bersaglio (se presente e diverso dall'esecutore)
+    if (targetMember && targetMember.id !== executorId) {
+      await punishMember(targetMember, `${punishReason} (Bersaglio dell'azione)`);
+      await ModLogModule.logUserAction(guild, {
+        type: 'Anti-Nuke (Bersaglio)',
+        title: '🛡️ Anti-Nuke: Bersaglio Punito',
+        targetId: targetMember.id,
+        target: `${targetMember.user.tag} (${targetMember.id})`,
+        moderator: 'Sistema Anti-Nuke',
+        reason: `Ha ricevuto un'azione di tipo "${actionType}" da ${executor ? executor.user.tag : executorId} in un contesto sospetto.`
+      }).catch(() => {});
     }
 
     antinukeTracker.delete(`${guild.id}-${executorId}-${actionType}`);
-
-    await ModLogModule.logUserAction(guild, {
-      type: 'Anti-Nuke',
-      title: '🛡️ Anti-Nuke Attivato',
-      targetId: executorId,
-      target: `${member.user.tag} (${executorId})`,
-      moderator: 'Sistema Anti-Nuke',
-      reason: `Ha eseguito ${count} azioni di tipo "${actionType}" in ${windowMs}ms (soglia: ${threshold}). Punizione: ${config.punishment}`
-    }).catch(() => {});
   }
 }
 
@@ -764,7 +788,6 @@ function isServerAuthorized(guildId) {
   return BLACKLIST_ADMIN_SERVERS.includes(guildId);
 }
 
-// FIX #3: return SEMPRE fuori dal try/catch → nessun autorole a utenti blacklisted
 async function handleGuildMemberAdd(member) {
   if (storage.isBlacklisted(member.user.id)) {
     const entry = storage.getBlacklistEntry(member.user.id);
@@ -784,7 +807,7 @@ async function handleGuildMemberAdd(member) {
     } catch (err) {
       log.err('handleGuildMemberAdd blacklist', err);
     }
-    return; // ← FIX: sempre, anche se il kick fallisce
+    return;
   }
 
   try {
@@ -1602,7 +1625,7 @@ const CommandLogic = {
   }
 };
 
-// ==================== SLASH COMMANDS (PRIMA delle features) ====================
+// ==================== SLASH COMMANDS ====================
 const slashCommands = [
   new SlashCommandBuilder().setName('help').setDescription('Mostra la lista dei comandi'),
   new SlashCommandBuilder().setName('stats').setDescription('Mostra le statistiche del bot'),
@@ -1695,7 +1718,7 @@ const slashCommands = [
       .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true)))
 ];
 
-// ==================== FEATURES (dopo slashCommands!) ====================
+// ==================== FEATURES ====================
 let features = [];
 try {
   features = require('./features');
@@ -1731,7 +1754,6 @@ const client = new Client({
 });
 clientRef = client;
 
-// Setta client nelle features dopo la creazione
 for (const f of features) {
   if (f.setup && !f._ctxClient) {
     try {
@@ -1746,7 +1768,8 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   if (!newMember.guild) return;
   if (oldMember.roles.cache.size === newMember.roles.cache.size) return;
   const cfg = storage.getAntiNukeConfig(newMember.guild.id);
-  await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', cfg.threshold_role_update);
+  // Passiamo newMember.id come targetId per punire anche il bersaglio
+  await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', cfg.threshold_role_update, newMember.id);
 });
 client.on(Events.ChannelCreate, async (channel) => {
   if (!channel.guild) return;
