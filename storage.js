@@ -4,7 +4,6 @@ const Database = require('better-sqlite3');
 
 class StorageService {
   // FIX #1: path assoluto relativo a __dirname (non al CWD)
-  // Accetta sia path assoluti che relativi (risolti rispetto a __dirname)
   constructor(dbPath) {
     let finalPath;
     if (dbPath) {
@@ -200,6 +199,13 @@ class StorageService {
         whitelist_ids TEXT DEFAULT '',
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS quarantine_roles (
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        PRIMARY KEY (user_id, guild_id, role_id)
+      );
     `);
   }
 
@@ -281,7 +287,6 @@ class StorageService {
     this._disableWelcome = this.db.prepare(
       'UPDATE welcome_config SET channel_id = NULL, updated_at = ? WHERE guild_id = ?'
     );
-    // FIX #3: metodo esplicito per svuotare il messaggio (non era possibile prima)
     this._clearWelcomeMessage = this.db.prepare(
       'UPDATE welcome_config SET message = NULL, updated_at = ? WHERE guild_id = ?'
     );
@@ -326,7 +331,6 @@ class StorageService {
       INSERT INTO reminders (user_id, guild_id, channel_id, content, remind_at, created_at)
       VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
     `);
-    // FIX #6: LIMIT sui reminder scaduti (evita raffiche enormi al primo giro dopo un down)
     this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ? ORDER BY remind_at ASC LIMIT 100');
     this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT ?');
     this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
@@ -410,6 +414,11 @@ class StorageService {
         updated_at = excluded.updated_at
     `);
 
+    // ===== QUARANTINE ROLES =====
+    this._qrDel = this.db.prepare('DELETE FROM quarantine_roles WHERE user_id = ? AND guild_id = ?');
+    this._qrIns = this.db.prepare('INSERT INTO quarantine_roles (user_id, guild_id, role_id) VALUES (?, ?, ?)');
+    this._qrGet = this.db.prepare('SELECT role_id FROM quarantine_roles WHERE user_id = ? AND guild_id = ?');
+
     this._logCounter = 0;
   }
 
@@ -492,7 +501,6 @@ class StorageService {
     });
   }
   disableWelcome(guildId) { return this._disableWelcome.run(new Date().toISOString(), guildId).changes > 0; }
-  // FIX #3: nuovo metodo per svuotare il messaggio (prima non era possibile)
   clearWelcomeMessage(guildId) { return this._clearWelcomeMessage.run(new Date().toISOString(), guildId).changes > 0; }
   setWelcomeChannel(guildId, channelId) {
     const current = this.getWelcomeConfig(guildId);
@@ -638,6 +646,23 @@ class StorageService {
       whitelist_ids: data.whitelist_ids ?? current.whitelist_ids,
       updatedAt: new Date().toISOString()
     });
+  }
+
+  // ==================== QUARANTINE ====================
+  saveQuarantineRoles(userId, guildId, roleIds) {
+    const tx = this.db.transaction((roles) => {
+      this._qrDel.run(userId, guildId);
+      for (const r of roles) this._qrIns.run(userId, guildId, r);
+    });
+    tx(roleIds);
+  }
+
+  getQuarantineRoles(userId, guildId) {
+    return this._qrGet.all(userId, guildId).map(r => r.role_id);
+  }
+
+  clearQuarantineRoles(userId, guildId) {
+    this._qrDel.run(userId, guildId);
   }
 
   // ==================== CLOSE ====================
