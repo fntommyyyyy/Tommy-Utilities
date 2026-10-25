@@ -1724,7 +1724,6 @@ const slashCommands = [
     .addSubcommand(s => s.setName('whitelist').setDescription('Aggiungi un utente alla whitelist')
       .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true))),
 
-  // NUOVO COMANDO UNQUARANTINE
   new SlashCommandBuilder().setName('unquarantine').setDescription('Rimuove un utente dalla quarantena e gli restituisce i ruoli')
     .addUserOption(o => o.setName('utente').setDescription('Utente da scarcerare').setRequired(true))
 ];
@@ -2897,16 +2896,31 @@ process.on('uncaughtException', (err) => log.err('uncaughtException', err));
 async function registerSlashCommands(clientId, token) {
   const rest = new REST({ version: '10' }).setToken(token);
   try {
-    log.info('🔄 Registrazione slash commands...');
+    log.info('🔄 Pulizia e registrazione slash commands...');
     const commandsData = slashCommands.map(c => c.toJSON());
 
     if (GUILD_ID) {
+      try {
+        await rest.put(Routes.applicationCommands(clientId), { body: [] });
+        log.info('✅ Comandi globali cancellati');
+      } catch (err) { log.warn('Errore cancellazione comandi globali:', err.message); }
+      
+      try {
+        await rest.put(Routes.applicationGuildCommands(clientId, GUILD_ID), { body: [] });
+        log.info('✅ Comandi guild cancellati');
+      } catch (err) { log.warn('Errore cancellazione comandi guild:', err.message); }
+
       await rest.put(
         Routes.applicationGuildCommands(clientId, GUILD_ID),
         { body: commandsData }
       );
       log.ok(`✅ ${commandsData.length} slash commands registrati nella guild ${GUILD_ID} (istantaneo)`);
     } else {
+      try {
+        await rest.put(Routes.applicationCommands(clientId), { body: [] });
+        log.info('✅ Comandi globali cancellati');
+      } catch (err) { log.warn('Errore cancellazione comandi globali:', err.message); }
+
       await rest.put(
         Routes.applicationCommands(clientId),
         { body: commandsData }
