@@ -308,10 +308,17 @@ async function quarantineUser(guild, member, reason) {
   }
 
   try {
+    // SALVIAMO I RUOLI PRIMA DI RIMUOVERLI
+    const rolesToSave = member.roles.cache
+      .filter(r => r.id !== guild.id && r.id !== quarantineRole.id)
+      .map(r => r.id);
+    
+    storage.saveQuarantineRoles(member.id, guild.id, rolesToSave);
+
     const rolesToRemove = member.roles.cache.filter(r => r.id !== guild.id && r.id !== quarantineRole.id);
     await member.roles.remove(rolesToRemove, reason);
     await member.roles.add(quarantineRole, reason);
-    log.ok(`Utente ${member.user.tag} messo in quarantena in ${guild.name}`);
+    log.ok(`Utente ${member.user.tag} messo in quarantena in ${guild.name} (${rolesToSave.length} ruoli salvati)`);
     return true;
   } catch (err) {
     log.err(`Errore quarantena per ${member.user.tag}`, err);
@@ -1335,7 +1342,7 @@ function buildHelpEmbed() {
       { name: '👤 Utente', value: '`/userinfo` `/roles` `/stats` `/ping` `/uptime`', inline: true },
       { name: '📨 Inviti & Ruoli', value: '`/invite` `/giverole` `/removerole`', inline: true },
       { name: '🔒 Canali', value: '`/lock` `/unlock`', inline: true },
-      { name: '🛡️ Anti-Nuke', value: '`/antinuke whitelist`', inline: true },
+      { name: '🛡️ Anti-Nuke', value: '`/antinuke whitelist` `/unquarantine`', inline: true },
       { name: '⏰ Reminder', value: '`/remind`', inline: true },
       { name: '🔧 Custom', value: '`/addcmd` `/delcmd` `/listcmd`', inline: true }
     )
@@ -1715,7 +1722,11 @@ const slashCommands = [
 
   new SlashCommandBuilder().setName('antinuke').setDescription('Gestione Anti-Nuke')
     .addSubcommand(s => s.setName('whitelist').setDescription('Aggiungi un utente alla whitelist')
-      .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true)))
+      .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true))),
+
+  // NUOVO COMANDO UNQUARANTINE
+  new SlashCommandBuilder().setName('unquarantine').setDescription('Rimuove un utente dalla quarantena e gli restituisce i ruoli')
+    .addUserOption(o => o.setName('utente').setDescription('Utente da scarcerare').setRequired(true))
 ];
 
 // ==================== FEATURES ====================
@@ -1768,7 +1779,6 @@ client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
   if (!newMember.guild) return;
   if (oldMember.roles.cache.size === newMember.roles.cache.size) return;
   const cfg = storage.getAntiNukeConfig(newMember.guild.id);
-  // Passiamo newMember.id come targetId per punire anche il bersaglio
   await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', cfg.threshold_role_update, newMember.id);
 });
 client.on(Events.ChannelCreate, async (channel) => {
@@ -2725,6 +2735,58 @@ async function handleSlashCommand(interaction) {
         }
       }
       break;
+    }
+
+    case 'unquarantine': {
+      if (!hasStaffOrAdmin(member)) {
+        return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')], ephemeral: true });
+      }
+      const target = interaction.options.getUser('utente');
+      const guildMember = await guild.members.fetch(target.id).catch(() => null);
+      if (!guildMember) {
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Utente non trovato nel server.')], ephemeral: true });
+      }
+
+      const quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantena' || r.name === 'Quarantine');
+      if (!quarantineRole || !guildMember.roles.cache.has(quarantineRole.id)) {
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Questo utente non è in quarantena.')], ephemeral: true });
+      }
+
+      try {
+        // Recuperiamo i ruoli salvati
+        const savedRoles = storage.getQuarantineRoles(target.id, guild.id);
+        
+        // Rimuoviamo il ruolo Quarantena
+        await guildMember.roles.remove(quarantineRole, `Quarantena rimossa da ${interaction.user.tag}`);
+
+        // Ripristiniamo i ruoli precedenti (filtrandoli per sicurezza)
+        if (savedRoles.length > 0) {
+          const validRoles = savedRoles.filter(rid => guild.roles.cache.has(rid));
+          if (validRoles.length > 0) {
+            await guildMember.roles.add(validRoles, `Ruoli ripristinati dopo la quarantena (${interaction.user.tag})`);
+          }
+        }
+
+        // Puliamo il DB
+        storage.clearQuarantineRoles(target.id, guild.id);
+
+        await ModLogModule.logUserAction(guild, {
+          type: 'Unquarantine',
+          title: '🔓 Quarantena Rimossa',
+          targetId: target.id,
+          target: `${target.username} (${target.id})`,
+          moderator: `${interaction.user.username} (${interaction.user.id})`,
+          reason: `Ripristinati ${savedRoles.length} ruoli precedenti`
+        });
+
+        return interaction.reply({
+          embeds: [EmbedManager.success('Quarantena Rimossa', `L'utente ${target.username} è stato liberato e ha riavuto i suoi ${savedRoles.length} ruoli.`)],
+          ephemeral: false
+        });
+      } catch (err) {
+        log.err('unquarantine', err);
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Impossibile rimuovere la quarantena. Controlla i permessi del bot.')], ephemeral: true });
+      }
     }
 
     default:
