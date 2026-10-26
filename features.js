@@ -14,7 +14,7 @@ const welcomeFeature = {
       log.warn('welcome: client non ancora disponibile, setup saltato');
       return;
     }
-    if (this._listenerRegistered) return;   // fix doppio listener
+    if (this._listenerRegistered) return;
     this._listenerRegistered = true;
 
     client.on('guildMemberAdd', async member => {
@@ -25,7 +25,23 @@ const welcomeFeature = {
         if (!config || !config.channel_id) return;
 
         const channel = member.guild.channels.cache.get(config.channel_id);
-        if (!channel) return;
+        if (!channel) {
+          // FIX: log esplicito se il canale è stato cancellato/rinominato
+          log.warn(`welcome: canale ${config.channel_id} non trovato in ${member.guild.name} (può essere stato cancellato).`);
+          return;
+        }
+
+        if (!channel.isTextBased()) {
+          log.warn(`welcome: canale ${channel.name} non è testuale in ${member.guild.name}`);
+          return;
+        }
+
+        // FIX: verifico che il bot possa scrivere nel canale
+        const botMember = member.guild.members.me;
+        if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) {
+          log.warn(`welcome: manca permesso SendMessages in ${channel.name} (${member.guild.name})`);
+          return;
+        }
 
         const text = (config.message || 'Benvenuto {user} in {server}!')
           .replace(/{user}/g, member.toString())
@@ -41,9 +57,9 @@ const welcomeFeature = {
             .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
             .setFooter({ text: `Sei il membro #${member.guild.memberCount}` })
             .setTimestamp();
-          await channel.send({ embeds: [embed] }).catch(() => {});
+          await channel.send({ embeds: [embed] }).catch(err => log.warn(`welcome send embed: ${err.message}`));
         } else {
-          await channel.send({ content: text }).catch(() => {});
+          await channel.send({ content: text }).catch(err => log.warn(`welcome send text: ${err.message}`));
         }
       } catch (err) {
         log.err('welcome guildMemberAdd', err);
@@ -85,7 +101,8 @@ const welcomeFeature = {
     const { storage, isAdmin, safeReply } = ctx;
     const sub = interaction.options.getSubcommand();
 
-    if (!isAdmin(interaction.member)) {
+    // FIX: controllo esplicito se member è null (es. in DM, ma il bot non ha DM)
+    if (!interaction.member || !isAdmin(interaction.member)) {
       return safeReply(interaction, {
         embeds: [new EmbedBuilder().setTitle('❌ Accesso Negato').setDescription('Solo Admin.').setColor(0xFF0000)],
         ephemeral: true
@@ -103,6 +120,12 @@ const welcomeFeature = {
 
     if (sub === 'channel') {
       const channel = interaction.options.getChannel('canale');
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        return safeReply(interaction, {
+          embeds: [new EmbedBuilder().setTitle('❌ Errore').setDescription('Devi selezionare un canale testuale.').setColor(0xFF0000)],
+          ephemeral: true
+        });
+      }
       storage.setWelcomeConfig(gid, { channelId: channel.id, message: null, embedEnabled: undefined });
       return safeReply(interaction, {
         embeds: [new EmbedBuilder().setTitle('✅ Canale Impostato').setDescription(`Benvenuto in ${channel}`).setColor(0x00FF00)],
@@ -112,6 +135,18 @@ const welcomeFeature = {
 
     if (sub === 'message') {
       const testo = interaction.options.getString('testo');
+      if (!testo || testo.trim().length < 1) {
+        return safeReply(interaction, {
+          embeds: [new EmbedBuilder().setTitle('❌ Errore').setDescription('Il messaggio non può essere vuoto.').setColor(0xFF0000)],
+          ephemeral: true
+        });
+      }
+      if (testo.length > 2000) {
+        return safeReply(interaction, {
+          embeds: [new EmbedBuilder().setTitle('❌ Troppo Lungo').setDescription('Max 2000 caratteri.').setColor(0xFF0000)],
+          ephemeral: true
+        });
+      }
       storage.setWelcomeConfig(gid, { channelId: null, message: testo, embedEnabled: undefined });
 
       const preview = testo
