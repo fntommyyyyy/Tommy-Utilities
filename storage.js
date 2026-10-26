@@ -3,7 +3,6 @@ const fs = require('fs');
 const Database = require('better-sqlite3');
 
 class StorageService {
-  // FIX #1: path assoluto relativo a __dirname (non al CWD)
   constructor(dbPath) {
     let finalPath;
     if (dbPath) {
@@ -22,10 +21,10 @@ class StorageService {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 5000'); // FIX: evita SQLITE_BUSY con accessi concorrenti
     this._migrate();
     this._prepare();
 
-    // FIX #5: trim dei log all'avvio
     try { this._trimLogs.run(); } catch {}
   }
 
