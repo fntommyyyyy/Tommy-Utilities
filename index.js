@@ -376,7 +376,7 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId
       }
     };
 
-    // 1. Puniamo l'esecutore
+    // 1. Puniamo SOLO l'esecutore
     if (executor) {
       await punishMember(executor, punishReason);
       await ModLogModule.logUserAction(guild, {
@@ -389,16 +389,15 @@ async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId
       }).catch(() => {});
     }
 
-    // 2. Puniamo il bersaglio (se presente e diverso dall'esecutore)
-    if (targetMember && targetMember.id !== executorId) {
-      await punishMember(targetMember, `${punishReason} (Bersaglio dell'azione)`);
+    // 2. Logghiamo l'informazione sul bersaglio (senza punirlo)
+    if (targetId && targetId !== executorId && targetMember) {
       await ModLogModule.logUserAction(guild, {
-        type: 'Anti-Nuke (Bersaglio)',
-        title: '🛡️ Anti-Nuke: Bersaglio Punito',
+        type: 'Anti-Nuke (Info)',
+        title: 'ℹ️ Anti-Nuke: Bersaglio dell\'azione',
         targetId: targetMember.id,
         target: `${targetMember.user.tag} (${targetMember.id})`,
         moderator: 'Sistema Anti-Nuke',
-        reason: `Ha ricevuto un'azione di tipo "${actionType}" da ${executor ? executor.user.tag : executorId} in un contesto sospetto.`
+        reason: `Il bersaglio era stato toccato dall'azione sospetta di ${executor ? executor.user.tag : executorId}. Nessuna punizione applicata al bersaglio.`
       }).catch(() => {});
     }
 
@@ -2752,22 +2751,29 @@ async function handleSlashCommand(interaction) {
       }
 
       try {
-        // Recuperiamo i ruoli salvati
         const savedRoles = storage.getQuarantineRoles(target.id, guild.id);
-        
-        // Rimuoviamo il ruolo Quarantena
+        const botMember = guild.members.me;
+
+        // Filtra i ruoli: solo quelli che il bot può assegnare (gerarchia + permessi)
+        const validRoles = savedRoles.filter(rid => {
+          const role = guild.roles.cache.get(rid);
+          if (!role) return false;
+          if (role.position >= botMember.roles.highest.position) {
+            log.warn(`Unquarantine: impossibile riassegnare il ruolo "${role.name}" (troppo in alto per il bot)`);
+            return false;
+          }
+          return true;
+        });
+
         await guildMember.roles.remove(quarantineRole, `Quarantena rimossa da ${interaction.user.tag}`);
 
-        // Ripristiniamo i ruoli precedenti (filtrandoli per sicurezza)
-        if (savedRoles.length > 0) {
-          const validRoles = savedRoles.filter(rid => guild.roles.cache.has(rid));
-          if (validRoles.length > 0) {
-            await guildMember.roles.add(validRoles, `Ruoli ripristinati dopo la quarantena (${interaction.user.tag})`);
-          }
+        if (validRoles.length > 0) {
+          await guildMember.roles.add(validRoles, `Ruoli ripristinati dopo la quarantena (${interaction.user.tag})`);
         }
 
-        // Puliamo il DB
         storage.clearQuarantineRoles(target.id, guild.id);
+
+        const skipped = savedRoles.length - validRoles.length;
 
         await ModLogModule.logUserAction(guild, {
           type: 'Unquarantine',
@@ -2775,11 +2781,11 @@ async function handleSlashCommand(interaction) {
           targetId: target.id,
           target: `${target.username} (${target.id})`,
           moderator: `${interaction.user.username} (${interaction.user.id})`,
-          reason: `Ripristinati ${savedRoles.length} ruoli precedenti`
+          reason: `Ripristinati ${validRoles.length} ruoli.${skipped > 0 ? ` ${skipped} ruoli saltati (gerarchia/permessi).` : ''}`
         });
 
         return interaction.reply({
-          embeds: [EmbedManager.success('Quarantena Rimossa', `L'utente ${target.username} è stato liberato e ha riavuto i suoi ${savedRoles.length} ruoli.`)],
+          embeds: [EmbedManager.success('Quarantena Rimossa', `L'utente ${target.username} è stato liberato e ha riavuto ${validRoles.length} ruoli.${skipped > 0 ? `\n⚠️ ${skipped} ruoli non sono stati ripristinati perché il bot non ha i permessi per assegnarli.` : ''}`)],
           ephemeral: false
         });
       } catch (err) {
