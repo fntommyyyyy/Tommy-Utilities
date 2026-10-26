@@ -7,7 +7,7 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 
-const helmet = require('helmet'); // FIX #1: rimosso carattere "a" spuria
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
@@ -119,7 +119,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     },
     size: 32,
     ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
-    // FIX #2: funzione robusta (evita .toString() su undefined/null)
     getCsrfTokenFromRequest: (req) => {
       const h = req.headers['x-csrf-token'];
       const b = req.body && req.body._csrf;
