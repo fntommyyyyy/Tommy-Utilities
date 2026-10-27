@@ -12,8 +12,7 @@ const {
   EmbedBuilder,
   SlashCommandBuilder,
   REST,
-  Routes,
-  AuditLogEvent
+  Routes
 } = require('discord.js');
 
 const StorageService = require('./storage');
@@ -264,145 +263,6 @@ async function buildTranscriptHtml(channel) {
   }
   html += '</body></html>';
   return html;
-}
-
-// ==================== ANTI-NUKE ====================
-const antinukeTracker = new Map();
-
-function trackAction(guildId, userId, actionType, windowMs) {
-  const key = `${guildId}-${userId}-${actionType}`;
-  const now = Date.now();
-  const timestamps = antinukeTracker.get(key) || [];
-  const recent = timestamps.filter(t => now - t < windowMs);
-  recent.push(now);
-  antinukeTracker.set(key, recent);
-  return recent.length;
-}
-
-async function quarantineUser(guild, member, reason) {
-  const botMember = guild.members.me;
-  if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-    log.warn(`Anti-Nuke: manca ManageRoles in ${guild.name}, salto quarantena`);
-    return false;
-  }
-
-  let quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantena' || r.name === 'Quarantine');
-  if (!quarantineRole) {
-    try {
-      quarantineRole = await guild.roles.create({
-        name: 'Quarantena',
-        color: 0x808080,
-        permissions: [],
-        reason: 'Ruolo creato automaticamente per l\'Anti-Nuke'
-      });
-      log.info(`Creato ruolo "Quarantena" in ${guild.name}`);
-    } catch (err) {
-      log.err('Impossibile creare il ruolo Quarantena', err);
-      return false;
-    }
-  }
-
-  if (quarantineRole.position >= botMember.roles.highest.position) {
-    log.warn(`Il ruolo "Quarantena" è troppo in alto per essere assegnato in ${guild.name}`);
-    return false;
-  }
-
-  try {
-    // SALVIAMO I RUOLI PRIMA DI RIMUOVERLI
-    const rolesToSave = member.roles.cache
-      .filter(r => r.id !== guild.id && r.id !== quarantineRole.id)
-      .map(r => r.id);
-    
-    storage.saveQuarantineRoles(member.id, guild.id, rolesToSave);
-
-    const rolesToRemove = member.roles.cache.filter(r => r.id !== guild.id && r.id !== quarantineRole.id);
-    await member.roles.remove(rolesToRemove, reason);
-    await member.roles.add(quarantineRole, reason);
-    log.ok(`Utente ${member.user.tag} messo in quarantena in ${guild.name} (${rolesToSave.length} ruoli salvati)`);
-    return true;
-  } catch (err) {
-    log.err(`Errore quarantena per ${member.user.tag}`, err);
-    return false;
-  }
-}
-
-async function checkAntiNuke(guild, auditAction, actionType, threshold, targetId = null) {
-  if (!guild) return;
-  let executorId = null;
-  try {
-    const logs = await guild.fetchAuditLogs({ limit: 1, type: auditAction });
-    const entry = logs.entries.first();
-    if (!entry) return;
-    if (entry.executor.id === clientRef.user.id) return;
-    if (Date.now() - entry.createdTimestamp > 15000) return;
-    executorId = entry.executor.id;
-    
-    // Se il target non è passato, proviamo a prenderlo dall'audit log
-    if (!targetId && entry.target) {
-      targetId = entry.target.id;
-    }
-  } catch (e) { return; }
-
-  if (!executorId) return;
-
-  const config = storage.getAntiNukeConfig(guild.id);
-  const whitelist = (config.whitelist_ids || '').split(',').map(s => s.trim()).filter(Boolean);
-  if (whitelist.includes(executorId)) return;
-  if (executorId === guild.ownerId) return;
-
-  const windowMs = config.window_ms || 10000;
-  const count = trackAction(guild.id, executorId, actionType, windowMs);
-
-  if (count >= (threshold || 3)) {
-    const executor = await guild.members.fetch(executorId).catch(() => null);
-    const targetMember = targetId ? await guild.members.fetch(targetId).catch(() => null) : null;
-    
-    const botMember = guild.members.me;
-    const punishReason = `[ANTI-NUKE] Superata soglia ${actionType} (${count} in ${windowMs}ms)`;
-
-    const punishMember = async (member, reason) => {
-      if (!member) return;
-      if (member.roles.highest.position >= botMember.roles.highest.position) {
-        log.warn(`Anti-Nuke: impossibile punire ${member.id} (ruolo troppo alto)`);
-        return;
-      }
-      if (config.punishment === 'quarantine') {
-        const success = await quarantineUser(guild, member, reason);
-        if (!success) await member.ban({ reason }).catch(() => {});
-      } else if (config.punishment === 'ban') {
-        await member.ban({ reason }).catch(() => {});
-      } else if (config.punishment === 'kick') {
-        await member.kick(reason).catch(() => {});
-      }
-    };
-
-    // 1. Puniamo SOLO l'esecutore
-    if (executor) {
-      await punishMember(executor, punishReason);
-      await ModLogModule.logUserAction(guild, {
-        type: 'Anti-Nuke (Esecutore)',
-        title: '🛡️ Anti-Nuke: Esecutore Punito',
-        targetId: executorId,
-        target: `${executor.user.tag} (${executorId})`,
-        moderator: 'Sistema Anti-Nuke',
-        reason: `Ha eseguito ${count} azioni di tipo "${actionType}" in ${windowMs}ms.`
-      }).catch(() => {});
-    }
-
-    // 2. Logghiamo l'informazione sul bersaglio (senza punirlo)
-    if (targetId && targetId !== executorId && targetMember) {
-      await ModLogModule.logUserAction(guild, {
-        type: 'Anti-Nuke (Info)',
-        title: 'ℹ️ Anti-Nuke: Bersaglio dell\'azione',
-        targetId: targetMember.id,
-        target: `${targetMember.user.tag} (${targetMember.id})`,
-        moderator: 'Sistema Anti-Nuke',
-        reason: `Il bersaglio era stato toccato dall'azione sospetta di ${executor ? executor.user.tag : executorId}. Nessuna punizione applicata al bersaglio.`
-      }).catch(() => {});
-    }
-
-    antinukeTracker.delete(`${guild.id}-${executorId}-${actionType}`);
-  }
 }
 
 // ==================== MOD LOG ====================
@@ -1341,7 +1201,6 @@ function buildHelpEmbed() {
       { name: '👤 Utente', value: '`/userinfo` `/roles` `/stats` `/ping` `/uptime`', inline: true },
       { name: '📨 Inviti & Ruoli', value: '`/invite` `/giverole` `/removerole`', inline: true },
       { name: '🔒 Canali', value: '`/lock` `/unlock`', inline: true },
-      { name: '🛡️ Anti-Nuke', value: '`/antinuke whitelist` `/unquarantine`', inline: true },
       { name: '⏰ Reminder', value: '`/remind`', inline: true },
       { name: '🔧 Custom', value: '`/addcmd` `/delcmd` `/listcmd`', inline: true }
     )
@@ -1717,14 +1576,7 @@ const slashCommands = [
 
   new SlashCommandBuilder().setName('lock').setDescription('Blocca il canale')
     .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
-  new SlashCommandBuilder().setName('unlock').setDescription('Sblocca il canale'),
-
-  new SlashCommandBuilder().setName('antinuke').setDescription('Gestione Anti-Nuke')
-    .addSubcommand(s => s.setName('whitelist').setDescription('Aggiungi un utente alla whitelist')
-      .addUserOption(o => o.setName('utente').setDescription('Utente da aggiungere').setRequired(true))),
-
-  new SlashCommandBuilder().setName('unquarantine').setDescription('Rimuove un utente dalla quarantena e gli restituisce i ruoli')
-    .addUserOption(o => o.setName('utente').setDescription('Utente da scarcerare').setRequired(true))
+  new SlashCommandBuilder().setName('unlock').setDescription('Sblocca il canale')
 ];
 
 // ==================== FEATURES ====================
@@ -1771,36 +1623,6 @@ for (const f of features) {
     } catch (e) { log.err(`Feature "${f.name}" re-setup`, e); }
   }
 }
-
-// ==================== ANTI-NUKE EVENTI ====================
-client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
-  if (!newMember.guild) return;
-  if (oldMember.roles.cache.size === newMember.roles.cache.size) return;
-  const cfg = storage.getAntiNukeConfig(newMember.guild.id);
-  await checkAntiNuke(newMember.guild, AuditLogEvent.MemberRoleUpdate, 'role_update', cfg.threshold_role_update, newMember.id);
-});
-client.on(Events.ChannelCreate, async (channel) => {
-  if (!channel.guild) return;
-  const cfg = storage.getAntiNukeConfig(channel.guild.id);
-  await checkAntiNuke(channel.guild, AuditLogEvent.ChannelCreate, 'channel_create', cfg.threshold_channel);
-});
-client.on(Events.ChannelDelete, async (channel) => {
-  if (!channel.guild) return;
-  const cfg = storage.getAntiNukeConfig(channel.guild.id);
-  await checkAntiNuke(channel.guild, AuditLogEvent.ChannelDelete, 'channel_delete', cfg.threshold_channel);
-});
-client.on(Events.GuildBanAdd, async (ban) => {
-  const cfg = storage.getAntiNukeConfig(ban.guild.id);
-  await checkAntiNuke(ban.guild, AuditLogEvent.MemberBanAdd, 'ban_add', cfg.threshold_ban);
-});
-client.on(Events.GuildRoleCreate, async (role) => {
-  const cfg = storage.getAntiNukeConfig(role.guild.id);
-  await checkAntiNuke(role.guild, AuditLogEvent.RoleCreate, 'role_create', cfg.threshold_role);
-});
-client.on(Events.GuildRoleDelete, async (role) => {
-  const cfg = storage.getAntiNukeConfig(role.guild.id);
-  await checkAntiNuke(role.guild, AuditLogEvent.RoleDelete, 'role_delete', cfg.threshold_role);
-});
 
 // ==================== REMINDER SCHEDULER ====================
 setInterval(async () => {
@@ -2706,92 +2528,6 @@ async function handleSlashCommand(interaction) {
         return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve "Gestisci Canali".')], ephemeral: true });
       const res = await CommandLogic.unlockChannel(interaction.channel, member);
       return interaction.reply({ embeds: [buildResultEmbed({ ...res, title: 'Canale Sbloccato' })], ephemeral: !res.success });
-    }
-
-    case 'antinuke': {
-      if (!isAdmin(member)) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Solo Admin.')], ephemeral: true });
-      }
-      const sub = interaction.options.getSubcommand();
-      if (sub === 'whitelist') {
-        const target = interaction.options.getUser('utente');
-        const config = storage.getAntiNukeConfig(guild.id);
-        const currentWhitelist = (config.whitelist_ids || '').split(',').map(s => s.trim()).filter(Boolean);
-
-        if (!currentWhitelist.includes(target.id)) {
-          currentWhitelist.push(target.id);
-          storage.setAntiNukeConfig(guild.id, { ...config, whitelist_ids: currentWhitelist.join(',') });
-          return interaction.reply({
-            embeds: [EmbedManager.success('Whitelist Aggiornata', `${target.username} è ora immune all'Anti-Nuke.`)],
-            ephemeral: true
-          });
-        } else {
-          return interaction.reply({
-            embeds: [EmbedManager.info('Già in Whitelist', `${target.username} è già immune.`)],
-            ephemeral: true
-          });
-        }
-      }
-      break;
-    }
-
-    case 'unquarantine': {
-      if (!hasStaffOrAdmin(member)) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')], ephemeral: true });
-      }
-      const target = interaction.options.getUser('utente');
-      const guildMember = await guild.members.fetch(target.id).catch(() => null);
-      if (!guildMember) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Utente non trovato nel server.')], ephemeral: true });
-      }
-
-      const quarantineRole = guild.roles.cache.find(r => r.name === 'Quarantena' || r.name === 'Quarantine');
-      if (!quarantineRole || !guildMember.roles.cache.has(quarantineRole.id)) {
-        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Questo utente non è in quarantena.')], ephemeral: true });
-      }
-
-      try {
-        const savedRoles = storage.getQuarantineRoles(target.id, guild.id);
-        const botMember = guild.members.me;
-
-        // Filtra i ruoli: solo quelli che il bot può assegnare (gerarchia + permessi)
-        const validRoles = savedRoles.filter(rid => {
-          const role = guild.roles.cache.get(rid);
-          if (!role) return false;
-          if (role.position >= botMember.roles.highest.position) {
-            log.warn(`Unquarantine: impossibile riassegnare il ruolo "${role.name}" (troppo in alto per il bot)`);
-            return false;
-          }
-          return true;
-        });
-
-        await guildMember.roles.remove(quarantineRole, `Quarantena rimossa da ${interaction.user.tag}`);
-
-        if (validRoles.length > 0) {
-          await guildMember.roles.add(validRoles, `Ruoli ripristinati dopo la quarantena (${interaction.user.tag})`);
-        }
-
-        storage.clearQuarantineRoles(target.id, guild.id);
-
-        const skipped = savedRoles.length - validRoles.length;
-
-        await ModLogModule.logUserAction(guild, {
-          type: 'Unquarantine',
-          title: '🔓 Quarantena Rimossa',
-          targetId: target.id,
-          target: `${target.username} (${target.id})`,
-          moderator: `${interaction.user.username} (${interaction.user.id})`,
-          reason: `Ripristinati ${validRoles.length} ruoli.${skipped > 0 ? ` ${skipped} ruoli saltati (gerarchia/permessi).` : ''}`
-        });
-
-        return interaction.reply({
-          embeds: [EmbedManager.success('Quarantena Rimossa', `L'utente ${target.username} è stato liberato e ha riavuto ${validRoles.length} ruoli.${skipped > 0 ? `\n⚠️ ${skipped} ruoli non sono stati ripristinati perché il bot non ha i permessi per assegnarli.` : ''}`)],
-          ephemeral: false
-        });
-      } catch (err) {
-        log.err('unquarantine', err);
-        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Impossibile rimuovere la quarantena. Controlla i permessi del bot.')], ephemeral: true });
-      }
     }
 
     default:
