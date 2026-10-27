@@ -188,15 +188,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     when: z.string().min(1).max(20)
   });
 
-  const schemaAntinuke = z.object({
-    threshold_channel: z.coerce.number().int().min(1).max(50).optional(),
-    threshold_role: z.coerce.number().int().min(1).max(50).optional(),
-    threshold_ban: z.coerce.number().int().min(1).max(50).optional(),
-    threshold_role_update: z.coerce.number().int().min(1).max(50).optional(),
-    window_ms: z.coerce.number().int().min(1000).max(600000).optional(),
-    punishment: z.enum(['quarantine', 'ban', 'kick']).optional(),
-    whitelist_ids: z.string().max(2000).optional()
-  });
+  // schemaAntinuke rimosso
 
   function parseOrFail(schema, data, res) {
     const r = schema.safeParse(data);
@@ -844,24 +836,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/antinuke/:guildId', requireAuth, (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    try {
-      if (storage.getAntiNukeConfig) res.json(storage.getAntiNukeConfig(req.params.guildId));
-      else res.json({});
-    } catch (e) { apiError(res, e, 'Errore lettura config'); }
-  });
-
-  app.post('/api/antinuke/:guildId', requireAuth, (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    const data = parseOrFail(schemaAntinuke, req.body || {}, res);
-    if (!data) return;
-    try {
-      if (storage.setAntiNukeConfig) storage.setAntiNukeConfig(req.params.guildId, data);
-      else throw new Error('setAntiNukeConfig non disponibile in storage');
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore salvataggio'); }
-  });
+  // Endpoint /api/antinuke rimossi
 
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
@@ -906,7 +881,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
   });
   app.get('/reminders', requireAuth, pageHandler('reminders'));
-  app.get('/antinuke', requireAuth, pageHandler('antinuke'));
+  // app.get('/antinuke') rimosso
 
   app.use((err, req, res, next) => {
     log.err('web-error', err);
@@ -953,8 +928,8 @@ function renderLayout(user, page, params = {}, security = {}) {
     accesslogs: renderAccessLogsContent(),
     messages: renderMessagesContent(),
     userActions: renderUserActionsContent(params.userId || ''),
-    reminders: renderRemindersContent(),
-    antinuke: renderAntinukeContent()
+    reminders: renderRemindersContent()
+    // antinuke rimosso
   };
 
   return `<!DOCTYPE html>
@@ -1108,7 +1083,6 @@ function renderLayout(user, page, params = {}, security = {}) {
     <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
     <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
     <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
-    <a href="/antinuke" class="${page === 'antinuke' ? 'active' : ''}">🛡️ Anti-Nuke</a>
     <a href="/reminders" class="${page === 'reminders' ? 'active' : ''}">⏰ Reminder</a>
     <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
     <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
@@ -1244,7 +1218,6 @@ function renderModlogsContent() {
         <option value="Purge">Purge</option>
         <option value="Lock">Lock</option>
         <option value="Unlock">Unlock</option>
-        <option value="Anti-Nuke">Anti-Nuke</option>
         <option value="Ticket Claim">Ticket Claim</option>
         <option value="Ticket Priorità">Ticket Priorità</option>
       </select>
@@ -2098,104 +2071,6 @@ function renderRemindersContent() {
   </script>`;
 }
 
-// ---------- ANTINUKE ----------
-function renderAntinukeContent() {
-  return `
-  <div class="section">
-    <h2>🛡️ Configurazione Anti-Nuke</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Configura soglie e punizioni per il sistema Anti-Nuke.</p>
-    <select id="an-guild" onchange="loadConfig()"></select>
-
-    <div class="config-block" style="margin-top:14px;">
-      <h3>Soglie</h3>
-      <label style="font-size:13px;color:#888;">Threshold canali (azioni)</label>
-      <input type="number" id="an-threshold-channel" min="1" max="50">
-      <label style="font-size:13px;color:#888;">Threshold ruoli (azioni)</label>
-      <input type="number" id="an-threshold-role" min="1" max="50">
-      <label style="font-size:13px;color:#888;">Threshold ban (azioni)</label>
-      <input type="number" id="an-threshold-ban" min="1" max="50">
-      <label style="font-size:13px;color:#888;">Threshold role update (azioni)</label>
-      <input type="number" id="an-threshold-role-update" min="1" max="50">
-      <label style="font-size:13px;color:#888;">Finestra (ms)</label>
-      <input type="number" id="an-window" min="1000" max="600000">
-    </div>
-
-    <div class="config-block">
-      <h3>Punizione</h3>
-      <select id="an-punishment">
-        <option value="quarantine">Quarantena (poi ban se fallisce)</option>
-        <option value="ban">Ban</option>
-        <option value="kick">Kick</option>
-      </select>
-    </div>
-
-    <div class="config-block">
-      <h3>Whitelist (ID utenti separati da virgola)</h3>
-      <textarea id="an-whitelist" rows="3" placeholder="123456789012345678,987654321098765432"></textarea>
-    </div>
-
-    <button onclick="saveAntinuke()">💾 Salva</button>
-    <div id="an-result"></div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let guildsData = [];
-
-  async function loadGuilds() {
-    const res = await apiFetch('/api/guilds');
-    guildsData = await res.json();
-    const sel = document.getElementById('an-guild');
-    sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
-    if (guildsData.length) loadConfig();
-  }
-  async function loadConfig() {
-    const guildId = document.getElementById('an-guild').value;
-    if (!guildId) return;
-    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId));
-    const c = await res.json().catch(() => ({}));
-    document.getElementById('an-threshold-channel').value = c.threshold_channel ?? 3;
-    document.getElementById('an-threshold-role').value = c.threshold_role ?? 3;
-    document.getElementById('an-threshold-ban').value = c.threshold_ban ?? 3;
-    document.getElementById('an-threshold-role-update').value = c.threshold_role_update ?? 3;
-    document.getElementById('an-window').value = c.window_ms ?? 10000;
-    document.getElementById('an-punishment').value = c.punishment ?? 'quarantine';
-    document.getElementById('an-whitelist').value = c.whitelist_ids ?? '';
-  }
-  async function saveAntinuke() {
-    const guildId = document.getElementById('an-guild').value;
-    if (!guildId) return;
-    // FIX: invia solo i campi valorizzati, con parseInt sicuro
-    const parseNum = (id) => {
-      const v = document.getElementById(id).value.trim();
-      if (!v) return undefined;
-      const n = parseInt(v, 10);
-      return isNaN(n) ? undefined : n;
-    };
-    const payload = {
-      threshold_channel: parseNum('an-threshold-channel'),
-      threshold_role: parseNum('an-threshold-role'),
-      threshold_ban: parseNum('an-threshold-ban'),
-      threshold_role_update: parseNum('an-threshold-role-update'),
-      window_ms: parseNum('an-window'),
-      punishment: document.getElementById('an-punishment').value || undefined,
-      whitelist_ids: document.getElementById('an-whitelist').value.trim() || undefined
-    };
-    // Rimuovi i campi undefined
-    Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
-    const el = document.getElementById('an-result');
-    el.innerHTML = '<span class="loading">Salvataggio...</span>';
-    const res = await apiFetch('/api/antinuke/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      el.innerHTML = '<span class="success">✅ Salvato</span>';
-      loadConfig();
-    } else {
-      el.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
-    }
-  }
-  loadGuilds();
-  </script>`;
-}
+// renderAntinukeContent rimosso
 
 module.exports = { createWebServer };
