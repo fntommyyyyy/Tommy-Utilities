@@ -21,7 +21,7 @@ class StorageService {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
-    this.db.pragma('busy_timeout = 5000'); // FIX: evita SQLITE_BUSY con accessi concorrenti
+    this.db.pragma('busy_timeout = 5000');
     this._migrate();
     this._prepare();
 
@@ -395,28 +395,8 @@ class StorageService {
         updated_at = @updatedAt
     `);
 
-    // ===== ANTI-NUKE =====
-    this._getAntiNuke = this.db.prepare('SELECT * FROM antinuke_config WHERE guild_id = ?');
-    this._upsertAntiNuke = this.db.prepare(`
-      INSERT INTO antinuke_config
-        (guild_id, threshold_channel, threshold_role, threshold_ban, threshold_role_update, window_ms, punishment, whitelist_ids, updated_at)
-      VALUES
-        (@guildId, @threshold_channel, @threshold_role, @threshold_ban, @threshold_role_update, @window_ms, @punishment, @whitelist_ids, @updatedAt)
-      ON CONFLICT(guild_id) DO UPDATE SET
-        threshold_channel = excluded.threshold_channel,
-        threshold_role = excluded.threshold_role,
-        threshold_ban = excluded.threshold_ban,
-        threshold_role_update = excluded.threshold_role_update,
-        window_ms = excluded.window_ms,
-        punishment = excluded.punishment,
-        whitelist_ids = excluded.whitelist_ids,
-        updated_at = excluded.updated_at
-    `);
-
-    // ===== QUARANTINE ROLES =====
-    this._qrDel = this.db.prepare('DELETE FROM quarantine_roles WHERE user_id = ? AND guild_id = ?');
-    this._qrIns = this.db.prepare('INSERT INTO quarantine_roles (user_id, guild_id, role_id) VALUES (?, ?, ?)');
-    this._qrGet = this.db.prepare('SELECT role_id FROM quarantine_roles WHERE user_id = ? AND guild_id = ?');
+    // ANTI-NUKE prepared statements rimossi
+    // QUARANTINE prepared statements rimossi
 
     this._logCounter = 0;
   }
@@ -609,60 +589,8 @@ class StorageService {
     });
   }
 
-  // ==================== ANTI-NUKE ====================
-  getAntiNukeConfig(guildId) {
-    const row = this._getAntiNuke.get(guildId);
-    const defaults = {
-      threshold_channel: 3,
-      threshold_role: 3,
-      threshold_ban: 3,
-      threshold_role_update: 3,
-      window_ms: 10000,
-      punishment: 'quarantine',
-      whitelist_ids: ''
-    };
-    if (!row) return defaults;
-    return {
-      threshold_channel: row.threshold_channel ?? defaults.threshold_channel,
-      threshold_role: row.threshold_role ?? defaults.threshold_role,
-      threshold_ban: row.threshold_ban ?? defaults.threshold_ban,
-      threshold_role_update: row.threshold_role_update ?? defaults.threshold_role_update,
-      window_ms: row.window_ms ?? defaults.window_ms,
-      punishment: row.punishment ?? defaults.punishment,
-      whitelist_ids: row.whitelist_ids ?? defaults.whitelist_ids
-    };
-  }
-  setAntiNukeConfig(guildId, data = {}) {
-    const current = this.getAntiNukeConfig(guildId);
-    this._upsertAntiNuke.run({
-      guildId,
-      threshold_channel: data.threshold_channel ?? current.threshold_channel,
-      threshold_role: data.threshold_role ?? current.threshold_role,
-      threshold_ban: data.threshold_ban ?? current.threshold_ban,
-      threshold_role_update: data.threshold_role_update ?? current.threshold_role_update,
-      window_ms: data.window_ms ?? current.window_ms,
-      punishment: data.punishment ?? current.punishment,
-      whitelist_ids: data.whitelist_ids ?? current.whitelist_ids,
-      updatedAt: new Date().toISOString()
-    });
-  }
-
-  // ==================== QUARANTINE ====================
-  saveQuarantineRoles(userId, guildId, roleIds) {
-    const tx = this.db.transaction((roles) => {
-      this._qrDel.run(userId, guildId);
-      for (const r of roles) this._qrIns.run(userId, guildId, r);
-    });
-    tx(roleIds);
-  }
-
-  getQuarantineRoles(userId, guildId) {
-    return this._qrGet.all(userId, guildId).map(r => r.role_id);
-  }
-
-  clearQuarantineRoles(userId, guildId) {
-    this._qrDel.run(userId, guildId);
-  }
+  // ANTI-NUKE metodi pubblici rimossi
+  // QUARANTINE metodi pubblici rimossi
 
   // ==================== CLOSE ====================
   close() {
