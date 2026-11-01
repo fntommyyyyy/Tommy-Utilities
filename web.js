@@ -6,13 +6,14 @@ const cookieParser = require('cookie-parser');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
 
-function createWebServer({ storage, client, log, botStartTime }) {
+function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml }) {
   const app = express();
   const PORT = parseInt(process.env.PORT) || 3000;
   const HOST = process.env.WEB_HOST || '0.0.0.0';
@@ -24,7 +25,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
   const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
   const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
   const DASHBOARD_URL = (process.env.DASHBOARD_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
-  const SESSION_SECRET = process.env.SESSION_SECRET || 'cambia-questo-segreto-ora';
+  if (IS_PROD && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
+    throw new Error('SESSION_SECRET mancante o troppo corto (minimo 32 caratteri) in produzione');
+  }
+  const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-non-usare-in-produzione';
   const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
   const DASHBOARD_ROLES = ['Senior Admin'];
 
@@ -48,6 +52,38 @@ function createWebServer({ storage, client, log, botStartTime }) {
     }
     authCache.set(userId, { authorized, expires: now + AUTH_CACHE_TTL });
     return authorized;
+  }
+
+  // ==================== AUTORIZZAZIONE PER SERVER ====================
+  const guildAccessCache = new Map();
+
+  async function canManageGuild(userId, guild) {
+    if (ENV_ADMIN_IDS.includes(userId)) return true;
+    const key = `${userId}:${guild.id}`;
+    const cached = guildAccessCache.get(key);
+    if (cached && cached.expires > Date.now()) return cached.ok;
+    const member = await guild.members.fetch(userId).catch(() => null);
+    const ok = !!member && member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name));
+    guildAccessCache.set(key, { ok, expires: Date.now() + AUTH_CACHE_TTL });
+    return ok;
+  }
+
+  async function allowedGuildIds(userId) {
+    const ids = new Set();
+    for (const g of client.guilds.cache.values()) {
+      if (await canManageGuild(userId, g)) ids.add(g.id);
+    }
+    return ids;
+  }
+
+  async function assertGuildAccess(req, res, guildId) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) { res.status(404).json({ error: 'Server non trovato' }); return false; }
+    if (!(await canManageGuild(req.session.user.id, guild))) {
+      res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      return false;
+    }
+    return true;
   }
 
   // ==================== HELMET ====================
@@ -86,7 +122,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
     store: new FileStore({ path: SESSION_DIR, ttl: 7 * 24 * 60 * 60, retries: 0 }),
     secret: SESSION_SECRET,
     resave: false,
-    saveUninitialized: true,
+    saveUninitialized: false,
     proxy: true,
     cookie: {
       secure: IS_PROD,
@@ -140,7 +176,7 @@ function createWebServer({ storage, client, log, botStartTime }) {
         res.json({ csrfToken: token });
       } catch (e) {
         log.err('csrf-token', e);
-        res.status(500).json({ error: 'Errore CSRF', detail: e.message, stack: e.stack });
+        res.status(500).json({ error: 'Errore CSRF' });
       }
     });
   });
@@ -188,8 +224,6 @@ function createWebServer({ storage, client, log, botStartTime }) {
     when: z.string().min(1).max(20)
   });
 
-  // schemaAntinuke rimosso
-
   function parseOrFail(schema, data, res) {
     const r = schema.safeParse(data);
     if (!r.success) {
@@ -201,14 +235,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     return r.data;
   }
 
-  function escapeHtml(str) {
-    if (str === null || str === undefined) return '';
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
   function apiError(res, e, msg = 'Errore interno') {
     try { log.err('api-error', e); } catch {}
-    res.status(500).json({ error: msg, detail: e?.message });
+    res.status(500).json(IS_PROD ? { error: msg } : { error: msg, detail: e?.message });
   }
 
   async function requireAuth(req, res, next) {
@@ -242,13 +271,28 @@ function createWebServer({ storage, client, log, botStartTime }) {
   // ==================== OAUTH ====================
   app.get('/auth/login', (req, res) => {
     if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('OAuth2 non configurato.');
-    const params = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: `${DASHBOARD_URL}/auth/callback`, response_type: 'code', scope: 'identify' });
-    res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
+    const state = crypto.randomBytes(24).toString('hex');
+    req.session.oauthState = state;
+    req.session.save((err) => {
+      if (err) return res.status(500).send('Errore sessione');
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID,
+        redirect_uri: `${DASHBOARD_URL}/auth/callback`,
+        response_type: 'code',
+        scope: 'identify',
+        state
+      });
+      res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
+    });
   });
 
   app.get('/auth/callback', async (req, res) => {
-    const { code } = req.query;
-    if (!code) return res.status(400).send('Codice mancante');
+    const { code, state } = req.query;
+    const expected = req.session.oauthState;
+    delete req.session.oauthState;
+    if (!code || !state || !expected || !safeEqual(state, expected)) {
+      return res.status(403).send('Richiesta di login non valida, riprova dalla dashboard.');
+    }
     try {
       const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
         new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: `${DASHBOARD_URL}/auth/callback` }),
@@ -298,21 +342,23 @@ function createWebServer({ storage, client, log, botStartTime }) {
   });
 
   // ==================== API ====================
-  app.get('/api/stats', requireAuth, (req, res) => {
+  app.get('/api/stats', requireAuth, async (req, res) => {
     try {
       const s = storage.getStats();
+      const allowed = await allowedGuildIds(req.session.user.id);
       let ticketsCount = 0;
       for (const guild of client.guilds.cache.values()) {
+        if (!allowed.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-')) ticketsCount++;
         }
       }
       let notesCount = 0, transcriptsCount = 0, remindersCount = 0;
-      try { notesCount = storage.db.prepare('SELECT COUNT(*) as c FROM member_notes').get()?.c || 0; } catch {}
+      try { notesCount = storage.getAllNotes().filter(n => allowed.has(n.guild_id)).length; } catch {}
       try { transcriptsCount = storage.countTranscripts ? storage.countTranscripts() : 0; } catch {}
       try { remindersCount = storage.countReminders ? storage.countReminders() : 0; } catch {}
       res.json({
-        logs: s.total, blacklist: s.blacklist, guilds: client.guilds.cache.size, ping: client.ws.ping,
+        logs: s.total, blacklist: s.blacklist, guilds: allowed.size, ping: client.ws.ping,
         uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType,
         tickets: ticketsCount, notes: notesCount, transcripts: transcriptsCount, reminders: remindersCount
       });
@@ -355,30 +401,46 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getLogsForUser(req.params.userId)); } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/notes/all', requireAuth, (req, res) => {
-    try { res.json(storage.getAllNotes()); } catch (e) { res.json([]); }
+  app.get('/api/notes/all', requireAuth, async (req, res) => {
+    try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      res.json(storage.getAllNotes().filter(n => allowed.has(n.guild_id)));
+    } catch (e) { res.json([]); }
   });
-  app.delete('/api/notes/:id', requireAuth, (req, res) => {
+  app.delete('/api/notes/:id', requireAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'ID non valido' });
-    try { res.json({ ok: storage.deleteNoteById(id) }); } catch (e) { apiError(res, e); }
+    try {
+      const note = storage.getAllNotes().find(n => n.id === id);
+      if (!note) return res.status(404).json({ error: 'Nota non trovata' });
+      const allowed = await allowedGuildIds(req.session.user.id);
+      if (!allowed.has(note.guild_id)) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      res.json({ ok: storage.deleteNoteById(id) });
+    } catch (e) { apiError(res, e); }
   });
-  app.post('/api/notes/bulk-delete', requireAuth, (req, res) => {
+  app.post('/api/notes/bulk-delete', requireAuth, async (req, res) => {
     const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
     if (!data) return;
     try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const byId = new Map(storage.getAllNotes().map(n => [n.id, n]));
       let count = 0;
-      for (const id of data.ids) if (storage.deleteNoteById(parseInt(id, 10))) count++;
+      for (const id of data.ids) {
+        const note = byId.get(parseInt(id, 10));
+        if (note && allowed.has(note.guild_id) && storage.deleteNoteById(note.id)) count++;
+      }
       res.json({ ok: true, count });
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/config/:guildId', requireAuth, (req, res) => {
+  app.get('/api/config/:guildId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
     try { res.json(storage.getGuildConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
   });
-  app.post('/api/config/:guildId', requireAuth, (req, res) => {
+  app.post('/api/config/:guildId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
     const data = parseOrFail(schemaConfig, req.body || {}, res);
     if (!data) return;
     const guildId = req.params.guildId;
@@ -395,12 +457,14 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/welcome/:guildId', requireAuth, (req, res) => {
+  app.get('/api/welcome/:guildId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
     try { res.json(storage.getWelcomeConfig(req.params.guildId) || {}); } catch (e) { apiError(res, e); }
   });
-  app.post('/api/welcome/:guildId', requireAuth, (req, res) => {
+  app.post('/api/welcome/:guildId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
     const data = parseOrFail(schemaWelcome, req.body || {}, res);
     if (!data) return;
     const guildId = req.params.guildId;
@@ -420,8 +484,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
 
   app.post('/api/welcome/:guildId/test', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
     const guild = client.guilds.cache.get(req.params.guildId);
-    if (!guild) return res.status(404).json({ error: 'Server non trovato' });
 
     const config = storage.getWelcomeConfig(req.params.guildId);
     if (!config || !config.channel_id) return res.status(400).json({ error: 'Canale welcome non configurato' });
@@ -454,10 +518,12 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore test welcome'); }
   });
 
-  app.get('/api/tickets', requireAuth, (req, res) => {
+  app.get('/api/tickets', requireAuth, async (req, res) => {
     try {
+      const allowed = await allowedGuildIds(req.session.user.id);
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
+        if (!allowed.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-')) {
             const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
@@ -481,41 +547,18 @@ function createWebServer({ storage, client, log, botStartTime }) {
       const ch = await client.channels.fetch(req.params.channelId).catch(() => null);
       if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
       if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
+      if (!ch.name?.startsWith('ticket-')) return res.status(400).json({ error: 'Non è un canale ticket' });
+      if (!(await canManageGuild(req.session.user.id, ch.guild))) {
+        return res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      }
 
-      const msgs = await ch.messages.fetch({ limit: 100 }).catch(() => null);
-      if (msgs && storage.saveTranscript) {
-        const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-        let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + esc(ch.name) + '</title>'
-          + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
-          + '.msg{display:flex;gap:10px;margin-bottom:15px;padding:10px;border-bottom:1px solid #40444b}'
-          + '.avatar{width:40px;height:40px;border-radius:50%}'
-          + '.author{font-weight:bold;color:#fff}.time{font-size:12px;color:#72767d;margin-left:10px}'
-          + '.content{flex:1;word-wrap:break-word;white-space:pre-wrap}'
-          + 'img.attach{max-width:300px;border-radius:6px;margin-top:6px}</style></head><body>';
-        html += '<h1>Transcript: #' + esc(ch.name) + '</h1>';
-        const sorted = [...msgs.values()].reverse();
-        for (const m of sorted) {
-          const avatar = esc(m.author.displayAvatarURL());
-          const username = esc(m.author.username);
-          const time = esc(m.createdAt.toLocaleString('it-IT'));
-          if (m.author.bot && m.embeds.length > 0) {
-            const desc = m.embeds.map(e => esc(e.description || '')).join('<br>');
-            html += '<div class="msg"><div class="content"><span class="author">[BOT] ' + username + '</span>'
-              + '<span class="time">' + time + '</span><br>' + desc + '</div></div>';
-          } else {
-            let attach = '';
-            for (const att of m.attachments.values()) {
-              if ((att.contentType || '').startsWith('image/')) attach += '<br><img class="attach" src="' + esc(att.url) + '" alt="attachment">';
-              else attach += '<br><a href="' + esc(att.url) + '" target="_blank" rel="noopener">📎 ' + esc(att.name) + '</a>';
-            }
-            html += '<div class="msg"><img src="' + avatar + '" class="avatar">'
-              + '<div class="content"><span class="author">' + username + '</span>'
-              + '<span class="time">' + time + '</span><br>' + esc(m.content) + attach + '</div></div>';
-          }
-        }
-        html += '</body></html>';
+      const html = await buildTranscriptHtml(ch);
+      if (html && storage.saveTranscript) {
         const meta = storage.getTicketMeta ? storage.getTicketMeta(ch.id) : null;
-        storage.saveTranscript(ch.id, ch.name, ch.name.replace('ticket-', ''), meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html);
+        storage.saveTranscript(
+          ch.id, ch.name, ch.name.replace('ticket-', ''),
+          meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html
+        );
       }
       await ch.delete('Chiuso dalla dashboard web');
       res.json({ ok: true });
@@ -529,6 +572,9 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try {
       const channel = await client.channels.fetch(data.channelId).catch(() => null);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
+      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
+        return res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      }
 
       const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
       const embed = new EmbedBuilder().setTitle('Pannello Ticket').setDescription('Premi il bottone qui sotto per aprire un ticket.').setColor(0x0099FF).setTimestamp();
@@ -601,26 +647,32 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { log.err('api/top', e); res.json({ moderators: [], targets: [], types: [], byMonth: [] }); }
   });
 
-  app.get('/api/guilds', requireAuth, (req, res) => {
+  app.get('/api/guilds', requireAuth, async (req, res) => {
     try {
-      const guilds = client.guilds.cache.map(g => ({
-        id: g.id, name: g.name,
-        roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
-        channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
-      }));
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const guilds = [...client.guilds.cache.values()]
+        .filter(g => allowed.has(g.id))
+        .map(g => ({
+          id: g.id, name: g.name,
+          roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
+          channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
+        }));
       res.json(guilds);
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/user/:userId', requireAuth, (req, res) => {
+  app.get('/api/user/:userId', requireAuth, async (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
     try {
+      const allowed = await allowedGuildIds(req.session.user.id);
       const logs = storage.getLogsForUser(userId);
-      const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(userId);
+      const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(userId)
+        .filter(n => allowed.has(n.guild_id));
       const blacklistEntry = storage.getBlacklistEntry(userId);
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
+        if (!allowed.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name === `ticket-${userId}`) {
             const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
@@ -633,15 +685,17 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore caricamento utente'); }
   });
 
-  app.get('/api/search', requireAuth, (req, res) => {
+  app.get('/api/search', requireAuth, async (req, res) => {
     const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
     try {
+      const allowed = await allowedGuildIds(req.session.user.id);
       const blacklist = storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q));
-      const notes = storage.getAllNotes().filter(n => (n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q));
+      const notes = storage.getAllNotes().filter(n => allowed.has(n.guild_id) && ((n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q)));
       const logs = storage.getAllLogs(500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
+        if (!allowed.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-') && ch.name.toLowerCase().includes(q)) {
             tickets.push({ guild: guild.name, channel: ch.name, channelId: ch.id, userId: ch.name.replace('ticket-', '') });
@@ -674,9 +728,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
-  app.get('/api/export/notes.csv', requireAuth, (req, res) => {
+  app.get('/api/export/notes.csv', requireAuth, async (req, res) => {
     try {
-      const csv = toCsv(storage.getAllNotes(), ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']);
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const csv = toCsv(
+        storage.getAllNotes().filter(n => allowed.has(n.guild_id)),
+        ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']
+      );
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="notes.csv"');
       res.send(csv);
@@ -703,10 +761,12 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
 
-  app.get('/api/messages/channels', requireAuth, (req, res) => {
+  app.get('/api/messages/channels', requireAuth, async (req, res) => {
     try {
+      const allowed = await allowedGuildIds(req.session.user.id);
       const out = [];
       for (const guild of client.guilds.cache.values()) {
+        if (!allowed.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.type === 0) out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
         }
@@ -722,10 +782,13 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try {
       const channel = await client.channels.fetch(data.channelId).catch(() => null);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
+      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
+        return res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      }
       const botMember = channel.guild?.members?.me;
       if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
 
-      const payload = {};
+      const payload = { allowedMentions: { parse: ['users'] } };
       if (data.content) payload.content = data.content;
       if (data.embed && (data.embed.title || data.embed.description)) {
         const { EmbedBuilder } = require('discord.js');
@@ -753,8 +816,10 @@ function createWebServer({ storage, client, log, botStartTime }) {
     try {
       const user = await client.users.fetch(userId).catch(() => null);
       if (!user) return res.status(404).json({ error: 'Utente non trovato' });
+      const allowed = await allowedGuildIds(req.session.user.id);
       const memberships = [];
       for (const guild of client.guilds.cache.values()) {
+        if (!allowed.has(guild.id)) continue;
         const member = await guild.members.fetch(userId).catch(() => null);
         if (member) memberships.push({ guildId: guild.id, guildName: guild.name, joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name) });
       }
@@ -768,8 +833,8 @@ function createWebServer({ storage, client, log, botStartTime }) {
     const { action, userId, guildId, reason } = data;
     if (userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
     try {
+      if (!(await assertGuildAccess(req, res, guildId))) return;
       const guild = client.guilds.cache.get(guildId);
-      if (!guild) return res.status(404).json({ error: 'Server non trovato' });
       const botMember = guild.members.me;
       if (!botMember) return res.status(500).json({ error: 'Bot non nel server' });
       const r = (reason || `Azione da dashboard (${req.session.user.username})`).slice(0, 512);
@@ -814,16 +879,22 @@ function createWebServer({ storage, client, log, botStartTime }) {
     } catch (e) { apiError(res, e, 'Errore azione utente'); }
   });
 
-  app.get('/api/reminders', requireAuth, (req, res) => {
+  app.get('/api/reminders', requireAuth, async (req, res) => {
     try {
-      if (storage.getAllReminders) res.json(storage.getAllReminders(200));
-      else res.json(storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all());
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const rows = storage.getAllReminders
+        ? storage.getAllReminders(200)
+        : storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all();
+      res.json(rows.filter(r => allowed.has(r.guild_id)));
     } catch (e) { apiError(res, e); }
   });
 
-  app.post('/api/reminders', requireAuth, (req, res) => {
+  app.post('/api/reminders', requireAuth, async (req, res) => {
     const data = parseOrFail(schemaReminder, req.body || {}, res);
     if (!data) return;
+    const guild = client.guilds.cache.get(data.guildId);
+    if (!guild || !guild.channels.cache.has(data.channelId)) return res.status(400).json({ error: 'Server o canale non valido' });
+    if (!(await canManageGuild(req.session.user.id, guild))) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
     const m = data.when.trim().match(/^(\d+)\s*(s|m|h|d)$/i);
     if (!m) return res.status(400).json({ error: 'Formato tempo non valido (es. 10m, 1h, 2d)' });
     const n = parseInt(m[1], 10);
@@ -1001,7 +1072,7 @@ function renderLayout(user, page, params = {}, security = {}) {
     else alert('Errore logout globale');
   }
 </script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, "Segoe UI", sans-serif; background: #1a1a1a; color: #eee; padding: 24px; }
@@ -1099,6 +1170,22 @@ function renderLayout(user, page, params = {}, security = {}) {
 function escapeHtml(str) {
   if (str === null || str === undefined) return '';
   return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+// Serializza dati dentro un <script> senza poter chiudere il tag
+function safeJson(v) {
+  return JSON.stringify(v)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 // ---------- DASHBOARD ----------
@@ -1450,6 +1537,8 @@ function renderCommandsContent() {
 
 // ---------- CONFIG ----------
 function renderConfigContent() {
+  // NB: ${esc(guildId)} deve essere interpolato dal browser al render, quindi nel
+  // sorgente server è scritto con un solo backslash (\${...}) dentro il template.
   return `
   <div class="section">
     <h2>⚙️ Configurazione Server</h2>
@@ -1492,7 +1581,7 @@ function renderConfigContent() {
             <option value="">— Nessuno —</option>
             \${guild.roles.map(r => '<option value="' + esc(r.id) + '" ' + (config.autorole_id === r.id ? 'selected' : '') + '>' + esc(r.name) + '</option>').join('')}
           </select>
-          <button onclick="saveAutorole('\\\${esc(guildId)}')">Salva</button>
+          <button onclick="saveAutorole('\${esc(guildId)}')">Salva</button>
           <div id="autorole-msg"></div>
         </div>
 
@@ -1502,7 +1591,7 @@ function renderConfigContent() {
             <option value="">— Nessuno —</option>
             \${guild.channels.map(c => '<option value="' + esc(c.id) + '" ' + (config.log_channel_id === c.id ? 'selected' : '') + '>#' + esc(c.name) + '</option>').join('')}
           </select>
-          <button onclick="saveLogChannel('\\\${esc(guildId)}')">Salva</button>
+          <button onclick="saveLogChannel('\${esc(guildId)}')">Salva</button>
           <div id="logchannel-msg"></div>
         </div>
 
@@ -1519,8 +1608,8 @@ function renderConfigContent() {
             <input type="checkbox" id="cfg-welcomeembed" style="width:auto;margin-right:6px;" \${welcome.embed_enabled ? 'checked' : ''}>
             Usa formato embed
           </label>
-          <br><button onclick="saveWelcome('\\\${esc(guildId)}')">Salva</button>
-          <button class="secondary" onclick="testWelcome('\\\${esc(guildId)}')">🧪 Test Welcome</button>
+          <br><button onclick="saveWelcome('\${esc(guildId)}')">Salva</button>
+          <button class="secondary" onclick="testWelcome('\${esc(guildId)}')">🧪 Test Welcome</button>
           <div id="welcome-msg"></div>
         </div>
       </div>
@@ -1687,7 +1776,7 @@ function renderUserContent(userId) {
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  const USER_ID = ${JSON.stringify(userId)};
+  const USER_ID = ${safeJson(userId)};
   let chartInstance = null;
 
   async function loadUser() {
@@ -1769,7 +1858,7 @@ function renderSearchContent(q) {
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  const QUERY = ${JSON.stringify(q)};
+  const QUERY = ${safeJson(q)};
 
   async function doSearch() {
     const el = document.getElementById('search-content');
