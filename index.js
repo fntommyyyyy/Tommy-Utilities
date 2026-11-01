@@ -953,7 +953,8 @@ async function showStats(source, isSlash) {
 }
 
 // ==================== PURGE ====================
-async function purgeUser(source, targetUser, amount, executor, isSlash) {
+async function purgeMessages(source, amount, executor, isSlash) {
+  // Controllo permessi
   if (!executor.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
     return safeReplySource(source, {
       embeds: [EmbedManager.error('Accesso Negato', 'Non hai il permesso "Gestisci Messaggi".')],
@@ -973,44 +974,38 @@ async function purgeUser(source, targetUser, amount, executor, isSlash) {
   amount = Math.min(Math.max(amount || 100, 1), 100);
 
   try {
-    const messages = await channel.messages.fetch({ limit: 100 });
-    const toDelete = messages
-      .filter(m => m.author.id === targetUser.id)
-      .first(amount);
+    // Recupera gli ultimi `amount` messaggi (esclusi i messaggi del bot)
+    const messages = await channel.messages.fetch({ limit: amount });
+    
+    // Filtra i messaggi più vecchi di 14 giorni (Discord non permette di cancellarli in blocco)
+    const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    const deletable = messages.filter(m => m.createdTimestamp > fourteenDaysAgo);
 
-    if (!toDelete.length) {
+    if (!deletable.size) {
       return safeReplySource(source, {
-        embeds: [EmbedManager.info('Nessun messaggio', `Nessun messaggio recente di ${targetUser.username} trovato in questo canale.`)],
+        embeds: [EmbedManager.error('Errore', 'Nessun messaggio cancellabile trovato (potrebbero essere più vecchi di 14 giorni).')],
         ephemeral: isSlash
       }, isSlash);
     }
 
-    const deleted = await channel.bulkDelete(toDelete, true);
+    const deleted = await channel.bulkDelete(deletable, true);
 
     await ModLogModule.logUserAction(channel.guild, {
       type: 'Purge',
       title: 'Purge Messaggi',
-      targetId: targetUser.id,
-      target: `${targetUser.username} (${targetUser.id})`,
       moderator: `${executor.user ? executor.user.tag : executor.username} (${executor.id})`,
       channel: channel.name,
       reason: `Cancellati ${deleted.size} messaggi`
     });
 
     return safeReplySource(source, {
-      embeds: [EmbedManager.success('Purge Completato', `🧹 Cancellati **${deleted.size}** messaggi di ${targetUser.username} in ${channel}.`)],
+      embeds: [EmbedManager.success('Purge Completato', `🧹 Cancellati **${deleted.size}** messaggi in ${channel}.`)],
       ephemeral: isSlash
     }, isSlash);
   } catch (err) {
-    if (err.code === 50034) {
-      return safeReplySource(source, {
-        embeds: [EmbedManager.error('Errore', 'Non posso cancellare messaggi più vecchi di 14 giorni.')],
-        ephemeral: isSlash
-      }, isSlash);
-    }
-    log.err('purgeUser', err);
+    log.err('purgeMessages', err);
     return safeReplySource(source, {
-      embeds: [EmbedManager.error('Errore', 'Errore durante la cancellazione.')],
+      embeds: [EmbedManager.error('Errore', 'Errore durante la cancellazione dei messaggi.')],
       ephemeral: isSlash
     }, isSlash);
   }
