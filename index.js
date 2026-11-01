@@ -1260,6 +1260,18 @@ const CommandLogic = {
       return { success: false, message: '❌ Non posso bannare questo utente!' };
     if (member && !outranks(executor, member, guild))
       return { success: false, message: '❌ Non puoi bannare un utente con ruolo uguale o superiore al tuo!' };
+    // --- INIZIO INVIO DM ---
+    try {
+      const targetUser = await clientRef.users.fetch(targetId).catch(() => null);
+      if (targetUser) {
+        await targetUser.send({
+          embeds: [EmbedManager.error('Sei stato bannato', `Sei stato bannato dal server **${guild.name}**.\n\n**Motivo:** ${reason}`)]
+        }).catch(() => {}); 
+      }
+    } catch (err) {
+      log.warn(`Impossibile inviare DM a ${targetId}`);
+    }
+    // --- FINE INVIO DM ---
 
     await guild.members.ban(targetId, { reason });
     await ModLogModule.logUserAction(guild, {
