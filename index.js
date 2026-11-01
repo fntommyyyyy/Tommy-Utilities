@@ -1291,18 +1291,43 @@ const CommandLogic = {
     try {
       const ban = await guild.bans.fetch(targetId);
       if (!ban) return { success: false, message: '❌ Utente non bannato!' };
-      // --- INIZIO INVIO DM UNBAN ---
+      // --- INIZIO INVIO DM UNBAN CON INVITO AUTO-GENERATO ---
       try {
         const targetUser = await clientRef.users.fetch(targetId).catch(() => null);
         if (targetUser) {
+          let inviteUrl = 'https://discord.gg/IL_TUO_LINK_DI_RISERVA'; // Link di riserva se non riesce a generarne uno
+          
+          // Cerca il primo canale di testo dove il bot ha i permessi
+          const invitableChannel = guild.channels.cache.find(c => 
+            c.type === ChannelType.GuildText && 
+            c.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.CreateInstantInvite)
+          );
+
+          if (invitableChannel) {
+            try {
+              const invite = await invitableChannel.createInvite({
+                maxUses: 1,
+                maxAge: 3600, // 1 ora
+                unique: true,
+                reason: `Invito per utente sbannato (${targetId})`
+              });
+              inviteUrl = invite.url;
+            } catch (e) {
+              log.warn(`Impossibile creare invito per unban: ${e.message}`);
+            }
+          }
+
           await targetUser.send({
-            embeds: [EmbedManager.success('Sei stato sbannato', `Sei stato sbannato dal server **${guild.name}**.\n\nOra puoi rientrare se lo desideri.`)]
+            embeds: [EmbedManager.success(
+              'Sei stato sbannato', 
+              `Sei stato sbannato dal server **${guild.name}**.\n\nRientra qui:\n👉 ${inviteUrl}`
+            )]
           }).catch(() => {});
         }
       } catch (err) {
         log.warn(`Impossibile inviare DM di unban a ${targetId}`);
       }
-      // --- FINE INVIO DM UNBAN ---
+      // --- FINE INVIO DM UNBAN CON INVITO AUTO-GENERATO ---
 
       await guild.bans.remove(targetId);
       await ModLogModule.logUserAction(guild, {
