@@ -225,9 +225,22 @@ function escHtml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+async function fetchAllMessages(channel, maxMessages = 5000) {
+  const all = [];
+  let before;
+  while (all.length < maxMessages) {
+    const batch = await channel.messages.fetch({ limit: 100, before }).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    all.push(...batch.values());
+    before = batch.last().id;
+    if (batch.size < 100) break;
+  }
+  return all; // dal più recente al più vecchio
+}
+
 async function buildTranscriptHtml(channel) {
-  const msgs = await channel.messages.fetch({ limit: 100 }).catch(() => null);
-  if (!msgs) return null;
+  const msgs = await fetchAllMessages(channel);
+  if (!msgs.length) return null;
 
   let html = '<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><title>Transcript #' + escHtml(channel.name) + '</title>'
     + '<style>body{font-family:sans-serif;background:#36393f;color:#dcddde;padding:20px;max-width:800px;margin:auto}'
@@ -238,7 +251,7 @@ async function buildTranscriptHtml(channel) {
     + 'img.attach{max-width:300px;border-radius:6px;margin-top:6px}</style></head><body>';
   html += '<h1>Transcript: #' + escHtml(channel.name) + '</h1>';
 
-  const sorted = [...msgs.values()].reverse();
+  const sorted = [...msgs].reverse();
   for (const m of sorted) {
     const avatar = escHtml(m.author.displayAvatarURL());
     const username = escHtml(m.author.username);
@@ -306,8 +319,28 @@ const TICKET_COOLDOWN_MS = 5 * 60 * 1000;
 const CLOSE_DELAY_MS = 3000;
 const closingTickets = new Set();
 const ticketCooldowns = new Map();
+const creatingTickets = new Set();
 
 async function createTicket(source, user) {
+  const isSlash = isInteractionSource(source);
+  const lockKey = `${source.guild.id}:${user.id}`;
+
+  if (creatingTickets.has(lockKey)) {
+    return safeReplySource(source, {
+      embeds: [EmbedManager.info('Attendi', 'Stai già aprendo un ticket, attendi un momento.')],
+      ephemeral: true
+    }, isSlash);
+  }
+
+  creatingTickets.add(lockKey);
+  try {
+    return await createTicketUnsafe(source, user);
+  } finally {
+    creatingTickets.delete(lockKey);
+  }
+}
+
+async function createTicketUnsafe(source, user) {
   const guild = source.guild;
   const isSlash = isInteractionSource(source);
 
@@ -654,6 +687,32 @@ function isServerAuthorized(guildId) {
   return BLACKLIST_ADMIN_SERVERS.includes(guildId);
 }
 
+async function sendWelcome(member) {
+  const config = storage.getWelcomeConfig(member.guild.id);
+  if (!config?.channel_id) return;
+  const channel = member.guild.channels.cache.get(config.channel_id);
+  if (!channel || !channel.isTextBased()) return;
+
+  const text = String(config.message || 'Benvenuto {user} in {server}!')
+    .replace(/{user}/g, `<@${member.id}>`)
+    .replace(/{username}/g, member.user.username)
+    .replace(/{server}/g, member.guild.name)
+    .replace(/{memberCount}/g, member.guild.memberCount);
+
+  if (config.embed_enabled) {
+    const embed = new EmbedBuilder()
+      .setTitle('👋 Benvenuto!')
+      .setDescription(text)
+      .setColor(0x00FF00)
+      .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+      .setFooter({ text: `Sei il membro #${member.guild.memberCount}` })
+      .setTimestamp();
+    await channel.send({ embeds: [embed] });
+  } else {
+    await channel.send({ content: text, allowedMentions: { parse: ['users'] } });
+  }
+}
+
 async function handleGuildMemberAdd(member) {
   if (storage.isBlacklisted(member.user.id)) {
     const entry = storage.getBlacklistEntry(member.user.id);
@@ -690,6 +749,12 @@ async function handleGuildMemberAdd(member) {
     }
   } catch (err) {
     log.err('handleGuildMemberAdd autorole', err);
+  }
+
+  try {
+    await sendWelcome(member);
+  } catch (err) {
+    log.err('handleGuildMemberAdd welcome', err);
   }
 }
 
@@ -974,9 +1039,9 @@ async function purgeMessages(source, amount, executor, isSlash) {
   amount = Math.min(Math.max(amount || 100, 1), 100);
 
   try {
-    // Recupera gli ultimi `amount` messaggi (esclusi i messaggi del bot)
+    // Recupera gli ultimi `amount` messaggi
     const messages = await channel.messages.fetch({ limit: amount });
-    
+
     // Filtra i messaggi più vecchi di 14 giorni (Discord non permette di cancellarli in blocco)
     const fourteenDaysAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
     const deletable = messages.filter(m => m.createdTimestamp > fourteenDaysAgo);
@@ -1255,13 +1320,13 @@ const CommandLogic = {
       return { success: false, message: '❌ Non posso bannare questo utente!' };
     if (member && !outranks(executor, member, guild))
       return { success: false, message: '❌ Non puoi bannare un utente con ruolo uguale o superiore al tuo!' };
-    // --- INIZIO INVIO DM ---
+    // --- INVIO DM (prima del ban: dopo il ban il bot potrebbe non condividere più un server con l'utente) ---
     try {
       const targetUser = await clientRef.users.fetch(targetId).catch(() => null);
       if (targetUser) {
         await targetUser.send({
           embeds: [EmbedManager.error('Sei stato bannato', `Sei stato bannato dal server **${guild.name}**.\n\n**Motivo:** ${reason}`)]
-        }).catch(() => {}); 
+        }).catch(() => {});
       }
     } catch (err) {
       log.warn(`Impossibile inviare DM a ${targetId}`);
@@ -1291,45 +1356,55 @@ const CommandLogic = {
     try {
       const ban = await guild.bans.fetch(targetId);
       if (!ban) return { success: false, message: '❌ Utente non bannato!' };
-      // --- INIZIO INVIO DM UNBAN CON INVITO AUTO-GENERATO ---
+
+      // 1) Sban per primo: se fallisce, non parte nessun DM
+      await guild.bans.remove(targetId);
+
+      // 2) Invito monouso (se non riesce, il DM arriva senza bottone)
+      let inviteUrl = null;
+      const invitableChannel = guild.channels.cache.find(c =>
+        c.type === ChannelType.GuildText &&
+        c.permissionsFor(botMember)?.has(PermissionsBitField.Flags.CreateInstantInvite)
+      );
+      if (invitableChannel) {
+        try {
+          const invite = await invitableChannel.createInvite({
+            maxUses: 1,
+            maxAge: 3600,
+            unique: true,
+            reason: `Invito per utente sbannato (${targetId})`
+          });
+          inviteUrl = invite.url;
+        } catch (e) {
+          log.warn(`Impossibile creare invito per unban: ${e.message}`);
+        }
+      }
+
+      // 3) DM con bottone link sotto il messaggio
       try {
         const targetUser = await clientRef.users.fetch(targetId).catch(() => null);
         if (targetUser) {
-          let inviteUrl = 'https://discord.gg/IL_TUO_LINK_DI_RISERVA'; // Link di riserva se non riesce a generarne uno
-          
-          // Cerca il primo canale di testo dove il bot ha i permessi
-          const invitableChannel = guild.channels.cache.find(c => 
-            c.type === ChannelType.GuildText && 
-            c.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.CreateInstantInvite)
-          );
+          const description = inviteUrl
+            ? `Sei stato sbannato dal server **${guild.name}**.\n\nUsa il pulsante qui sotto per rientrare. L'invito è valido per 1 utilizzo e scade tra 60 minuti.`
+            : `Sei stato sbannato dal server **${guild.name}**.`;
 
-          if (invitableChannel) {
-            try {
-              const invite = await invitableChannel.createInvite({
-                maxUses: 1,
-                maxAge: 3600, // 1 ora
-                unique: true,
-                reason: `Invito per utente sbannato (${targetId})`
-              });
-              inviteUrl = invite.url;
-            } catch (e) {
-              log.warn(`Impossibile creare invito per unban: ${e.message}`);
-            }
+          const payload = { embeds: [EmbedManager.success('Sei stato sbannato', description)] };
+          if (inviteUrl) {
+            payload.components = [
+              new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                  .setLabel('Rientra nel server')
+                  .setStyle(ButtonStyle.Link)
+                  .setURL(inviteUrl)
+              )
+            ];
           }
-
-          await targetUser.send({
-            embeds: [EmbedManager.success(
-              'Sei stato sbannato', 
-              `Sei stato sbannato dal server **${guild.name}**.\n\nRientra qui:\n👉 ${inviteUrl}`
-            )]
-          }).catch(() => {});
+          await targetUser.send(payload).catch(() => {});
         }
       } catch (err) {
         log.warn(`Impossibile inviare DM di unban a ${targetId}`);
       }
-      // --- FINE INVIO DM UNBAN CON INVITO AUTO-GENERATO ---
 
-      await guild.bans.remove(targetId);
       await ModLogModule.logUserAction(guild, {
         type: 'Unban', title: 'Unban', targetId,
         target: `${ban.user.tag} (${targetId})`,
@@ -1628,15 +1703,7 @@ let features = [];
 try {
   features = require('./features');
   log.ok(`📦 Caricamento ${features.length} feature(s)...`);
-  const ctx = {
-    client: null, storage, log, EmbedManager,
-    safeReply, safeReplySource, hasStaffOrAdmin, isAdmin
-  };
   for (const feature of features) {
-    if (feature.setup) {
-      try { feature.setup(ctx); log.ok(`   ✅ Feature "${feature.name}" caricata`); }
-      catch (e) { log.err(`Feature "${feature.name}" setup`, e); }
-    }
     if (Array.isArray(feature.slashCommands)) {
       slashCommands.push(...feature.slashCommands);
     }
@@ -1659,12 +1726,13 @@ const client = new Client({
 });
 clientRef = client;
 
-for (const f of features) {
-  if (f.setup && !f._ctxClient) {
-    try {
-      f.setup({ client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin });
-      f._ctxClient = true;
-    } catch (e) { log.err(`Feature "${f.name}" re-setup`, e); }
+for (const feature of features) {
+  if (!feature.setup) continue;
+  try {
+    feature.setup({ client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin });
+    log.ok(`   ✅ Feature "${feature.name}" caricata`);
+  } catch (e) {
+    log.err(`Feature "${feature.name}" setup`, e);
   }
 }
 
@@ -1694,6 +1762,17 @@ setInterval(async () => {
 }, 30 * 1000).unref?.();
 
 // ==================== PREFIX COMMANDS ====================
+const BUILTIN_PREFIX_COMMANDS = new Set([
+  'help', 'stats', 'ping', 'uptime', 'kick', 'ban', 'unban', 'clear', 'purge', 'invite',
+  'giverole', 'removerole', 'roles', 'lock', 'unlock', 'addcmd', 'delcmd', 'listcmd', 'cmds',
+  'remind', 'reminder', 'ticketpanel', 'ticket', 'close', 'userinfo', 'warn', 'timeout',
+  'modlogs', 'md', 'dashboard', 'bl', 'blacklist', 'note', 'notes', 'autorole', 'welcome'
+]);
+
+function isReservedCommandName(name) {
+  return BUILTIN_PREFIX_COMMANDS.has(name) || slashCommands.some(c => c.name === name);
+}
+
 async function handlePrefixCommand(message) {
   if (message.author.bot) return;
   if (!message.guild) return;
@@ -1708,8 +1787,10 @@ async function handlePrefixCommand(message) {
 
   const { guild, channel, member } = message;
 
-  const custom = storage.getCommand(commandName);
-  if (custom) {
+  // Solo comandi integrati o custom esistenti rispondono: "-lol" viene ignorato senza cooldown
+  if (!BUILTIN_PREFIX_COMMANDS.has(commandName)) {
+    const custom = storage.getCommand(commandName);
+    if (!custom) return;
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
       await message.delete().catch(err => log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`));
     }
@@ -1833,6 +1914,8 @@ async function handlePrefixCommand(message) {
         const name = args.shift()?.toLowerCase();
         const resp = args.join(' ');
         if (!name || !resp) return message.reply({ embeds: [EmbedManager.error('Sintassi', 'Uso: `-addcmd <nome> <risposta>`')] });
+        if (isReservedCommandName(name))
+          return message.reply({ embeds: [EmbedManager.error('Nome riservato', `\`${name}\` è il nome di un comando integrato.`)] });
         if (resp.length > 4096) return message.reply({ embeds: [EmbedManager.error('Troppo lungo', 'Max 4096 caratteri.')] });
         storage.saveCommand(name, resp);
         return message.reply({ embeds: [EmbedManager.success('Comando Aggiunto', `"${name}" salvato.`)] });
@@ -2412,6 +2495,8 @@ async function handleSlashCommand(interaction) {
         return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Solo Admin.')], ephemeral: true });
       const name = interaction.options.getString('nome').toLowerCase();
       const resp = interaction.options.getString('risposta');
+      if (isReservedCommandName(name))
+        return safeReply(interaction, { embeds: [EmbedManager.error('Nome riservato', `\`${name}\` è il nome di un comando integrato.`)], ephemeral: true });
       if (resp.length > 4096) return safeReply(interaction, { embeds: [EmbedManager.error('Troppo lungo', 'Max 4096.')], ephemeral: true });
       storage.saveCommand(name, resp);
       return interaction.reply({ embeds: [EmbedManager.success('Comando Aggiunto', `"${name}" salvato.`)], ephemeral: true });
@@ -2685,7 +2770,7 @@ async function registerSlashCommands(clientId, token) {
         await rest.put(Routes.applicationCommands(clientId), { body: [] });
         log.info('✅ Comandi globali cancellati');
       } catch (err) { log.warn('Errore cancellazione comandi globali:', err.message); }
-      
+
       try {
         await rest.put(Routes.applicationGuildCommands(clientId, GUILD_ID), { body: [] });
         log.info('✅ Comandi guild cancellati');
@@ -2723,7 +2808,7 @@ let webServer = null;
     await client.login(TOKEN);
     log.ok('✅ Bot online');
 
-    webServer = createWebServer({ storage, client, log, botStartTime });
+    webServer = createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml });
 
     registerSlashCommands(CLIENT_ID, TOKEN).catch(err => {
       log.err('❌ Registrazione comandi fallita (ma il bot è online)', err);
@@ -2734,10 +2819,16 @@ let webServer = null;
   }
 })();
 
-process.on('SIGINT', async () => {
-  log.warn('Shutdown...');
-  if (webServer) try { webServer.close(); } catch {}
-  if (typeof storage.close === 'function') { try { storage.close(); } catch {} }
+// ==================== SHUTDOWN (SIGINT + SIGTERM) ====================
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.warn(`Shutdown (${signal})...`);
+  try { if (webServer) webServer.close(); } catch {}
+  try { if (typeof storage.close === 'function') storage.close(); } catch {}
   try { client.destroy(); } catch {}
   setTimeout(() => process.exit(0), 500);
-});
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
