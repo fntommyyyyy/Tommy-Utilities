@@ -1296,6 +1296,19 @@ const CommandLogic = {
     try {
       const ban = await guild.bans.fetch(targetId);
       if (!ban) return { success: false, message: '❌ Utente non bannato!' };
+      // --- INIZIO INVIO DM UNBAN ---
+      try {
+        const targetUser = await clientRef.users.fetch(targetId).catch(() => null);
+        if (targetUser) {
+          await targetUser.send({
+            embeds: [EmbedManager.success('Sei stato sbannato', `Sei stato sbannato dal server **${guild.name}**.\n\nOra puoi rientrare se lo desideri.`)]
+          }).catch(() => {});
+        }
+      } catch (err) {
+        log.warn(`Impossibile inviare DM di unban a ${targetId}`);
+      }
+      // --- FINE INVIO DM UNBAN ---
+
       await guild.bans.remove(targetId);
       await ModLogModule.logUserAction(guild, {
         type: 'Unban', title: 'Unban', targetId,
