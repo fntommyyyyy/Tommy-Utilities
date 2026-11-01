@@ -1542,9 +1542,8 @@ const slashCommands = [
     .addStringOption(o => o.setName('id').setDescription('ID utente').setRequired(true)),
   new SlashCommandBuilder().setName('clear').setDescription('Cancella messaggi (1-100)')
     .addIntegerOption(o => o.setName('quantita').setDescription('Numero messaggi').setRequired(true)),
-  new SlashCommandBuilder().setName('purge').setDescription('Cancella i messaggi di un utente nel canale')
-    .addUserOption(o => o.setName('utente').setDescription('Utente').setRequired(true))
-    .addIntegerOption(o => o.setName('quantita').setDescription('Numero max messaggi (1-100, default 100)')),
+  new SlashCommandBuilder().setName('purge').setDescription('Cancella gli ultimi messaggi nel canale')
+    .addIntegerOption(o => o.setName('quantita').setDescription('Numero di messaggi da cancellare (1-100)').setRequired(true)),
   new SlashCommandBuilder().setName('modlogs').setDescription('Mostra log moderazione')
     .addUserOption(o => o.setName('utente').setDescription('Utente').setRequired(true)),
 
@@ -1770,13 +1769,9 @@ async function handlePrefixCommand(message) {
         return replyMethod({ ...r, title: 'Clear' });
       }
       case 'purge': {
-        if (!args[0]) return message.reply('❌ Uso: `-purge <@utente o ID> [quantità]`');
-        const id = extractUserId(args[0]);
-        if (!id) return message.reply('❌ ID utente non valido!');
-        let target;
-        try { target = await client.users.fetch(id); } catch { return message.reply('❌ Utente non trovato.'); }
-        const amount = parseInt(args[1]) || 100;
-        return purgeUser(message, target, amount, member, false);
+        const amount = parseInt(args[0]);
+        if (isNaN(amount)) return message.reply('❌ Uso: `-purge <1-100>`');
+        return purgeMessages(message, amount, member, false);
       }
       case 'invite': {
         if (!args[0]) return message.reply('❌ Uso: `-invite <id o @utente>`');
@@ -2378,9 +2373,8 @@ async function handleSlashCommand(interaction) {
       return;
     }
     case 'purge': {
-      const u = interaction.options.getUser('utente');
       const amount = interaction.options.getInteger('quantita') || 100;
-      return purgeUser(interaction, u, amount, member, true);
+      return purgeMessages(interaction, amount, member, true);
     }
     case 'modlogs': {
       if (!hasStaffOrAdmin(member))
