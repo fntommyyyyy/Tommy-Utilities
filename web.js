@@ -86,6 +86,16 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     return true;
   }
 
+  // Note dei soli server autorizzati, lette direttamente dal DB (nessun limite a 500)
+  function notesForGuilds(allowed, limit = 1000) {
+    const ids = [...allowed];
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return storage.db
+      .prepare(`SELECT * FROM member_notes WHERE guild_id IN (${placeholders}) ORDER BY id DESC LIMIT ?`)
+      .all(...ids, limit);
+  }
+
   // ==================== HELMET ====================
   app.use(helmet({
     contentSecurityPolicy: {
@@ -354,7 +364,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         }
       }
       let notesCount = 0, transcriptsCount = 0, remindersCount = 0;
-      try { notesCount = storage.getAllNotes().filter(n => allowed.has(n.guild_id)).length; } catch {}
+      try {
+        const perGuild = storage.db.prepare('SELECT guild_id, COUNT(*) AS c FROM member_notes GROUP BY guild_id').all();
+        notesCount = perGuild.filter(r => allowed.has(r.guild_id)).reduce((sum, r) => sum + r.c, 0);
+      } catch {}
       try { transcriptsCount = storage.countTranscripts ? storage.countTranscripts() : 0; } catch {}
       try { remindersCount = storage.countReminders ? storage.countReminders() : 0; } catch {}
       res.json({
@@ -404,14 +417,14 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   app.get('/api/notes/all', requireAuth, async (req, res) => {
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
-      res.json(storage.getAllNotes().filter(n => allowed.has(n.guild_id)));
-    } catch (e) { res.json([]); }
+      res.json(notesForGuilds(allowed));
+    } catch (e) { apiError(res, e); }
   });
   app.delete('/api/notes/:id', requireAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'ID non valido' });
     try {
-      const note = storage.getAllNotes().find(n => n.id === id);
+      const note = storage.db.prepare('SELECT id, guild_id FROM member_notes WHERE id = ?').get(id);
       if (!note) return res.status(404).json({ error: 'Nota non trovata' });
       const allowed = await allowedGuildIds(req.session.user.id);
       if (!allowed.has(note.guild_id)) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
@@ -423,11 +436,13 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!data) return;
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
-      const byId = new Map(storage.getAllNotes().map(n => [n.id, n]));
+      const lookup = storage.db.prepare('SELECT id, guild_id FROM member_notes WHERE id = ?');
       let count = 0;
-      for (const id of data.ids) {
-        const note = byId.get(parseInt(id, 10));
-        if (note && allowed.has(note.guild_id) && storage.deleteNoteById(note.id)) count++;
+      for (const raw of data.ids) {
+        const id = parseInt(raw, 10);
+        if (!Number.isInteger(id) || id <= 0) continue;
+        const note = lookup.get(id);
+        if (note && allowed.has(note.guild_id) && storage.deleteNoteById(id)) count++;
       }
       res.json({ ok: true, count });
     } catch (e) { apiError(res, e); }
@@ -473,7 +488,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         if (data.channelId) storage.setWelcomeChannel(guildId, data.channelId);
         else storage.disableWelcome(guildId);
       }
-      if (data.message !== undefined && data.message !== null) storage.setWelcomeMessage(guildId, data.message);
+      if (data.message !== undefined && data.message !== null) {
+        if (data.message.trim()) storage.setWelcomeMessage(guildId, data.message);
+        else storage.clearWelcomeMessage(guildId);
+      }
       if (data.embedEnabled !== undefined) {
         const current = storage.getWelcomeConfig(guildId);
         storage.setWelcomeConfig(guildId, { channelId: current?.channel_id ?? null, message: current?.message ?? null, embedEnabled: data.embedEnabled });
@@ -667,8 +685,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
       const logs = storage.getLogsForUser(userId);
-      const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 100').all(userId)
-        .filter(n => allowed.has(n.guild_id));
+      const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 1000').all(userId)
+        .filter(n => allowed.has(n.guild_id))
+        .slice(0, 100);
       const blacklistEntry = storage.getBlacklistEntry(userId);
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
@@ -691,7 +710,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
       const blacklist = storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q));
-      const notes = storage.getAllNotes().filter(n => allowed.has(n.guild_id) && ((n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q)));
+      const notes = notesForGuilds(allowed, 5000).filter(n => (n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q));
       const logs = storage.getAllLogs(500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
@@ -732,7 +751,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
       const csv = toCsv(
-        storage.getAllNotes().filter(n => allowed.has(n.guild_id)),
+        notesForGuilds(allowed, 100000),
         ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']
       );
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -985,23 +1004,24 @@ function renderLayout(user, page, params = {}, security = {}) {
   const csrfToken = security.csrfToken || '';
   const safeQ = escapeHtml(params.q || '');
 
-  const pages = {
-    dashboard: renderDashboardContent(),
-    modlogs: renderModlogsContent(),
-    notes: renderNotesContent(),
-    tickets: renderTicketsContent(),
-    commands: renderCommandsContent(),
-    config: renderConfigContent(),
-    charts: renderChartsContent(),
-    top: renderTopContent(),
-    user: renderUserContent(params.userId),
-    search: renderSearchContent(params.q || ''),
-    accesslogs: renderAccessLogsContent(),
-    messages: renderMessagesContent(),
-    userActions: renderUserActionsContent(params.userId || ''),
-    reminders: renderRemindersContent()
-    // antinuke rimosso
+  // Ogni pagina viene generata solo quando è quella richiesta
+  const renderers = {
+    dashboard: () => renderDashboardContent(),
+    modlogs: () => renderModlogsContent(),
+    notes: () => renderNotesContent(),
+    tickets: () => renderTicketsContent(),
+    commands: () => renderCommandsContent(),
+    config: () => renderConfigContent(),
+    charts: () => renderChartsContent(),
+    top: () => renderTopContent(),
+    user: () => renderUserContent(params.userId),
+    search: () => renderSearchContent(params.q || ''),
+    accesslogs: () => renderAccessLogsContent(),
+    messages: () => renderMessagesContent(),
+    userActions: () => renderUserActionsContent(params.userId || ''),
+    reminders: () => renderRemindersContent()
   };
+  const body = renderers[page] ? renderers[page]() : '<p>Pagina non trovata</p>';
 
   return `<!DOCTYPE html>
 <html lang="it">
@@ -1162,7 +1182,7 @@ function renderLayout(user, page, params = {}, security = {}) {
     <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
   </nav>
 
-  ${pages[page] || '<p>Pagina non trovata</p>'}
+  ${body}
 </body>
 </html>`;
 }
@@ -1178,9 +1198,10 @@ function safeEqual(a, b) {
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
-// Serializza dati dentro un <script> senza poter chiudere il tag
+// Serializza dati dentro un <script> senza poter chiudere il tag.
+// undefined diventa null, così non si tenta mai di fare .replace su undefined.
 function safeJson(v) {
-  return JSON.stringify(v)
+  return JSON.stringify(v ?? null)
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
     .replace(/&/g, '\\u0026')
@@ -1537,8 +1558,8 @@ function renderCommandsContent() {
 
 // ---------- CONFIG ----------
 function renderConfigContent() {
-  // NB: ${esc(guildId)} deve essere interpolato dal browser al render, quindi nel
-  // sorgente server è scritto con un solo backslash (\${...}) dentro il template.
+  // NB: nel template server-side ${...} con un solo backslash (\${...}) viene
+  // scritto come ${...} nel browser, dove si interpola con il guildId reale.
   return `
   <div class="section">
     <h2>⚙️ Configurazione Server</h2>
