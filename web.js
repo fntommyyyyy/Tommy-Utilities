@@ -1,4 +1,4 @@
-// web.js — Dashboard web (sicurezza + pulsanti funzionanti)
+// web.js — Dashboard web (sicurezza + azioni di moderazione allineate al bot)
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -7,13 +7,21 @@ const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const {
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ChannelType,
+  PermissionsBitField
+} = require('discord.js');
 
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
 
-function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml }) {
+function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml, modLog: modLogFn }) {
   const app = express();
   const PORT = parseInt(process.env.PORT) || 3000;
   const HOST = process.env.WEB_HOST || '0.0.0.0';
@@ -94,6 +102,141 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     return storage.db
       .prepare(`SELECT * FROM member_notes WHERE guild_id IN (${placeholders}) ORDER BY id DESC LIMIT ?`)
       .all(...ids, limit);
+  }
+
+  // ==================== HELPER AZIONI (allineati al bot) ====================
+  function dashActor(req) {
+    const u = req.session.user;
+    return { id: u.id, name: u.username, label: `${u.username} (${u.id}) [dashboard]` };
+  }
+  function dashMod(req) {
+    return dashActor(req).label;
+  }
+
+  // Scrive nel DB e, se disponibile, nel canale mod-log (stessa logica del bot)
+  async function logMod(guild, data) {
+    try {
+      if (typeof modLogFn === 'function') await modLogFn(guild, data);
+      else storage.saveLog(data);
+    } catch (err) { log.err('logMod', err); }
+  }
+
+  async function dmUser(userId, payload) {
+    try {
+      const user = await client.users.fetch(userId).catch(() => null);
+      if (!user) return false;
+      await user.send(payload);
+      return true;
+    } catch { return false; }
+  }
+
+  // Il dashboard agisce con i permessi gerarchici dell'utente loggato
+  async function actorCanActOn(guild, actorId, target) {
+    if (ENV_ADMIN_IDS.includes(actorId)) return true;
+    const actor = await guild.members.fetch(actorId).catch(() => null);
+    if (!actor) return false;
+    if (guild.ownerId === actor.id) return true;
+    if (target.id === guild.ownerId) return false;
+    return actor.roles.highest.position > target.roles.highest.position;
+  }
+
+  async function actorCanGrantRole(guild, actorId, role) {
+    if (ENV_ADMIN_IDS.includes(actorId)) return true;
+    const actor = await guild.members.fetch(actorId).catch(() => null);
+    if (!actor) return false;
+    if (guild.ownerId === actor.id) return true;
+    return role.position < actor.roles.highest.position;
+  }
+
+  async function createSingleUseInvite(guild, reason) {
+    const botMember = guild.members.me;
+    const ch = guild.channels.cache.find(c =>
+      c.type === ChannelType.GuildText &&
+      c.permissionsFor(botMember)?.has(PermissionsBitField.Flags.CreateInstantInvite)
+    );
+    if (!ch) return null;
+    try {
+      const invite = await ch.createInvite({ maxUses: 1, maxAge: 3600, unique: true, reason });
+      return invite.url;
+    } catch (e) {
+      log.warn(`Impossibile creare invito: ${e.message}`);
+      return null;
+    }
+  }
+
+  // Sban + invito monouso + DM con bottone (identico al comando -unban del bot)
+  async function unbanWithInvite(guild, targetId, moderatorName) {
+    await guild.bans.remove(targetId, `Sbannato dalla dashboard (${moderatorName})`);
+    const inviteUrl = await createSingleUseInvite(guild, `Invito per utente sbannato (${targetId})`);
+    const description = inviteUrl
+      ? `Sei stato sbannato dal server **${guild.name}**.\n\nUsa il pulsante qui sotto per rientrare. L'invito è valido per 1 utilizzo e scade tra 60 minuti.`
+      : `Sei stato sbannato dal server **${guild.name}**.`;
+    const payload = { embeds: [makeEmbed('Sei stato sbannato', description, 0x00FF00)] };
+    if (inviteUrl) {
+      payload.components = [
+        new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel('Rientra nel server').setStyle(ButtonStyle.Link).setURL(inviteUrl)
+        )
+      ];
+    }
+    await dmUser(targetId, payload);
+    return inviteUrl;
+  }
+
+  // Blacklist globale: DB + DM + ban su tutti i server dove l'utente è presente (come il bot)
+  async function blacklistAddFull(targetId, username, reason, mod) {
+    storage.addToBlacklist(targetId, username, reason, mod.id, mod.name);
+    await dmUser(targetId, { embeds: [makeEmbed('Aggiunto alla Blacklist Globale', `Sei stato aggiunto alla blacklist globale.\n**Motivo:** ${reason}`, 0x8B0000)] });
+    let bannedIn = 0;
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const member = await guild.members.fetch(targetId).catch(() => null);
+        if (!member) continue;
+        await guild.members.ban(targetId, { reason: `[BLACKLIST GLOBALE] ${reason}` });
+        await logMod(guild, {
+          type: 'Blacklist Ban', title: 'Ban Globale (Blacklist)', targetId,
+          target: `${username} (${targetId})`, moderator: mod.label, reason
+        });
+        bannedIn++;
+      } catch (err) { log.err(`ban ${guild.name}`, err); }
+    }
+    return bannedIn;
+  }
+
+  // Rimozione dalla blacklist: DB + unban su tutti i server + DM (come il bot)
+  async function blacklistRemoveFull(targetId, mod) {
+    const entry = storage.getBlacklistEntry(targetId);
+    storage.removeFromBlacklist(targetId);
+    const targetLabel = `${entry?.username || targetId} (${targetId})`;
+    let unbannedIn = 0;
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const ban = await guild.bans.fetch(targetId).catch(() => null);
+        if (!ban) continue;
+        await guild.bans.remove(targetId, `[BLACKLIST RIMOSSA] ${mod.name}`);
+        await logMod(guild, {
+          type: 'Blacklist Unban', title: 'Unban Globale (Blacklist Rimossa)', targetId,
+          target: targetLabel, moderator: mod.label, reason: 'Blacklist globale rimossa'
+        });
+        unbannedIn++;
+      } catch (err) { log.err(`unban ${guild.name}`, err); }
+    }
+    await dmUser(targetId, { embeds: [makeEmbed('Rimosso dalla Blacklist Globale', 'Sei stato rimosso dalla blacklist globale.', 0x00FF00)] });
+    return unbannedIn;
+  }
+
+  // Recupera un canale ticket e verifica i permessi; in caso di errore risponde e ritorna null
+  async function ticketChannelOrFail(req, res) {
+    const channelId = req.params.channelId;
+    if (!/^\d{17,20}$/.test(channelId)) { res.status(400).json({ error: 'ID canale non valido' }); return null; }
+    const ch = await client.channels.fetch(channelId).catch(() => null);
+    if (!ch || !ch.guild) { res.status(404).json({ error: 'Canale non trovato' }); return null; }
+    if (!ch.name?.startsWith('ticket-')) { res.status(400).json({ error: 'Non è un canale ticket' }); return null; }
+    if (!(await canManageGuild(req.session.user.id, ch.guild))) {
+      res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      return null;
+    }
+    return ch;
   }
 
   // ==================== HELMET ====================
@@ -203,6 +346,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   // ==================== ZOD ====================
   const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
   const guildIdSchema = z.string().regex(/^\d{17,20}$/, 'ID server non valido');
+  const channelIdSchema = z.string().regex(/^\d{17,20}$/, 'ID canale non valido');
+  const roleIdSchema = z.string().regex(/^\d{17,20}$/, 'ID ruolo non valido');
+  const reasonSchema = z.string().max(512).optional().default('');
 
   const schemaBlacklistAdd = z.object({ userId: userIdSchema, username: z.string().min(1).max(64), reason: z.string().min(1).max(500) });
   const schemaBulkDelete = z.object({ ids: z.array(z.union([z.string(), z.number()])).min(1).max(500) });
@@ -233,6 +379,15 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     content: z.string().min(1).max(500),
     when: z.string().min(1).max(20)
   });
+  const schemaModWarn = z.object({ guildId: guildIdSchema, userId: userIdSchema, reason: reasonSchema });
+  const schemaModTimeout = z.object({ guildId: guildIdSchema, userId: userIdSchema, seconds: z.number().int().min(1).max(2419200), reason: reasonSchema });
+  const schemaModClear = z.object({ guildId: guildIdSchema, channelId: channelIdSchema, amount: z.number().int().min(1).max(100) });
+  const schemaModLock = z.object({ guildId: guildIdSchema, channelId: channelIdSchema, reason: reasonSchema });
+  const schemaModUnlock = z.object({ guildId: guildIdSchema, channelId: channelIdSchema });
+  const schemaModInvite = z.object({ guildId: guildIdSchema, channelId: channelIdSchema, userId: userIdSchema });
+  const schemaModRole = z.object({ guildId: guildIdSchema, userId: userIdSchema, roleId: roleIdSchema, action: z.enum(['add', 'remove']) });
+  const schemaNoteAdd = z.object({ guildId: guildIdSchema, userId: userIdSchema, content: z.string().min(2).max(1000) });
+  const schemaTicketPriority = z.object({ priority: z.enum(['low', 'med', 'high', 'urgent']) });
 
   function parseOrFail(schema, data, res) {
     const r = schema.safeParse(data);
@@ -381,27 +536,37 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   app.get('/api/blacklist', requireAuth, (req, res) => {
     try { res.json(storage.getAllBlacklist()); } catch (e) { apiError(res, e); }
   });
-  app.post('/api/blacklist', requireAuth, (req, res) => {
+  app.post('/api/blacklist', actionLimiter, requireAuth, async (req, res) => {
     const data = parseOrFail(schemaBlacklistAdd, req.body || {}, res);
     if (!data) return;
     if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist il bot' });
     if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist te stesso' });
     try {
       if (storage.isBlacklisted(data.userId)) return res.status(409).json({ error: 'Già in blacklist' });
-      storage.addToBlacklist(data.userId, data.username, data.reason, req.session.user.id, req.session.user.username);
-      res.json({ ok: true });
+      const bannedIn = await blacklistAddFull(data.userId, data.username, data.reason, dashActor(req));
+      res.json({ ok: true, bannedIn });
     } catch (e) { apiError(res, e); }
   });
-  app.delete('/api/blacklist/:userId', requireAuth, (req, res) => {
+  app.delete('/api/blacklist/:userId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
-    try { res.json({ ok: storage.removeFromBlacklist(req.params.userId) }); } catch (e) { apiError(res, e); }
+    try {
+      if (!storage.isBlacklisted(req.params.userId)) return res.status(404).json({ error: 'Utente non in blacklist' });
+      const unbannedIn = await blacklistRemoveFull(req.params.userId, dashActor(req));
+      res.json({ ok: true, unbannedIn });
+    } catch (e) { apiError(res, e); }
   });
-  app.post('/api/blacklist/bulk-delete', requireAuth, (req, res) => {
+  app.post('/api/blacklist/bulk-delete', requireAuth, async (req, res) => {
     const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
     if (!data) return;
     try {
+      const mod = dashActor(req);
       let count = 0;
-      for (const id of data.ids) if (storage.removeFromBlacklist(String(id))) count++;
+      for (const raw of data.ids) {
+        const id = String(raw);
+        if (!/^\d{17,20}$/.test(id) || !storage.isBlacklisted(id)) continue;
+        await blacklistRemoveFull(id, mod);
+        count++;
+      }
       res.json({ ok: true, count });
     } catch (e) { apiError(res, e); }
   });
@@ -419,6 +584,24 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const allowed = await allowedGuildIds(req.session.user.id);
       res.json(notesForGuilds(allowed));
     } catch (e) { apiError(res, e); }
+  });
+  app.post('/api/notes', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaNoteAdd, req.body || {}, res);
+    if (!data) return;
+    const content = data.content.trim();
+    if (content.length < 2) return res.status(400).json({ error: 'Il contenuto della nota è troppo corto' });
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const target = await client.users.fetch(data.userId).catch(() => null);
+      if (!target) return res.status(404).json({ error: 'Utente non trovato' });
+      const id = storage.addNote(data.guildId, data.userId, req.session.user.id, req.session.user.username, content);
+      await logMod(guild, {
+        type: 'Nota Aggiunta', title: 'Nota Staff', targetId: data.userId,
+        target: `${target.username} (${target.id})`, moderator: dashMod(req), reason: content.slice(0, 500)
+      });
+      res.json({ ok: true, id });
+    } catch (e) { apiError(res, e, 'Errore salvataggio nota'); }
   });
   app.delete('/api/notes/:id', requireAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
@@ -512,7 +695,6 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!channel || !channel.isTextBased()) return res.status(400).json({ error: 'Canale welcome non valido' });
 
     try {
-      const { EmbedBuilder } = require('discord.js');
       const user = req.session.user;
       const fill = (t) => String(t || 'Benvenuto {user} in {server}!')
         .replace(/{user}/g, `<@${user.id}>`)
@@ -560,25 +742,52 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   });
 
   app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.channelId)) return res.status(400).json({ error: 'ID canale non valido' });
     try {
-      const ch = await client.channels.fetch(req.params.channelId).catch(() => null);
-      if (!ch) return res.status(404).json({ error: 'Canale non trovato' });
-      if (!ch.guild) return res.status(400).json({ error: 'Canale non appartenente a un server' });
-      if (!ch.name?.startsWith('ticket-')) return res.status(400).json({ error: 'Non è un canale ticket' });
-      if (!(await canManageGuild(req.session.user.id, ch.guild))) {
-        return res.status(403).json({ error: 'Non hai i permessi su questo server' });
-      }
-
+      const ch = await ticketChannelOrFail(req, res);
+      if (!ch) return;
+      const userId = ch.name.replace('ticket-', '');
       const html = await buildTranscriptHtml(ch);
+      const meta = storage.getTicketMeta ? storage.getTicketMeta(ch.id) : null;
       if (html && storage.saveTranscript) {
-        const meta = storage.getTicketMeta ? storage.getTicketMeta(ch.id) : null;
         storage.saveTranscript(
-          ch.id, ch.name, ch.name.replace('ticket-', ''),
+          ch.id, ch.name, userId,
           meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html
         );
       }
+      await logMod(ch.guild, {
+        type: 'Ticket Chiuso', title: 'Ticket Chiuso', targetId: userId,
+        target: userId, moderator: dashMod(req), channel: ch.name
+      });
       await ch.delete('Chiuso dalla dashboard web');
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e); }
+  });
+
+  app.post('/api/tickets/:channelId/claim', actionLimiter, requireAuth, async (req, res) => {
+    try {
+      const ch = await ticketChannelOrFail(req, res);
+      if (!ch) return;
+      storage.setTicketMeta(ch.id, { claimedById: req.session.user.id, claimedByTag: req.session.user.username });
+      await logMod(ch.guild, {
+        type: 'Ticket Claim', title: 'Ticket preso in carico', targetId: ch.name.replace('ticket-', ''),
+        target: ch.name, moderator: dashMod(req), channel: ch.name
+      });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e); }
+  });
+
+  app.post('/api/tickets/:channelId/priority', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaTicketPriority, req.body || {}, res);
+    if (!data) return;
+    try {
+      const ch = await ticketChannelOrFail(req, res);
+      if (!ch) return;
+      storage.setTicketMeta(ch.id, { priority: data.priority });
+      await logMod(ch.guild, {
+        type: 'Ticket Priorità', title: 'Priorità ticket', targetId: ch.name.replace('ticket-', ''),
+        target: ch.name, moderator: dashMod(req), channel: ch.name,
+        reason: `Priorità: ${data.priority.toUpperCase()}`
+      });
       res.json({ ok: true });
     } catch (e) { apiError(res, e); }
   });
@@ -594,7 +803,6 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         return res.status(403).json({ error: 'Non hai i permessi su questo server' });
       }
 
-      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
       const embed = new EmbedBuilder().setTitle('Pannello Ticket').setDescription('Premi il bottone qui sotto per aprire un ticket.').setColor(0x0099FF).setTimestamp();
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('create_ticket').setLabel('Apri Ticket').setStyle(ButtonStyle.Primary)
@@ -810,7 +1018,6 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const payload = { allowedMentions: { parse: ['users'] } };
       if (data.content) payload.content = data.content;
       if (data.embed && (data.embed.title || data.embed.description)) {
-        const { EmbedBuilder } = require('discord.js');
         const e = new EmbedBuilder();
         if (data.embed.title) e.setTitle(String(data.embed.title).slice(0, 256));
         if (data.embed.description) e.setDescription(String(data.embed.description).slice(0, 4096));
@@ -827,6 +1034,175 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       } catch {}
       res.json({ ok: true, messageId: sent.id, channelId: channel.id });
     } catch (e) { apiError(res, e, 'Errore invio messaggio'); }
+  });
+
+  // ---------- Moderazione canale (come -clear, -lock, -unlock del bot) ----------
+  app.post('/api/mod/clear', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModClear, req.body || {}, res);
+    if (!data) return;
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const channel = guild.channels.cache.get(data.channelId);
+      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale testuale non valido' });
+      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
+        return res.status(403).json({ error: 'Il bot non può gestire i messaggi in questo canale' });
+      }
+      const deleted = await channel.bulkDelete(data.amount, true);
+      await logMod(guild, {
+        type: 'Clear', title: 'Clear Messaggi', moderator: dashMod(req),
+        channel: channel.name, reason: `Cancellati ${deleted.size} messaggi`
+      });
+      res.json({ ok: true, count: deleted.size });
+    } catch (e) {
+      if (e?.code === 50034) return res.status(400).json({ error: 'Non posso cancellare messaggi più vecchi di 14 giorni' });
+      apiError(res, e, 'Errore pulizia messaggi');
+    }
+  });
+
+  app.post('/api/mod/lock', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModLock, req.body || {}, res);
+    if (!data) return;
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const channel = guild.channels.cache.get(data.channelId);
+      if (!channel) return res.status(404).json({ error: 'Canale non trovato' });
+      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageChannels)) {
+        return res.status(403).json({ error: 'Il bot non può gestire questo canale' });
+      }
+      const everyone = guild.roles.everyone;
+      const current = channel.permissionOverwrites.cache.get(everyone.id);
+      if (current && current.deny.has(PermissionsBitField.Flags.SendMessages)) {
+        return res.status(409).json({ error: 'Questo canale è già bloccato' });
+      }
+      await channel.permissionOverwrites.edit(everyone, { SendMessages: false });
+      await logMod(guild, {
+        type: 'Lock', title: 'Canale Bloccato', moderator: dashMod(req),
+        channel: channel.name, reason: data.reason || 'Nessun motivo'
+      });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore blocco canale'); }
+  });
+
+  app.post('/api/mod/unlock', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModUnlock, req.body || {}, res);
+    if (!data) return;
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const channel = guild.channels.cache.get(data.channelId);
+      if (!channel) return res.status(404).json({ error: 'Canale non trovato' });
+      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageChannels)) {
+        return res.status(403).json({ error: 'Il bot non può gestire questo canale' });
+      }
+      const everyone = guild.roles.everyone;
+      const current = channel.permissionOverwrites.cache.get(everyone.id);
+      if (!current || !current.deny.has(PermissionsBitField.Flags.SendMessages)) {
+        return res.status(409).json({ error: 'Questo canale non è bloccato' });
+      }
+      await channel.permissionOverwrites.delete(everyone);
+      await logMod(guild, {
+        type: 'Unlock', title: 'Canale Sbloccato', moderator: dashMod(req), channel: channel.name
+      });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore sblocco canale'); }
+  });
+
+  // ---------- Azioni su utente (come -warn, -timeout, -invite, -giverole, -removerole) ----------
+  app.post('/api/mod/warn', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModWarn, req.body || {}, res);
+    if (!data) return;
+    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
+    if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi warnare il bot' });
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const member = await guild.members.fetch(data.userId).catch(() => null);
+      if (!member) return res.status(404).json({ error: 'Utente non nel server' });
+      if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return res.status(403).json({ error: 'Non puoi warnare un admin' });
+      await logMod(guild, {
+        type: 'Warn', title: 'Warn', targetId: member.id, target: `${member.user.username} (${member.id})`,
+        moderator: dashMod(req), reason: data.reason || 'Nessun motivo specificato'
+      });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore warn'); }
+  });
+
+  app.post('/api/mod/timeout', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModTimeout, req.body || {}, res);
+    if (!data) return;
+    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
+    if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi fare timeout al bot' });
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const member = await guild.members.fetch(data.userId).catch(() => null);
+      if (!member) return res.status(404).json({ error: 'Utente non nel server' });
+      if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return res.status(403).json({ error: 'Non puoi fare timeout a un admin' });
+      if (!guild.members.me.permissions.has(PermissionsBitField.Flags.ModerateMembers)) return res.status(403).json({ error: 'Il bot non ha "Modera Membri"' });
+      if (!member.moderatable) return res.status(403).json({ error: 'Non posso fare timeout a questo utente' });
+      if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
+      const reason = data.reason || 'Nessun motivo specificato';
+      await member.timeout(data.seconds * 1000, reason);
+      await logMod(guild, {
+        type: 'Timeout', title: 'Timeout', targetId: member.id, target: `${member.user.username} (${member.id})`,
+        moderator: dashMod(req), reason, duration: formatDuration(data.seconds)
+      });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore timeout'); }
+  });
+
+  app.post('/api/mod/invite', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModInvite, req.body || {}, res);
+    if (!data) return;
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const channel = guild.channels.cache.get(data.channelId);
+      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale testuale non valido' });
+      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.CreateInstantInvite)) {
+        return res.status(403).json({ error: 'Il bot non può creare inviti in questo canale' });
+      }
+      const target = await client.users.fetch(data.userId).catch(() => null);
+      if (!target) return res.status(404).json({ error: 'Utente non trovato' });
+      const invite = await channel.createInvite({
+        maxUses: 1, maxAge: 3600, unique: true,
+        reason: `Invito dalla dashboard (${req.session.user.username})`
+      });
+      const text = `${req.session.user.username} ti ha inviato un invito per il server **${guild.name}**\n${invite.url}\nValido per 1 utilizzo, scade tra 60 minuti.`;
+      const sent = await dmUser(data.userId, { content: text });
+      if (sent) return res.json({ ok: true, via: 'dm' });
+      await channel.send({ content: `${target}\n${text}`, allowedMentions: { users: [data.userId] } }).catch(() => {});
+      res.json({ ok: true, via: 'channel' });
+    } catch (e) { apiError(res, e, 'Errore invito'); }
+  });
+
+  app.post('/api/mod/role', actionLimiter, requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaModRole, req.body || {}, res);
+    if (!data) return;
+    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
+    if (!(await assertGuildAccess(req, res, data.guildId))) return;
+    try {
+      const guild = client.guilds.cache.get(data.guildId);
+      const botMember = guild.members.me;
+      const role = guild.roles.cache.get(data.roleId);
+      if (!role || role.name === '@everyone') return res.status(404).json({ error: 'Ruolo non trovato' });
+      const member = await guild.members.fetch(data.userId).catch(() => null);
+      if (!member) return res.status(404).json({ error: 'Utente non nel server' });
+      if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) return res.status(403).json({ error: 'Il bot non ha "Gestisci Ruoli"' });
+      if (role.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Non posso gestire un ruolo più alto o uguale al mio' });
+      if (!(await actorCanGrantRole(guild, req.session.user.id, role))) return res.status(403).json({ error: 'Non puoi gestire un ruolo più alto o uguale al tuo' });
+
+      if (data.action === 'add') {
+        if (member.roles.cache.has(role.id)) return res.status(409).json({ error: `L'utente ha già il ruolo ${role.name}` });
+        await member.roles.add(role);
+      } else {
+        if (!member.roles.cache.has(role.id)) return res.status(409).json({ error: `L'utente non ha il ruolo ${role.name}` });
+        await member.roles.remove(role);
+      }
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Errore gestione ruolo'); }
   });
 
   app.get('/api/user-lookup/:userId', requireAuth, async (req, res) => {
@@ -851,6 +1227,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!data) return;
     const { action, userId, guildId, reason } = data;
     if (userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
+    if (userId === client.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni sul bot' });
     try {
       if (!(await assertGuildAccess(req, res, guildId))) return;
       const guild = client.guilds.cache.get(guildId);
@@ -864,9 +1241,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         if (!member) return res.status(404).json({ error: 'Utente non nel server' });
         if (member.id === guild.ownerId) return res.status(403).json({ error: 'Non puoi espellere il proprietario' });
         if (member.roles.highest.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
+        if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
         if (!member.kickable) return res.status(403).json({ error: 'Utente non espellibile' });
         await member.kick(r);
-        storage.saveLog({ type: 'Kick (dashboard)', targetId: userId, target: `${member.user.tag} (${userId})`, moderator: `${req.session.user.username} (${req.session.user.id})`, reason: r, channel: 'Web Dashboard' });
+        await logMod(guild, { type: 'Kick (dashboard)', targetId: userId, target: `${member.user.tag} (${userId})`, moderator: dashMod(req), reason: r, channel: 'Web Dashboard' });
       }
 
       if (action === 'ban') {
@@ -876,18 +1254,23 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         if (member) {
           if (member.roles.highest.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
           if (!member.bannable) return res.status(403).json({ error: 'Utente non bannabile' });
+          if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
+        }
+        // DM prima del ban: dopo il ban il bot potrebbe non condividere più un server con l'utente
+        const targetUser = await client.users.fetch(userId).catch(() => null);
+        if (targetUser) {
+          await dmUser(userId, { embeds: [makeEmbed('Sei stato bannato', `Sei stato bannato dal server **${guild.name}**.\n\n**Motivo:** ${r}`, 0xFF0000)] });
         }
         await guild.members.ban(userId, { reason: r });
-        storage.saveLog({ type: 'Ban (dashboard)', targetId: userId, target: member ? `${member.user.tag} (${userId})` : userId, moderator: `${req.session.user.username} (${req.session.user.id})`, reason: r, channel: 'Web Dashboard' });
+        await logMod(guild, { type: 'Ban (dashboard)', targetId: userId, target: member ? `${member.user.tag} (${userId})` : userId, moderator: dashMod(req), reason: r, channel: 'Web Dashboard' });
       }
 
       if (action === 'unban') {
         if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
-        let ban = null;
-        try { ban = await guild.bans.fetch(userId); } catch (e) { if (e.code !== 10026) throw e; }
+        const ban = await guild.bans.fetch(userId).catch(e => { if (e.code === 10026) return null; throw e; });
         if (!ban) return res.status(404).json({ error: 'Utente non bannato' });
-        await guild.members.unban(userId, r);
-        storage.saveLog({ type: 'Unban (dashboard)', targetId: userId, target: `${ban.user.tag} (${userId})`, moderator: `${req.session.user.username} (${req.session.user.id})`, reason: r, channel: 'Web Dashboard' });
+        await unbanWithInvite(guild, userId, req.session.user.username);
+        await logMod(guild, { type: 'Unban (dashboard)', targetId: userId, target: `${ban.user.tag} (${userId})`, moderator: dashMod(req), reason: r, channel: 'Web Dashboard' });
       }
 
       try {
@@ -1085,6 +1468,12 @@ function renderLayout(user, page, params = {}, security = {}) {
     return res;
   };
 
+  window.postJson = async function (url, body) {
+    const res = await apiFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    const data = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, data: data };
+  };
+
   async function logoutAll() {
     if (!confirm('Vuoi disconnetterti da TUTTE le sessioni?')) return;
     const res = await apiFetch('/api/logout-all', { method: 'POST' });
@@ -1209,6 +1598,21 @@ function safeJson(v) {
     .replace(/\u2029/g, '\\u2029');
 }
 
+function makeEmbed(title, description, color) {
+  return new EmbedBuilder()
+    .setTitle(String(title).slice(0, 256))
+    .setDescription(String(description).slice(0, 4096))
+    .setColor(color)
+    .setTimestamp();
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}g`;
+}
+
 // ---------- DASHBOARD ----------
 function renderDashboardContent() {
   return `
@@ -1226,6 +1630,7 @@ function renderDashboardContent() {
 
   <div class="section">
     <h2>➕ Aggiungi alla Blacklist</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:12px;">Bannerà l'utente in tutti i server dove il bot è presente e gli invierà un DM.</p>
     <div class="form-row">
       <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)" maxlength="20">
       <input type="text" id="bl-username" placeholder="Username" maxlength="64">
@@ -1276,7 +1681,7 @@ function renderDashboardContent() {
   async function bulkDeleteBL() {
     const ids = Array.from(document.querySelectorAll('.bl-check:checked')).map(c => c.value);
     if (!ids.length) { alert('Nessun utente selezionato'); return; }
-    if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist?')) return;
+    if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist? Verranno sbannati in tutti i server.')) return;
     const res = await apiFetch('/api/blacklist/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
     const data = await res.json().catch(() => ({}));
     if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); loadStats(); }
@@ -1291,7 +1696,7 @@ function renderDashboardContent() {
     const res = await apiFetch('/api/blacklist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, username, reason }) });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
+      msg.innerHTML = '<span class="success">✅ Aggiunto (bannato in ' + esc(data.bannedIn || 0) + ' server)</span>';
       document.getElementById('bl-userId').value = '';
       document.getElementById('bl-username').value = '';
       document.getElementById('bl-reason').value = '';
@@ -1299,7 +1704,7 @@ function renderDashboardContent() {
     } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
   }
   async function removeBL(userId) {
-    if (!confirm('Rimuovere ' + userId + ' dalla blacklist?')) return;
+    if (!confirm('Rimuovere ' + userId + ' dalla blacklist? Verrà sbannato dove è bannato.')) return;
     const res = await apiFetch('/api/blacklist/' + encodeURIComponent(userId), { method: 'DELETE' });
     if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadBlacklist(); loadStats();
@@ -1454,8 +1859,31 @@ function renderTicketsContent() {
         '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
         '<td>' + esc(t.claimedBy || '-') + '</td>' +
         '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td>' +
+        '<td>' +
+          '<button class="secondary small" onclick="claimTicket(\\'' + esc(t.channelId) + '\\')">Prendi</button> ' +
+          '<select style="width:auto;display:inline-block;margin:0 6px 0 0;padding:4px 8px;" onchange="setPriority(\\'' + esc(t.channelId) + '\\', this.value)">' +
+            '<option value="">Priorità</option>' +
+            '<option value="low">🟢 Bassa</option>' +
+            '<option value="med">🟡 Media</option>' +
+            '<option value="high">🟠 Alta</option>' +
+            '<option value="urgent">🔴 Urgente</option>' +
+          '</select>' +
+          '<button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button>' +
+        '</td>' +
       '</tr>').join('') + '</tbody></table>';
+  }
+
+  async function claimTicket(channelId) {
+    const r = await postJson('/api/tickets/' + encodeURIComponent(channelId) + '/claim', {});
+    if (r.ok) loadTickets();
+    else alert('❌ ' + ((r.data && r.data.error) || 'Errore'));
+  }
+
+  async function setPriority(channelId, priority) {
+    if (!priority) return;
+    const r = await postJson('/api/tickets/' + encodeURIComponent(channelId) + '/priority', { priority: priority });
+    if (r.ok) loadTickets();
+    else alert('❌ ' + ((r.data && r.data.error) || 'Errore'));
   }
 
   async function loadTranscripts() {
@@ -1848,7 +2276,7 @@ function renderUserContent(userId) {
   }
 
   async function removeBL() {
-    if (!confirm('Rimuovere ' + USER_ID + ' dalla blacklist?')) return;
+    if (!confirm('Rimuovere ' + USER_ID + ' dalla blacklist? Verrà sbannato dove è bannato.')) return;
     const res = await apiFetch('/api/blacklist/' + encodeURIComponent(USER_ID), { method: 'DELETE' });
     if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
     loadUser();
@@ -1957,7 +2385,7 @@ function renderAccessLogsContent() {
   </script>`;
 }
 
-// ---------- MESSAGGI ----------
+// ---------- MESSAGGI + MODERAZIONE CANALE ----------
 function renderMessagesContent() {
   return `
   <div class="section">
@@ -1982,6 +2410,19 @@ function renderMessagesContent() {
 
     <button onclick="sendMessage()">📤 Invia</button>
     <div id="msg-result"></div>
+  </div>
+
+  <div class="section">
+    <h2>🧹 Moderazione canale</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:12px;">Agisce sul canale selezionato sopra.</p>
+    <div class="form-row">
+      <input id="mc-amount" type="number" min="1" max="100" value="10" style="max-width:120px;">
+      <button class="danger small" onclick="modClear()">🧹 Pulisci</button>
+      <button class="secondary small" onclick="modLock()">🔒 Blocca</button>
+      <button class="secondary small" onclick="modUnlock()">🔓 Sblocca</button>
+    </div>
+    <input id="mc-reason" placeholder="Motivo (opzionale, per il blocco)" maxlength="512">
+    <div id="mc-result"></div>
   </div>
 
   <script>
@@ -2024,6 +2465,39 @@ function renderMessagesContent() {
       result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
     }
   }
+
+  function currentChannel() {
+    const id = document.getElementById('msg-channel').value;
+    return channelsCache.find(c => c.channelId === id) || null;
+  }
+  function mcShow(html) { document.getElementById('mc-result').innerHTML = html; }
+  function mcReport(r, okText) {
+    if (r.ok) mcShow('<span class="success">✅ ' + esc(okText) + '</span>');
+    else mcShow('<span class="error">❌ [' + r.status + '] ' + esc((r.data && r.data.error) || 'Errore') + '</span>');
+  }
+  async function modClear() {
+    const ch = currentChannel();
+    if (!ch) return mcShow('<span class="error">❌ Seleziona un canale</span>');
+    const amount = parseInt(document.getElementById('mc-amount').value, 10);
+    if (!(amount >= 1 && amount <= 100)) return mcShow('<span class="error">❌ Inserisci un numero tra 1 e 100</span>');
+    if (!confirm('Cancellare fino a ' + amount + ' messaggi in #' + ch.channelName + '?')) return;
+    const r = await postJson('/api/mod/clear', { guildId: ch.guildId, channelId: ch.channelId, amount: amount });
+    mcReport(r, r.ok ? 'Cancellati ' + r.data.count + ' messaggi' : '');
+  }
+  async function modLock() {
+    const ch = currentChannel();
+    if (!ch) return mcShow('<span class="error">❌ Seleziona un canale</span>');
+    if (!confirm('Bloccare #' + ch.channelName + ' per tutti?')) return;
+    const reason = document.getElementById('mc-reason').value.trim();
+    const r = await postJson('/api/mod/lock', { guildId: ch.guildId, channelId: ch.channelId, reason: reason });
+    mcReport(r, 'Canale bloccato');
+  }
+  async function modUnlock() {
+    const ch = currentChannel();
+    if (!ch) return mcShow('<span class="error">❌ Seleziona un canale</span>');
+    const r = await postJson('/api/mod/unlock', { guildId: ch.guildId, channelId: ch.channelId });
+    mcReport(r, 'Canale sbloccato');
+  }
   loadChannels();
   </script>`;
 }
@@ -2043,20 +2517,56 @@ function renderUserActionsContent(userId = '') {
   <div class="section" id="ua-actions" style="display:none;">
     <h2>⚡ Azioni</h2>
     <label style="font-size:13px;color:#888;">Server</label>
-    <select id="ua-guild"></select>
+    <select id="ua-guild" onchange="fillGuildOptions()"></select>
     <label style="font-size:13px;color:#888;">Motivo (opzionale)</label>
     <input id="ua-reason" placeholder="Motivo dell'azione" maxlength="512">
-    <div style="display:flex;gap:8px;margin-top:8px;">
+    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
       <button class="secondary" onclick="doAction('kick')">👢 Kick</button>
       <button class="danger" onclick="doAction('ban')">🔨 Ban</button>
       <button class="secondary" onclick="doAction('unban')">🔓 Unban</button>
+      <button class="secondary" onclick="doWarn()">⚠️ Warn</button>
     </div>
     <div id="ua-result"></div>
+
+    <h3 style="margin-top:22px;font-size:15px;color:#bbb;">Altre azioni</h3>
+    <div class="form-row">
+      <input id="ua-timeout" type="number" min="1" max="40320" placeholder="Timeout (minuti, max 40320)">
+      <button class="secondary" onclick="doTimeout()">⏱️ Timeout</button>
+    </div>
+    <div class="form-row">
+      <select id="ua-role"></select>
+      <button class="secondary" onclick="doRole('add')">➕ Assegna ruolo</button>
+      <button class="secondary" onclick="doRole('remove')">➖ Rimuovi ruolo</button>
+    </div>
+    <div class="form-row">
+      <select id="ua-invite-channel"></select>
+      <button class="secondary" onclick="doInvite()">📨 Invita</button>
+    </div>
+    <textarea id="ua-note" rows="2" maxlength="1000" placeholder="Nota staff (2-1000 caratteri)"></textarea>
+    <button class="secondary" onclick="doNote()">📝 Aggiungi nota</button>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let currentUser = null;
+  let uaGuilds = [];
+
+  async function loadGuildsForUA() {
+    const res = await apiFetch('/api/guilds');
+    uaGuilds = await res.json().catch(() => []);
+    fillGuildOptions();
+  }
+
+  function fillGuildOptions() {
+    const guildId = document.getElementById('ua-guild').value;
+    const g = uaGuilds.find(x => x.id === guildId);
+    document.getElementById('ua-role').innerHTML = (g && g.roles.length)
+      ? g.roles.map(r => '<option value="' + esc(r.id) + '">' + esc(r.name) + '</option>').join('')
+      : '<option value="">Nessun ruolo</option>';
+    document.getElementById('ua-invite-channel').innerHTML = (g && g.channels.length)
+      ? g.channels.map(c => '<option value="' + esc(c.id) + '">#' + esc(c.name) + '</option>').join('')
+      : '<option value="">Nessun canale</option>';
+  }
 
   async function lookupUser() {
     const userId = document.getElementById('ua-userid').value.trim();
@@ -2066,7 +2576,7 @@ function renderUserActionsContent(userId = '') {
     info.innerHTML = '<p class="loading">Ricerca...</p>';
     const res = await apiFetch('/api/user-lookup/' + encodeURIComponent(userId));
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; actions.style.display='none'; return; }
+    if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; actions.style.display = 'none'; return; }
     currentUser = data;
 
     info.innerHTML =
@@ -2080,24 +2590,81 @@ function renderUserActionsContent(userId = '') {
     sel.innerHTML = data.memberships.map(m =>
       '<option value="' + esc(m.guildId) + '">' + esc(m.guildName) + ' (ruoli: ' + esc(m.roles.join(', ')) + ')</option>'
     ).join('') || '<option value="">Nessun server</option>';
+    fillGuildOptions();
 
     actions.style.display = 'block';
   }
 
-  async function doAction(action) {
-    if (!currentUser) return;
+  function uaContext() {
+    if (!currentUser) return null;
     const guildId = document.getElementById('ua-guild').value;
-    const reason = document.getElementById('ua-reason').value.trim();
-    const result = document.getElementById('ua-result');
-    if (!guildId) { result.innerHTML = '<span class="error">❌ Seleziona un server</span>'; return; }
-    if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + currentUser.tag + '?')) return;
-    const res = await apiFetch('/api/user-action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, userId: currentUser.id, guildId, reason }) });
-    const data = await res.json().catch(() => ({}));
-    result.innerHTML = res.ok
-      ? '<span class="success">✅ ' + esc(action.toUpperCase()) + ' eseguito</span>'
-      : '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
+    if (!guildId) return null;
+    return { guildId: guildId, userId: currentUser.id, tag: currentUser.tag };
+  }
+  function uaShow(html) { document.getElementById('ua-result').innerHTML = html; }
+  function uaReport(r, okText) {
+    if (r.ok) uaShow('<span class="success">✅ ' + esc(okText) + '</span>');
+    else uaShow('<span class="error">❌ [' + r.status + '] ' + esc((r.data && r.data.error) || 'Errore') + '</span>');
+  }
+  function needCtx() {
+    const c = uaContext();
+    if (!c) uaShow('<span class="error">❌ Seleziona un server</span>');
+    return c;
   }
 
+  async function doAction(action) {
+    const c = needCtx(); if (!c) return;
+    if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + c.tag + '?')) return;
+    const reason = document.getElementById('ua-reason').value.trim();
+    const r = await postJson('/api/user-action', { action: action, userId: c.userId, guildId: c.guildId, reason: reason });
+    uaReport(r, action.toUpperCase() + ' eseguito');
+  }
+
+  async function doWarn() {
+    const c = needCtx(); if (!c) return;
+    if (!confirm('Registrare un warn per ' + c.tag + '?')) return;
+    const reason = document.getElementById('ua-reason').value.trim();
+    const r = await postJson('/api/mod/warn', { guildId: c.guildId, userId: c.userId, reason: reason });
+    uaReport(r, 'Warn registrato');
+  }
+
+  async function doTimeout() {
+    const c = needCtx(); if (!c) return;
+    const minutes = parseInt(document.getElementById('ua-timeout').value, 10);
+    if (!(minutes >= 1 && minutes <= 40320)) return uaShow('<span class="error">❌ Inserisci minuti tra 1 e 40320</span>');
+    if (!confirm('Timeout di ' + minutes + ' minuti per ' + c.tag + '?')) return;
+    const reason = document.getElementById('ua-reason').value.trim();
+    const r = await postJson('/api/mod/timeout', { guildId: c.guildId, userId: c.userId, seconds: minutes * 60, reason: reason });
+    uaReport(r, 'Timeout applicato');
+  }
+
+  async function doRole(action) {
+    const c = needCtx(); if (!c) return;
+    const roleId = document.getElementById('ua-role').value;
+    if (!roleId) return uaShow('<span class="error">❌ Nessun ruolo selezionato</span>');
+    const r = await postJson('/api/mod/role', { guildId: c.guildId, userId: c.userId, roleId: roleId, action: action });
+    uaReport(r, action === 'add' ? 'Ruolo assegnato' : 'Ruolo rimosso');
+  }
+
+  async function doInvite() {
+    const c = needCtx(); if (!c) return;
+    const channelId = document.getElementById('ua-invite-channel').value;
+    if (!channelId) return uaShow('<span class="error">❌ Nessun canale selezionato</span>');
+    const r = await postJson('/api/mod/invite', { guildId: c.guildId, channelId: channelId, userId: c.userId });
+    if (!r.ok) return uaReport(r, '');
+    uaShow('<span class="success">✅ ' + esc(r.data.via === 'dm' ? 'Invito inviato in DM' : 'DM chiusi: invito postato nel canale') + '</span>');
+  }
+
+  async function doNote() {
+    const c = needCtx(); if (!c) return;
+    const content = document.getElementById('ua-note').value.trim();
+    if (content.length < 2) return uaShow('<span class="error">❌ La nota è troppo corta</span>');
+    const r = await postJson('/api/notes', { guildId: c.guildId, userId: c.userId, content: content });
+    uaReport(r, 'Nota aggiunta');
+    if (r.ok) document.getElementById('ua-note').value = '';
+  }
+
+  loadGuildsForUA();
   ${userId ? 'lookupUser();' : ''}
   </script>`;
 }
