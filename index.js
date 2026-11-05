@@ -2808,7 +2808,11 @@ let webServer = null;
     await client.login(TOKEN);
     log.ok('✅ Bot online');
 
-    webServer = createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml });
+    webServer = createWebServer({
+  storage, client, log, botStartTime, buildTranscriptHtml,
+  modLog: (guild, data) => ModLogModule.logUserAction(guild, data)
+});
+
 
     registerSlashCommands(CLIENT_ID, TOKEN).catch(err => {
       log.err('❌ Registrazione comandi fallita (ma il bot è online)', err);
