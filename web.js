@@ -41,6 +41,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   }
   const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-non-usare-in-produzione';
   const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const BLACKLIST_ADMIN_SERVERS = (process.env.BLACKLIST_ADMIN_SERVERS || '').split(',').map(s => s.trim()).filter(Boolean);
   const DASHBOARD_ROLES = ['Senior Admin'];
 
   const AUTH_CACHE_TTL = 60 * 1000;
@@ -107,6 +108,53 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       .all(...ids, limit);
   }
 
+  function isEnvAdmin(userId) {
+    return ENV_ADMIN_IDS.includes(userId);
+  }
+
+  function logsForViewer(userId, allowed, limit = 500) {
+    if (isEnvAdmin(userId)) return storage.getAllLogs(limit);
+    const ids = [...allowed];
+    if (!ids.length) return [];
+    const ph = ids.map(() => '?').join(',');
+    return storage.db.prepare(
+      `SELECT * FROM mod_logs WHERE guild_id IN (${ph}) ORDER BY id DESC LIMIT ?`
+    ).all(...ids, limit);
+  }
+
+  function logsForUserViewer(actorId, targetId, allowed) {
+    if (isEnvAdmin(actorId)) return storage.getLogsForUser(targetId);
+    const ids = [...allowed];
+    if (!ids.length) return [];
+    const ph = ids.map(() => '?').join(',');
+    return storage.db.prepare(
+      `SELECT * FROM mod_logs WHERE target_id = ? AND guild_id IN (${ph}) ORDER BY id DESC`
+    ).all(targetId, ...ids);
+  }
+
+  function transcriptsForViewer(userId, allowed) {
+    if (isEnvAdmin(userId)) return storage.getAllTranscripts ? storage.getAllTranscripts() : [];
+    const ids = [...allowed];
+    if (!ids.length) return [];
+    const ph = ids.map(() => '?').join(',');
+    return storage.db.prepare(
+      `SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at
+       FROM ticket_transcripts WHERE guild_id IN (${ph}) ORDER BY id DESC LIMIT 100`
+    ).all(...ids);
+  }
+
+  function countWhereGuilds(table, allowed, userId) {
+    if (isEnvAdmin(userId)) {
+      const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get();
+      return row?.c || 0;
+    }
+    const ids = [...allowed];
+    if (!ids.length) return 0;
+    const ph = ids.map(() => '?').join(',');
+    const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE guild_id IN (${ph})`).get(...ids);
+    return row?.c || 0;
+  }
+
   // ==================== HELPER AZIONI (allineati al bot) ====================
   function dashActor(req) {
     const u = req.session.user;
@@ -118,9 +166,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   // Scrive nel DB e, se disponibile, nel canale mod-log (stessa logica del bot)
   async function logMod(guild, data) {
+    const payload = { ...data, guildId: data.guildId || guild?.id || null };
     try {
-      if (typeof modLogFn === 'function') await modLogFn(guild, data);
-      else storage.saveLog(data);
+      if (typeof modLogFn === 'function') await modLogFn(guild, payload);
+      else storage.saveLog(payload);
     } catch (err) { log.err('logMod', err); }
   }
 
@@ -149,6 +198,22 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!actor) return false;
     if (guild.ownerId === actor.id) return true;
     return role.position < actor.roles.highest.position;
+  }
+
+  async function actorHas(guild, actorId, flag) {
+    if (ENV_ADMIN_IDS.includes(actorId)) return true;
+    const actor = await guild.members.fetch(actorId).catch(() => null);
+    return !!actor && actor.permissions.has(flag);
+  }
+
+  async function canUseGlobalBlacklist(userId) {
+    if (ENV_ADMIN_IDS.includes(userId)) return true;
+    if (!BLACKLIST_ADMIN_SERVERS.length) return true;
+    for (const id of BLACKLIST_ADMIN_SERVERS) {
+      const guild = client.guilds.cache.get(id);
+      if (guild && await canManageGuild(userId, guild)) return true;
+    }
+    return false;
   }
 
   async function createSingleUseInvite(guild, reason) {
@@ -357,7 +422,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   const schemaBulkDelete = z.object({ ids: z.array(z.union([z.string(), z.number()])).min(1).max(500) });
   const schemaConfig = z.object({ autoroleId: z.string().regex(/^\d{17,20}$/).nullable().optional(), logChannelId: z.string().regex(/^\d{17,20}$/).nullable().optional() });
   const schemaWelcome = z.object({ channelId: z.string().regex(/^\d{17,20}$/).nullable().optional(), message: z.string().max(2000).nullable().optional(), embedEnabled: z.boolean().optional() });
-  const schemaCommandAdd = z.object({ name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i), response: z.string().min(1).max(4096) });
+  const schemaCommandAdd = z.object({
+    name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i),
+    response: z.string().min(1).max(4096)
+  }).refine(d => !/@(everyone|here)\b/i.test(d.response), { message: 'La risposta non può menzionare everyone o here' });
   const schemaMessagesSend = z.object({
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
@@ -532,22 +600,27 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         const perGuild = storage.db.prepare('SELECT guild_id, COUNT(*) AS c FROM member_notes GROUP BY guild_id').all();
         notesCount = perGuild.filter(r => allowed.has(r.guild_id)).reduce((sum, r) => sum + r.c, 0);
       } catch {}
-      try { transcriptsCount = storage.countTranscripts ? storage.countTranscripts() : 0; } catch {}
-      try { remindersCount = storage.countReminders ? storage.countReminders() : 0; } catch {}
+      try { transcriptsCount = countWhereGuilds('ticket_transcripts', allowed, req.session.user.id); } catch {}
+      try { remindersCount = countWhereGuilds('reminders', allowed, req.session.user.id); } catch {}
+      const logCount = isEnvAdmin(req.session.user.id) ? s.total : countWhereGuilds('mod_logs', allowed, req.session.user.id);
       res.json({
-        logs: s.total, blacklist: s.blacklist, guilds: allowed.size, ping: client.ws.ping,
+        logs: logCount, blacklist: s.blacklist, guilds: allowed.size, ping: client.ws.ping,
         uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType,
         tickets: ticketsCount, notes: notesCount, transcripts: transcriptsCount, reminders: remindersCount
       });
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
 
-  app.get('/api/blacklist', requireAuth, (req, res) => {
-    try { res.json(storage.getAllBlacklist()); } catch (e) { apiError(res, e); }
+  app.get('/api/blacklist', requireAuth, async (req, res) => {
+    try {
+      if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi vedere la blacklist globale' });
+      res.json(storage.getAllBlacklist());
+    } catch (e) { apiError(res, e); }
   });
   app.post('/api/blacklist', actionLimiter, requireAuth, async (req, res) => {
     const data = parseOrFail(schemaBlacklistAdd, req.body || {}, res);
     if (!data) return;
+    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi gestire la blacklist globale' });
     if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist il bot' });
     if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist te stesso' });
     try {
@@ -556,17 +629,19 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       res.json({ ok: true, bannedIn });
     } catch (e) { apiError(res, e); }
   });
-  app.delete('/api/blacklist/:userId', requireAuth, async (req, res) => {
+  app.delete('/api/blacklist/:userId', actionLimiter, requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
+    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi gestire la blacklist globale' });
     try {
       if (!storage.isBlacklisted(req.params.userId)) return res.status(404).json({ error: 'Utente non in blacklist' });
       const unbannedIn = await blacklistRemoveFull(req.params.userId, dashActor(req));
       res.json({ ok: true, unbannedIn });
     } catch (e) { apiError(res, e); }
   });
-  app.post('/api/blacklist/bulk-delete', requireAuth, async (req, res) => {
+  app.post('/api/blacklist/bulk-delete', actionLimiter, requireAuth, async (req, res) => {
     const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
     if (!data) return;
+    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi gestire la blacklist globale' });
     try {
       const mod = dashActor(req);
       let count = 0;
@@ -580,12 +655,18 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/logs/all', requireAuth, (req, res) => {
-    try { res.json(storage.getAllLogs(500)); } catch (e) { res.json([]); }
+  app.get('/api/logs/all', requireAuth, async (req, res) => {
+    try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      res.json(logsForViewer(req.session.user.id, allowed, 500));
+    } catch (e) { res.json([]); }
   });
-  app.get('/api/logs/:userId', requireAuth, (req, res) => {
+  app.get('/api/logs/:userId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
-    try { res.json(storage.getLogsForUser(req.params.userId)); } catch (e) { apiError(res, e); }
+    try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      res.json(logsForUserViewer(req.session.user.id, req.params.userId, allowed));
+    } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/notes/all', requireAuth, async (req, res) => {
@@ -760,7 +841,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (html && storage.saveTranscript) {
         storage.saveTranscript(
           ch.id, ch.name, userId,
-          meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html
+          meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html, ch.guild.id
         );
       }
       await logMod(ch.guild, {
@@ -811,6 +892,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
         return res.status(403).json({ error: 'Non hai i permessi su questo server' });
       }
+      const panelActor = await channel.guild.members.fetch(req.session.user.id).catch(() => null);
+      if (!isEnvAdmin(req.session.user.id) && !channel.permissionsFor(panelActor)?.has(PermissionsBitField.Flags.SendMessages)) {
+        return res.status(403).json({ error: 'Non puoi scrivere in questo canale' });
+      }
 
       const embed = new EmbedBuilder().setTitle('Pannello Ticket').setDescription('Premi il bottone qui sotto per aprire un ticket.').setColor(0x0099FF).setTimestamp();
       const row = new ActionRowBuilder().addComponents(
@@ -821,15 +906,23 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e, 'Errore creazione pannello'); }
   });
 
-  app.get('/api/tickets/transcripts', requireAuth, (req, res) => {
-    try { res.json(storage.getAllTranscripts ? storage.getAllTranscripts() : []); } catch (e) { apiError(res, e); }
+  app.get('/api/tickets/transcripts', requireAuth, async (req, res) => {
+    try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      res.json(transcriptsForViewer(req.session.user.id, allowed));
+    } catch (e) { apiError(res, e); }
   });
-  app.get('/api/tickets/transcripts/:id', requireAuth, (req, res) => {
+  app.get('/api/tickets/transcripts/:id', requireAuth, async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).send('ID non valido');
     try {
       const t = storage.getTranscript ? storage.getTranscript(id) : null;
       if (!t) return res.status(404).send('Transcript non trovato');
+      if (t.guild_id) {
+        if (!(await assertGuildAccess(req, res, t.guild_id))) return;
+      } else if (!isEnvAdmin(req.session.user.id)) {
+        return res.status(403).send('Transcript senza server: visibile solo agli admin dashboard');
+      }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.send(t.html_content);
@@ -864,20 +957,32 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/charts', requireAuth, (req, res) => {
+  function logScope(userId, allowed) {
+    if (isEnvAdmin(userId)) return { sql: '', params: [] };
+    const ids = [...allowed];
+    if (!ids.length) return { sql: ' AND 1=0', params: [] };
+    return { sql: ` AND guild_id IN (${ids.map(() => '?').join(',')})`, params: ids };
+  }
+
+  app.get('/api/charts', requireAuth, async (req, res) => {
     try {
-      const byType = storage.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type').all();
-      const byDay = storage.db.prepare("SELECT substr(timestamp,1,10) as day, COUNT(*) as c FROM mod_logs GROUP BY day ORDER BY day DESC LIMIT 30").all();
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const scope = logScope(req.session.user.id, allowed);
+      const where = scope.sql ? `WHERE 1=1${scope.sql}` : '';
+      const byType = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs ${where} GROUP BY type`).all(...scope.params);
+      const byDay = storage.db.prepare(`SELECT substr(timestamp,1,10) as day, COUNT(*) as c FROM mod_logs ${where} GROUP BY day ORDER BY day DESC LIMIT 30`).all(...scope.params);
       res.json({ byType, byDay });
     } catch (e) { res.json({ byType: [], byDay: [] }); }
   });
 
-  app.get('/api/top', requireAuth, (req, res) => {
+  app.get('/api/top', requireAuth, async (req, res) => {
     try {
-      const moderators = storage.db.prepare(`SELECT moderator, COUNT(*) as c FROM mod_logs WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico' GROUP BY moderator ORDER BY c DESC LIMIT 10`).all();
-      const targets = storage.db.prepare(`SELECT target_id, target, COUNT(*) as c FROM mod_logs WHERE target_id IS NOT NULL GROUP BY target_id ORDER BY c DESC LIMIT 10`).all();
-      const types = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type ORDER BY c DESC`).all();
-      const byMonth = storage.db.prepare(`SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs GROUP BY month ORDER BY month DESC LIMIT 12`).all();
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const scope = logScope(req.session.user.id, allowed);
+      const moderators = storage.db.prepare(`SELECT moderator, COUNT(*) as c FROM mod_logs WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico'${scope.sql} GROUP BY moderator ORDER BY c DESC LIMIT 10`).all(...scope.params);
+      const targets = storage.db.prepare(`SELECT target_id, target, COUNT(*) as c FROM mod_logs WHERE target_id IS NOT NULL${scope.sql} GROUP BY target_id ORDER BY c DESC LIMIT 10`).all(...scope.params);
+      const types = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs WHERE 1=1${scope.sql} GROUP BY type ORDER BY c DESC`).all(...scope.params);
+      const byMonth = storage.db.prepare(`SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs WHERE 1=1${scope.sql} GROUP BY month ORDER BY month DESC LIMIT 12`).all(...scope.params);
       res.json({ moderators, targets, types, byMonth });
     } catch (e) { log.err('api/top', e); res.json({ moderators: [], targets: [], types: [], byMonth: [] }); }
   });
@@ -901,11 +1006,11 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
-      const logs = storage.getLogsForUser(userId);
+      const logs = logsForUserViewer(req.session.user.id, userId, allowed);
       const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 1000').all(userId)
         .filter(n => allowed.has(n.guild_id))
         .slice(0, 100);
-      const blacklistEntry = storage.getBlacklistEntry(userId);
+      const blacklistEntry = (await canUseGlobalBlacklist(req.session.user.id)) ? storage.getBlacklistEntry(userId) : null;
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         if (!allowed.has(guild.id)) continue;
@@ -926,9 +1031,11 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
     try {
       const allowed = await allowedGuildIds(req.session.user.id);
-      const blacklist = storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q));
+      const blacklist = (await canUseGlobalBlacklist(req.session.user.id))
+        ? storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q))
+        : [];
       const notes = notesForGuilds(allowed, 5000).filter(n => (n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q));
-      const logs = storage.getAllLogs(500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
+      const logs = logsForViewer(req.session.user.id, allowed, 500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         if (!allowed.has(guild.id)) continue;
@@ -956,7 +1063,8 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     return headers.join(',') + '\n' + rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
   }
 
-  app.get('/api/export/blacklist.csv', requireAuth, (req, res) => {
+  app.get('/api/export/blacklist.csv', requireAuth, async (req, res) => {
+    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi esportare la blacklist globale' });
     try {
       const csv = toCsv(storage.getAllBlacklist(), ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -976,15 +1084,17 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
-  app.get('/api/export/logs.csv', requireAuth, (req, res) => {
+  app.get('/api/export/logs.csv', requireAuth, async (req, res) => {
     try {
-      const csv = toCsv(storage.getAllLogs(5000), ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'timestamp']);
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const csv = toCsv(logsForViewer(req.session.user.id, allowed, 5000), ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'guild_id', 'timestamp']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
       res.send(csv);
     } catch (e) { apiError(res, e); }
   });
   app.get('/api/export/access-logs.csv', requireAuth, (req, res) => {
+    if (ENV_ADMIN_IDS.length && !isEnvAdmin(req.session.user.id)) return res.status(403).json({ error: 'Solo gli admin dashboard vedono gli IP' });
     try {
       const csv = toCsv(storage.getDashboardAccessLogs(), ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -994,6 +1104,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   });
 
   app.get('/api/access-logs', requireAuth, (req, res) => {
+    if (ENV_ADMIN_IDS.length && !isEnvAdmin(req.session.user.id)) return res.status(403).json({ error: 'Solo gli admin dashboard vedono gli IP' });
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
   });
 
@@ -1020,6 +1131,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
       if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
         return res.status(403).json({ error: 'Non hai i permessi su questo server' });
+      }
+      const sender = await channel.guild.members.fetch(req.session.user.id).catch(() => null);
+      if (!isEnvAdmin(req.session.user.id) && !channel.permissionsFor(sender)?.has(PermissionsBitField.Flags.SendMessages)) {
+        return res.status(403).json({ error: 'Non puoi scrivere in questo canale' });
       }
       const botMember = channel.guild?.members?.me;
       if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
@@ -1054,6 +1169,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const guild = client.guilds.cache.get(data.guildId);
       const channel = guild.channels.cache.get(data.channelId);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale testuale non valido' });
+      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageMessages))) {
+        return res.status(403).json({ error: 'Ti manca "Gestisci Messaggi"' });
+      }
       if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
         return res.status(403).json({ error: 'Il bot non può gestire i messaggi in questo canale' });
       }
@@ -1077,6 +1195,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const guild = client.guilds.cache.get(data.guildId);
       const channel = guild.channels.cache.get(data.channelId);
       if (!channel) return res.status(404).json({ error: 'Canale non trovato' });
+      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageChannels))) {
+        return res.status(403).json({ error: 'Ti manca "Gestisci Canali"' });
+      }
       if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageChannels)) {
         return res.status(403).json({ error: 'Il bot non può gestire questo canale' });
       }
@@ -1102,6 +1223,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const guild = client.guilds.cache.get(data.guildId);
       const channel = guild.channels.cache.get(data.channelId);
       if (!channel) return res.status(404).json({ error: 'Canale non trovato' });
+      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageChannels))) {
+        return res.status(403).json({ error: 'Ti manca "Gestisci Canali"' });
+      }
       if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageChannels)) {
         return res.status(403).json({ error: 'Il bot non può gestire questo canale' });
       }
@@ -1110,7 +1234,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (!current || !current.deny.has(PermissionsBitField.Flags.SendMessages)) {
         return res.status(409).json({ error: 'Questo canale non è bloccato' });
       }
-      await channel.permissionOverwrites.delete(everyone);
+      await channel.permissionOverwrites.edit(everyone, { SendMessages: null });
       await logMod(guild, {
         type: 'Unlock', title: 'Canale Sbloccato', moderator: dashMod(req), channel: channel.name
       });
@@ -1130,6 +1254,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const member = await guild.members.fetch(data.userId).catch(() => null);
       if (!member) return res.status(404).json({ error: 'Utente non nel server' });
       if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return res.status(403).json({ error: 'Non puoi warnare un admin' });
+      if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
       await logMod(guild, {
         type: 'Warn', title: 'Warn', targetId: member.id, target: `${member.user.username} (${member.id})`,
         moderator: dashMod(req), reason: data.reason || 'Nessun motivo specificato'
@@ -1170,6 +1295,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const guild = client.guilds.cache.get(data.guildId);
       const channel = guild.channels.cache.get(data.channelId);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale testuale non valido' });
+      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.CreateInstantInvite))) {
+        return res.status(403).json({ error: 'Ti manca "Crea Invito"' });
+      }
       if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.CreateInstantInvite)) {
         return res.status(403).json({ error: 'Il bot non può creare inviti in questo canale' });
       }
@@ -1199,6 +1327,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (!role || role.name === '@everyone') return res.status(404).json({ error: 'Ruolo non trovato' });
       const member = await guild.members.fetch(data.userId).catch(() => null);
       if (!member) return res.status(404).json({ error: 'Utente non nel server' });
+      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageRoles))) return res.status(403).json({ error: 'Ti manca "Gestisci Ruoli"' });
       if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) return res.status(403).json({ error: 'Il bot non ha "Gestisci Ruoli"' });
       if (role.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Non posso gestire un ruolo più alto o uguale al mio' });
       if (!(await actorCanGrantRole(guild, req.session.user.id, role))) return res.status(403).json({ error: 'Non puoi gestire un ruolo più alto o uguale al tuo' });
@@ -1210,6 +1339,14 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         if (!member.roles.cache.has(role.id)) return res.status(409).json({ error: `L'utente non ha il ruolo ${role.name}` });
         await member.roles.remove(role);
       }
+      await logMod(guild, {
+        type: data.action === 'add' ? 'Ruolo Aggiunto' : 'Ruolo Rimosso',
+        title: data.action === 'add' ? 'Ruolo assegnato' : 'Ruolo rimosso',
+        targetId: member.id,
+        target: `${member.user.username} (${member.id})`,
+        moderator: dashMod(req),
+        reason: role.name
+      });
       res.json({ ok: true });
     } catch (e) { apiError(res, e, 'Errore gestione ruolo'); }
   });
@@ -1245,6 +1382,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const r = (reason || `Azione da dashboard (${req.session.user.username})`).slice(0, 512);
 
       if (action === 'kick') {
+        if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.KickMembers))) return res.status(403).json({ error: 'Ti manca "Espelli Membri"' });
         if (!botMember.permissions.has('KickMembers')) return res.status(403).json({ error: 'Il bot non ha "Espelli Membri"' });
         const member = await guild.members.fetch(userId).catch(() => null);
         if (!member) return res.status(404).json({ error: 'Utente non nel server' });
@@ -1257,6 +1395,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
 
       if (action === 'ban') {
+        if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.BanMembers))) return res.status(403).json({ error: 'Ti manca "Banna Membri"' });
         if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
         if (userId === guild.ownerId) return res.status(403).json({ error: 'Non puoi bannare il proprietario' });
         const member = await guild.members.fetch(userId).catch(() => null);
@@ -1275,6 +1414,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
 
       if (action === 'unban') {
+        if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.BanMembers))) return res.status(403).json({ error: 'Ti manca "Banna Membri"' });
         if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
         const ban = await guild.bans.fetch(userId).catch(e => { if (e.code === 10026) return null; throw e; });
         if (!ban) return res.status(404).json({ error: 'Utente non bannato' });
@@ -1494,27 +1634,28 @@ function renderLayout(user, page, params = {}, security = {}) {
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #1a1a1a; color: #eee; padding: 24px; }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding-bottom: 18px; border-bottom: 1px solid #333; gap: 16px; flex-wrap: wrap; }
-  h1 { font-size: 22px; }
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111214; color: #eee; padding: 28px 20px 48px; line-height: 1.45; }
+  header { display: flex; justify-content: space-between; align-items: center; margin: 0 auto 16px; padding-bottom: 18px; border-bottom: 1px solid #2b2d31; gap: 16px; flex-wrap: wrap; max-width: 1180px; }
+  h1 { font-size: 22px; letter-spacing: -0.02em; }
   .user { display: flex; align-items: center; gap: 12px; }
   .user img { width: 40px; height: 40px; border-radius: 50%; }
-  .search-box { flex: 1; max-width: 400px; min-width: 200px; }
+  .search-box { flex: 1; max-width: 420px; min-width: 200px; }
   .search-box form { display: flex; gap: 8px; }
-  .search-box input { margin: 0; }
-  nav { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
-  nav a { padding: 8px 14px; background: #252525; border: 1px solid #333; border-radius: 6px; color: #bbb; font-size: 14px; }
-  nav a:hover { background: #2f2f2f; }
+  .search-box input, .search-box button { margin: 0; }
+  nav { display: flex; gap: 8px; margin: 0 auto 24px; flex-wrap: wrap; max-width: 1180px; position: sticky; top: 0; z-index: 5; background: rgba(17,18,20,0.92); padding: 8px 0; }
+  nav a { padding: 8px 14px; background: #1e1f22; border: 1px solid #2b2d31; border-radius: 999px; color: #b5bac1; font-size: 13px; }
+  nav a:hover { background: #2b2d31; color: #fff; }
   nav a.active { background: #5865F2; color: white; border-color: #5865F2; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 28px; }
-  .card { background: #252525; border: 1px solid #333; border-radius: 10px; padding: 18px; }
-  .card h2 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
-  .card .value { font-size: 28px; font-weight: bold; color: #5865F2; }
-  .section { background: #252525; border: 1px solid #333; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 0 auto 28px; max-width: 1180px; }
+  .card { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 16px 18px; }
+  .card h2 { font-size: 11px; color: #949ba4; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+  .card .value { font-size: 28px; font-weight: 700; color: #5865F2; }
+  .section { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 20px; margin: 0 auto 16px; max-width: 1180px; overflow-x: auto; }
   .section h2 { font-size: 18px; margin-bottom: 14px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #333; font-size: 14px; }
-  th { color: #888; font-size: 11px; text-transform: uppercase; }
+  table { width: 100%; border-collapse: collapse; min-width: 640px; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2b2d31; font-size: 14px; vertical-align: top; }
+  th { color: #949ba4; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
   button { background: #5865F2; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
   button:hover { background: #4752c4; }
   button:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -1555,7 +1696,8 @@ function renderLayout(user, page, params = {}, security = {}) {
     <h1>🤖 Dashboard Bot</h1>
     <div class="search-box">
       <form action="/search" method="get">
-        <input type="text" name="q" placeholder="🔍 Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
+        <input type="text" name="q" placeholder="Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
+        <button type="submit" class="secondary">Cerca</button>
       </form>
     </div>
     <div class="user">
@@ -1677,8 +1819,9 @@ function renderDashboardContent() {
   }
   async function loadBlacklist() {
     const res = await apiFetch('/api/blacklist');
-    const list = await res.json();
+    const list = await res.json().catch(() => ({}));
     const el = document.getElementById('blacklist-content');
+    if (!res.ok) { el.innerHTML = '<p class="error">' + esc(list.error || 'Blacklist non disponibile') + '</p>'; return; }
     if (!list.length) { el.innerHTML = '<p class="loading">Nessun utente in blacklist.</p>'; return; }
     el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="bl-select-all" onclick="toggleAllBL()"></th><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
       list.map(e => '<tr><td><input type="checkbox" class="bl-check" value="' + esc(e.user_id) + '"></td><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a><br><small style="color:#666">' + esc(e.user_id) + '</small></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td><td><button class="danger small" onclick="removeBL(\\'' + esc(e.user_id) + '\\')">Rimuovi</button></td></tr>').join('') +
@@ -2371,6 +2514,10 @@ function renderAccessLogsContent() {
   let allAccess = [];
   async function loadAccess() {
     const res = await apiFetch('/api/access-logs');
+    if (!res.ok) {
+      document.getElementById('access-content').innerHTML = '<p class="loading">Gli IP sono visibili solo agli admin indicati in DASHBOARD_ADMIN_IDS.</p>';
+      return;
+    }
     allAccess = await res.json();
     renderAccess();
   }
