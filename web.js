@@ -40,7 +40,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     throw new Error('SESSION_SECRET mancante o troppo corto (minimo 32 caratteri) in produzione');
   }
   const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-non-usare-in-produzione';
-  const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '')
+    .split(',')
+    .map(s => s.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
   const BLACKLIST_ADMIN_SERVERS = (process.env.BLACKLIST_ADMIN_SERVERS || '').split(',').map(s => s.trim()).filter(Boolean);
   const DASHBOARD_ROLES = ['Senior Admin'];
 
@@ -112,35 +115,39 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     return ENV_ADMIN_IDS.includes(userId);
   }
 
+  // I log scritti prima della colonna guild_id hanno il campo vuoto: vanno contati lo stesso.
+  function legacyGuildSql(ids) {
+    if (!ids.length) return { sql: '1=0', params: [] };
+    const ph = ids.map(() => '?').join(',');
+    return { sql: `(guild_id IN (${ph}) OR guild_id IS NULL OR guild_id = '')`, params: ids };
+  }
+
   function logsForViewer(userId, allowed, limit = 500) {
     if (isEnvAdmin(userId)) return storage.getAllLogs(limit);
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const ph = ids.map(() => '?').join(',');
+    const scope = legacyGuildSql([...allowed]);
+    if (scope.sql === '1=0') return [];
     return storage.db.prepare(
-      `SELECT * FROM mod_logs WHERE guild_id IN (${ph}) ORDER BY id DESC LIMIT ?`
-    ).all(...ids, limit);
+      `SELECT * FROM mod_logs WHERE ${scope.sql} ORDER BY id DESC LIMIT ?`
+    ).all(...scope.params, limit);
   }
 
   function logsForUserViewer(actorId, targetId, allowed) {
     if (isEnvAdmin(actorId)) return storage.getLogsForUser(targetId);
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const ph = ids.map(() => '?').join(',');
+    const scope = legacyGuildSql([...allowed]);
+    if (scope.sql === '1=0') return [];
     return storage.db.prepare(
-      `SELECT * FROM mod_logs WHERE target_id = ? AND guild_id IN (${ph}) ORDER BY id DESC`
-    ).all(targetId, ...ids);
+      `SELECT * FROM mod_logs WHERE target_id = ? AND ${scope.sql} ORDER BY id DESC`
+    ).all(targetId, ...scope.params);
   }
 
   function transcriptsForViewer(userId, allowed) {
     if (isEnvAdmin(userId)) return storage.getAllTranscripts ? storage.getAllTranscripts() : [];
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const ph = ids.map(() => '?').join(',');
+    const scope = legacyGuildSql([...allowed]);
+    if (scope.sql === '1=0') return [];
     return storage.db.prepare(
       `SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at
-       FROM ticket_transcripts WHERE guild_id IN (${ph}) ORDER BY id DESC LIMIT 100`
-    ).all(...ids);
+       FROM ticket_transcripts WHERE ${scope.sql} ORDER BY id DESC LIMIT 100`
+    ).all(...scope.params);
   }
 
   function countWhereGuilds(table, allowed, userId) {
@@ -148,10 +155,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get();
       return row?.c || 0;
     }
-    const ids = [...allowed];
-    if (!ids.length) return 0;
-    const ph = ids.map(() => '?').join(',');
-    const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE guild_id IN (${ph})`).get(...ids);
+    const scope = legacyGuildSql([...allowed]);
+    if (scope.sql === '1=0') return 0;
+    const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${scope.sql}`).get(...scope.params);
     return row?.c || 0;
   }
 
@@ -961,7 +967,8 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (isEnvAdmin(userId)) return { sql: '', params: [] };
     const ids = [...allowed];
     if (!ids.length) return { sql: ' AND 1=0', params: [] };
-    return { sql: ` AND guild_id IN (${ids.map(() => '?').join(',')})`, params: ids };
+    const scope = legacyGuildSql(ids);
+    return { sql: ` AND ${scope.sql}`, params: scope.params };
   }
 
   app.get('/api/charts', requireAuth, async (req, res) => {

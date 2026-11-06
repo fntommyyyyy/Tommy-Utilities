@@ -282,7 +282,7 @@ async function buildTranscriptHtml(channel) {
 // ==================== MOD LOG ====================
 const ModLogModule = {
   async logUserAction(guild, logData = {}) {
-    storage.saveLog(logData);
+    storage.saveLog({ ...logData, guildId: logData.guildId || guild?.id || null });
     try {
       if (!guild) return;
       const config = storage.getGuildConfig(guild.id);
@@ -508,7 +508,8 @@ async function closeTicket(source, user) {
             still.id, still.name, still.name.replace('ticket-', ''),
             meta?.claimed_by_tag || 'N/D',
             meta?.priority || 'N/D',
-            html
+            html,
+            still.guild?.id || null
           );
         }
         if (channel.deletable) await channel.delete();
