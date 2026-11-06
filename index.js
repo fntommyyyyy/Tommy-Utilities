@@ -16,7 +16,7 @@ const {
 } = require('discord.js');
 
 const StorageService = require('./storage');
-const { mountLobbies, renderLobbiesContent, handleLobbyCommand, lobbyCommandBuilder, handleLobbyButton } = require('./lobbies');
+const { mountLobbies, renderLobbiesContent, handleLobbyCommand, handleLobbyPrefix, lobbyCommandBuilder, handleLobbyButton } = require('./lobbies');
 const { createAdvancedLobby, handleAdvancedLobbyButton } = require('./lobbies-advanced');
 const { createWebServer } = require('./web');
 
@@ -1259,7 +1259,7 @@ function buildHelpEmbed() {
       { name: '🛡️ Moderazione', value: '`/warn` `/timeout` `/unmute` `/modlogs` `/kick` `/ban` `/unban` `/clear`', inline: true },
       { name: '🚩 Report', value: '`/report` `/reports list|close`', inline: true },
       { name: '🎭 Reaction role', value: '`/reactionrole add|remove|list|clear`', inline: true },
-      { name: '🎮 Lobby', value: '`/lobby` `/dashboard` (semplice o avanzata)', inline: true },
+      { name: '🎮 Lobby', value: '`/lobby` e `-lobby`\n`crea` `lista` `info` `iscriviti` `rimuovi` `dropmap` `codice` `elimina`', inline: false },
       { name: '🧹 Purge', value: '`/purge`', inline: true },
       { name: '🚫 Blacklist', value: '`/blacklist add|remove|list|check`', inline: true },
       { name: '📝 Note', value: '`/note add|list|remove`', inline: true },
@@ -1813,7 +1813,7 @@ const BUILTIN_PREFIX_COMMANDS = new Set([
   'help', 'stats', 'ping', 'uptime', 'kick', 'ban', 'unban', 'clear', 'purge', 'invite',
   'giverole', 'removerole', 'deleterole', 'delrole', 'roles', 'lock', 'unlock', 'addcmd', 'delcmd', 'listcmd', 'cmds',
   'remind', 'reminder', 'ticketpanel', 'ticket', 'close', 'userinfo', 'warn', 'timeout', 'unmute',
-  'modlogs', 'md', 'dashboard', 'bl', 'blacklist', 'note', 'notes', 'autorole', 'welcome'
+  'modlogs', 'md', 'dashboard', 'bl', 'blacklist', 'note', 'notes', 'autorole', 'welcome', 'lobby'
 ]);
 
 function isReservedCommandName(name) {
@@ -2182,6 +2182,8 @@ async function handlePrefixCommand(message) {
         catch { return message.reply({ embeds: [EmbedManager.error('Errore', 'Utente non trovato.')] }); }
         return handleModlogs(message, target, false);
       }
+      case 'lobby':
+        return handleLobbyPrefix(message, args, storage.db, log);
       case 'dashboard': {
         if (!isAdmin(member))
           return message.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Solo Admin.')] });

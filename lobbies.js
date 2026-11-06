@@ -211,90 +211,304 @@ function buildLobby(guild, category, now, db) {
 }
 
 // ==================== COMANDI DISCORD ====================
-async function handleLobbyCommand(interaction, db, log) {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'lobby') return false;
+function findLobbyByName(guild, name) {
+  if (!name || !guild) return null;
+  const key = slugify(String(name).trim());
+  if (!key) return null;
+  return [...guild.channels.cache.values()].find(c => {
+    if (!isLobbyCategory(c)) return false;
+    const rest = c.name.slice(LOBBY_PREFIX.length);
+    return slugify(rest) === key || rest.toLowerCase() === String(name).trim().toLowerCase();
+  }) || null;
+}
 
-  await interaction.deferReply({ ephemeral: false }).catch(() => {});
-  
-  const sub = interaction.options.getSubcommand();
-  const guild = interaction.guild;
-  const member = interaction.member;
+function listLobbyCategories(guild) {
+  return [...guild.channels.cache.values()].filter(isLobbyCategory);
+}
 
-  function findLobbyByName(name) {
-    if (!name) return null;
-    const catName = LOBBY_PREFIX + name.toLowerCase().replace(/\s+/g, '-');
-    const cat = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === catName);
-    return cat || null;
+function isLobbyAdmin(member) {
+  return !!member?.permissions?.has(PermissionsBitField.Flags.Administrator);
+}
+
+function canManageLobby(member, meta) {
+  if (!member) return false;
+  if (isLobbyAdmin(member)) return true;
+  if (meta.hostId === member.id) return true;
+  return meta.staff.some(s => s.id === member.id);
+}
+
+function channelByIdOrSuffix(guild, category, id, suffix) {
+  if (id) {
+    const ch = guild.channels.cache.get(id);
+    if (ch) return ch;
+  }
+  return [...guild.channels.cache.values()].find(c => c.parentId === category.id && c.name.endsWith(suffix)) || null;
+}
+
+function playerChannels(guild, category, meta) {
+  return [
+    channelByIdOrSuffix(guild, category, meta.chatChannelId, '-chat'),
+    channelByIdOrSuffix(guild, category, meta.codeChannelId, '-code'),
+    channelByIdOrSuffix(guild, category, meta.dropmapChannelId, '-dropmap'),
+    [...guild.channels.cache.values()].find(c => c.parentId === category.id && c.type === ChannelType.GuildVoice) || null
+  ].filter(Boolean);
+}
+
+async function runLobbyCommand({ guild, member, sub, name, targetUser, map, code, db, log, reply }) {
+  if (sub === 'lista') {
+    const cats = listLobbyCategories(guild);
+    if (!cats.length) return reply({ content: 'Nessuna lobby in questo server. Creane una con `/lobby crea` o `-lobby crea <nome>`.' });
+    const lines = cats.slice(0, 25).map(c => {
+      const meta = readMeta(db, c.id);
+      const count = listRegistrations(db, c.id).length;
+      const label = c.name.slice(LOBBY_PREFIX.length);
+      return `• **${label}** — iscritti: ${count}${meta.dropmap ? ` — mappa: ${meta.dropmap}` : ''}`;
+    }).join('\n');
+    return reply({ embeds: [new EmbedBuilder().setTitle('Lobby').setDescription(lines).setColor(0x0099FF)] });
   }
 
-  try {
-    if (sub === 'crea') {
-      const name = interaction.options.getString('nome').trim().replace(/\s+/g, ' ');
-      if (!LOBBY_NAME_RE.test(name)) return interaction.editReply({ content: '❌ Nome non valido: usa lettere, numeri, spazi, - e _' });
-      
-      const catName = LOBBY_PREFIX + name;
-      if (guild.channels.cache.some(c => c.type === ChannelType.GuildCategory && c.name === catName)) return interaction.editReply({ content: '❌ Esiste già una lobby con questo nome.' });
-
-      const overwrites = [
-        { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-        { id: member.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak] }
-      ];
-
-      const category = await guild.channels.create({ name: catName, type: ChannelType.GuildCategory, permissionOverwrites: overwrites, reason: `Lobby creata da ${member.user.tag}` });
-      
-      const regChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-registration', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-      const dropmapChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-dropmap', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-      const codeChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-code', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-      const chatChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-chat', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-      const staffChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-staff', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-      const unregChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-unreg', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-      const fillsChannel = await guild.channels.create({ name: 'lobby-' + slugify(name) + '-fills', type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
-
-      await guild.channels.create({ name: catName, type: ChannelType.GuildVoice, parent: category.id, userLimit: 0, permissionOverwrites: overwrites });
-
-      saveMeta(db, category.id, guild.id, {
-        hostId: member.id,
-        regChannelId: regChannel.id,
-        dropmapChannelId: dropmapChannel.id,
-        codeChannelId: codeChannel.id,
-        chatChannelId: chatChannel.id,
-        staffChannelId: staffChannel.id,
-        unregChannelId: unregChannel.id,
-        fillsChannelId: fillsChannel.id
-      });
-
-      const regEmbed = new EmbedBuilder()
-        .setTitle(`Lobby: ${name}`)
-        .setDescription(`Clicca **Register** per iscriverti.\nLa lobby è **${name}**.\n\n**Host:** <@${member.id}>`)
-        .setColor(0x0099FF)
-        .setTimestamp();
-      
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`register_lobby_${category.id}`).setLabel('Register').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`host_ingame_${category.id}`).setLabel('Host in game').setStyle(ButtonStyle.Secondary)
-      );
-      await regChannel.send({ embeds: [regEmbed], components: [row] });
-
-      await unregChannel.send({ 
-        content: 'Clicca **Unregister** per disiscriverti dalla lobby.',
-        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unregister_lobby_${category.id}`).setLabel('Unregister').setStyle(ButtonStyle.Danger))]
-      });
-
-      await fillsChannel.send({ 
-        content: 'Qui puoi offrirti come rimpiazzo per la lobby.',
-        components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`fill_lobby_${category.id}`).setLabel('Offriti come rimpiazzo').setStyle(ButtonStyle.Primary))]
-      });
-
-      return interaction.editReply({ content: `✅ Lobby **${name}** creata con successo!\nCanale di registrazione: <#${regChannel.id}>` });
+  if (sub === 'crea') {
+    const clean = String(name || '').trim().replace(/\s+/g, ' ');
+    if (!clean || !LOBBY_NAME_RE.test(clean) || clean.length > 30) {
+      return reply({ content: '❌ Nome non valido: usa lettere, numeri, spazi, - e _ (max 30).' });
+    }
+    const slug = slugify(clean);
+    const catName = LOBBY_PREFIX + slug;
+    if (findLobbyByName(guild, clean) || guild.channels.cache.some(c => c.type === ChannelType.GuildCategory && c.name === catName)) {
+      return reply({ content: '❌ Esiste già una lobby con questo nome.' });
+    }
+    const me = guild.members.me;
+    if (me && !me.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+      return reply({ content: '❌ Il bot non ha il permesso di gestire i canali.' });
     }
 
-    // ... (il resto dei comandi è identico a prima, li ometto per brevità ma sono presenti nel file finale)
-    // ...
-    
-    return interaction.editReply({ content: '❌ Comando non riconosciuto.' });
+    const allow = [
+      PermissionsBitField.Flags.ViewChannel,
+      PermissionsBitField.Flags.SendMessages,
+      PermissionsBitField.Flags.ReadMessageHistory,
+      PermissionsBitField.Flags.Connect,
+      PermissionsBitField.Flags.Speak
+    ];
+    const overwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+      { id: member.id, allow }
+    ];
+    if (me) overwrites.push({ id: me.id, allow });
+
+    const category = await guild.channels.create({ name: catName, type: ChannelType.GuildCategory, permissionOverwrites: overwrites, reason: `Lobby creata da ${member.user.tag}` });
+    const regChannel = await guild.channels.create({ name: `${catName}-registration`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    const dropmapChannel = await guild.channels.create({ name: `${catName}-dropmap`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    const codeChannel = await guild.channels.create({ name: `${catName}-code`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    const chatChannel = await guild.channels.create({ name: `${catName}-chat`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    const staffChannel = await guild.channels.create({ name: `${catName}-staff`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    const unregChannel = await guild.channels.create({ name: `${catName}-unreg`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    const fillsChannel = await guild.channels.create({ name: `${catName}-fills`, type: ChannelType.GuildText, parent: category.id, permissionOverwrites: overwrites });
+    await guild.channels.create({ name: catName, type: ChannelType.GuildVoice, parent: category.id, userLimit: 0, permissionOverwrites: overwrites });
+
+    saveMeta(db, category.id, guild.id, {
+      hostId: member.id,
+      regChannelId: regChannel.id,
+      dropmapChannelId: dropmapChannel.id,
+      codeChannelId: codeChannel.id,
+      chatChannelId: chatChannel.id,
+      staffChannelId: staffChannel.id,
+      unregChannelId: unregChannel.id,
+      fillsChannelId: fillsChannel.id
+    });
+
+    const regEmbed = new EmbedBuilder()
+      .setTitle(`Lobby: ${clean}`)
+      .setDescription(`Clicca **Register** per iscriverti.\nLa lobby è **${clean}**.\n\n**Host:** <@${member.id}>`)
+      .setColor(0x0099FF)
+      .setTimestamp();
+    await regChannel.send({
+      embeds: [regEmbed],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`register_lobby_${category.id}`).setLabel('Register').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`host_ingame_${category.id}`).setLabel('Host in game').setStyle(ButtonStyle.Secondary)
+      )]
+    });
+    await unregChannel.send({
+      content: 'Clicca **Unregister** per disiscriverti dalla lobby.',
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unregister_lobby_${category.id}`).setLabel('Unregister').setStyle(ButtonStyle.Danger))]
+    });
+    await fillsChannel.send({
+      content: 'Qui puoi offrirti come rimpiazzo per la lobby.',
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`fill_lobby_${category.id}`).setLabel('Offriti come rimpiazzo').setStyle(ButtonStyle.Primary))]
+    });
+
+    return reply({ content: `✅ Lobby **${clean}** creata.\nRegistrazione: <#${regChannel.id}>` });
+  }
+
+  const category = findLobbyByName(guild, name);
+  if (!category) return reply({ content: '❌ Lobby non trovata. Controlla il nome con `/lobby lista`.' });
+  const meta = readMeta(db, category.id);
+  const label = category.name.slice(LOBBY_PREFIX.length);
+
+  if (sub === 'info') {
+    const regs = listRegistrations(db, category.id);
+    const names = regs.slice(0, 20).map(r => r.username).join(', ') || 'nessuno';
+    const seeCode = canManageLobby(member, meta) || hasRegistration(db, category.id, member.id);
+    return reply({
+      embeds: [new EmbedBuilder()
+        .setTitle(`Lobby ${label}`)
+        .setColor(0x0099FF)
+        .addFields(
+          { name: 'Host', value: meta.hostId ? `<@${meta.hostId}>` : 'N/D', inline: true },
+          { name: 'Iscritti', value: meta.slots > 0 ? `${regs.length}/${meta.slots}` : String(regs.length), inline: true },
+          { name: 'Iscrizioni', value: meta.regOpen ? 'Aperte' : 'Chiuse', inline: true },
+          { name: 'Dropmap', value: meta.dropmap || 'Non impostata', inline: true },
+          { name: 'Codice', value: meta.code ? (seeCode ? meta.code : 'Impostato') : 'Non impostato', inline: true },
+          { name: 'Nomi', value: names.slice(0, 1024), inline: false }
+        )]
+    });
+  }
+
+  if (sub === 'iscriviti') {
+    const targetMember = targetUser
+      ? await guild.members.fetch(targetUser.id).catch(() => null)
+      : member;
+    if (!targetMember) return reply({ content: '❌ Utente non trovato nel server.' });
+    if (targetUser && targetUser.id !== member.id && !canManageLobby(member, meta)) {
+      return reply({ content: '❌ Solo host, staff o admin possono iscrivere un altro utente.' });
+    }
+    if (targetMember.user.bot) return reply({ content: '❌ Un bot non può iscriversi.' });
+    if (!meta.regOpen && !canManageLobby(member, meta)) return reply({ content: '❌ Iscrizioni chiuse.' });
+    const count = listRegistrations(db, category.id).length;
+    if (meta.slots > 0 && count >= meta.slots && !hasRegistration(db, category.id, targetMember.id)) {
+      return reply({ content: '❌ Lobby piena.' });
+    }
+    if (hasRegistration(db, category.id, targetMember.id)) return reply({ content: '❌ Già iscritto.' });
+    addRegistration(db, category.id, targetMember.id, targetMember.displayName);
+    await applyAccess(guild, category, targetMember, 'player', 'Iscrizione lobby', log, playerChannels(guild, category, meta));
+    return reply({ content: `✅ <@${targetMember.id}> iscritto a **${label}**.` });
+  }
+
+  if (sub === 'rimuovi') {
+    if (!canManageLobby(member, meta)) return reply({ content: '❌ Solo host, staff o admin possono rimuovere un iscritto.' });
+    if (!targetUser) return reply({ content: '❌ Indica l\'utente da rimuovere.' });
+    if (targetUser.id === meta.hostId) return reply({ content: '❌ Non puoi rimuovere l\'host.' });
+    if (!removeRegistration(db, category.id, targetUser.id)) return reply({ content: '❌ Quell\'utente non è iscritto.' });
+    const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+    if (targetMember) {
+      const level = accessLevel(meta, targetMember.id, false);
+      await applyAccess(guild, category, targetMember, level === 'none' ? 'none' : level, 'Rimozione lobby', log, playerChannels(guild, category, meta));
+    }
+    return reply({ content: `✅ <@${targetUser.id}> rimosso da **${label}**.` });
+  }
+
+  if (sub === 'dropmap') {
+    if (!canManageLobby(member, meta)) return reply({ content: '❌ Solo host, staff o admin possono impostare la dropmap.' });
+    const value = String(map || '').trim().slice(0, 80);
+    if (!value) return reply({ content: '❌ Indica il nome della mappa.' });
+    saveMeta(db, category.id, guild.id, { dropmap: value });
+    const ch = channelByIdOrSuffix(guild, category, meta.dropmapChannelId, '-dropmap');
+    if (ch) await ch.send({ embeds: [new EmbedBuilder().setTitle('Dropmap').setDescription(`**${value}**`).setColor(0x0099FF)] }).catch(() => {});
+    return reply({ content: `✅ Dropmap di **${label}** impostata: **${value}**.` });
+  }
+
+  if (sub === 'codice') {
+    if (!canManageLobby(member, meta)) return reply({ content: '❌ Solo host, staff o admin possono impostare il codice.' });
+    const value = String(code || '').trim();
+    if (!CODE_RE.test(value)) return reply({ content: '❌ Codice non valido: lettere, numeri e trattino, max 30.' });
+    saveMeta(db, category.id, guild.id, { code: value });
+    const ch = channelByIdOrSuffix(guild, category, meta.codeChannelId, '-code');
+    if (ch) await ch.send({ embeds: [new EmbedBuilder().setTitle('Codice lobby').setDescription(`\`${value}\``).setColor(0x0099FF)] }).catch(() => {});
+    return reply({ content: `✅ Codice di **${label}** impostato.` });
+  }
+
+  if (sub === 'elimina') {
+    if (!(isLobbyAdmin(member) || meta.hostId === member.id)) return reply({ content: '❌ Solo l\'host o un admin possono eliminare la lobby.' });
+    const reason = `Lobby eliminata da ${member.user.tag}`;
+    const children = [...guild.channels.cache.values()].filter(c => c.parentId === category.id);
+    for (const ch of children) await ch.delete(reason).catch(err => log.warn(`Impossibile eliminare ${ch.name}: ${err.message}`));
+    await category.delete(reason);
+    deleteLobbyData(db, category.id);
+    return reply({ content: `✅ Lobby **${label}** eliminata.` });
+  }
+
+  return reply({ content: '❌ Comando non riconosciuto. Usa crea, iscriviti, rimuovi, dropmap, codice, info, lista, elimina.' });
+}
+
+async function handleLobbyCommand(interaction, db, log) {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'lobby') return false;
+  await interaction.deferReply({ ephemeral: false }).catch(() => {});
+  const sub = interaction.options.getSubcommand();
+  try {
+    return await runLobbyCommand({
+      guild: interaction.guild,
+      member: interaction.member,
+      sub,
+      name: interaction.options.getString('nome') || interaction.options.getString('lobby'),
+      targetUser: interaction.options.getUser('utente'),
+      map: interaction.options.getString('mappa'),
+      code: interaction.options.getString('codice'),
+      db,
+      log,
+      reply: (payload) => interaction.editReply(payload)
+    });
   } catch (e) {
     log.err('lobby command', e);
     return interaction.editReply({ content: '❌ Errore durante l\'esecuzione del comando.' });
+  }
+}
+
+const LOBBY_HELP = [
+  '**Lobby** — slash `/lobby` oppure prefisso `-lobby` / `&lobby`',
+  '`crea <nome>` — crea la lobby',
+  '`lista` — elenca le lobby',
+  '`info <nome>` — dettagli',
+  '`iscriviti <nome>` — iscriviti',
+  '`rimuovi <nome> @utente` — togli un iscritto',
+  '`dropmap <nome> | <mappa>` — imposta la mappa',
+  '`codice <nome> | <codice>` — imposta il codice',
+  '`elimina <nome>` — elimina la lobby'
+].join('\n');
+
+async function handleLobbyPrefix(message, args, db, log) {
+  const reply = (payload) => message.channel.send(payload);
+  const sub = (args.shift() || '').toLowerCase();
+  if (!sub || sub === 'help') return reply({ content: LOBBY_HELP });
+
+  let targetUser = null;
+  const mentionIdx = args.findIndex(a => /^<@!?\d{17,20}>$/.test(a) || /^\d{17,20}$/.test(a));
+  if (mentionIdx !== -1) {
+    const id = (args[mentionIdx].match(/\d{17,20}/) || [])[0];
+    args.splice(mentionIdx, 1);
+    targetUser = await message.client.users.fetch(id).catch(() => null);
+  }
+
+  let name = null;
+  let map = null;
+  let code = null;
+  const rest = args.join(' ').trim();
+  if (sub === 'crea' || sub === 'info' || sub === 'elimina' || sub === 'iscriviti') {
+    name = rest;
+  } else if (sub === 'rimuovi') {
+    name = rest;
+  } else if (sub === 'dropmap' || sub === 'codice') {
+    const [left, right] = rest.split('|').map(s => s.trim());
+    name = left;
+    if (sub === 'dropmap') map = right;
+    else code = right;
+  }
+
+  try {
+    return await runLobbyCommand({
+      guild: message.guild,
+      member: message.member,
+      sub,
+      name,
+      targetUser,
+      map,
+      code,
+      db,
+      log,
+      reply
+    });
+  } catch (e) {
+    log.err('lobby prefix', e);
+    return reply({ content: '❌ Errore durante l\'esecuzione del comando.' });
   }
 }
 
@@ -958,6 +1172,7 @@ module.exports = {
   mountLobbies,
   renderLobbiesContent,
   handleLobbyCommand,
+  handleLobbyPrefix,
   lobbyCommandBuilder,
   handleLobbyButton,
   saveMeta
