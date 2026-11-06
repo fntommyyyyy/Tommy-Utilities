@@ -2728,13 +2728,22 @@ client.once(Events.ClientReady, () => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
+      // 1. Controlla se è il comando /lobby
+      if (interaction.commandName === 'lobby') {
+        return await handleLobbyCommand(interaction, storage.db, log);
+      }
+
+      // 2. Controlla le feature
       for (const feature of features) {
         if (feature.handleSlash && feature.slashCommands?.some(c => c.name === interaction.commandName)) {
           const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin };
           return await feature.handleSlash(interaction, ctx);
         }
       }
+      
+      // 3. Altrimenti usa il gestore predefinito
       await handleSlashCommand(interaction);
+
     } else if (interaction.isButton()) {
       for (const feature of features) {
         if (feature.handleButton) {
@@ -2764,7 +2773,7 @@ async function registerSlashCommands(clientId, token) {
   const rest = new REST({ version: '10' }).setToken(token);
   try {
     log.info('🔄 Pulizia e registrazione slash commands...');
-    const commandsData = slashCommands.map(c => c.toJSON());
+    const commandsData = [...slashCommands.map(c => c.toJSON()), lobbyCommandBuilder.toJSON()];
 
     if (GUILD_ID) {
       try {
