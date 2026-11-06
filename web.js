@@ -1,4 +1,5 @@
 // web.js — Dashboard web (sicurezza + azioni di moderazione allineate al bot)
+const { mountLobbies, renderLobbiesContent } = require('./lobbies');
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
