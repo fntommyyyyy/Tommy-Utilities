@@ -16,7 +16,8 @@ const {
 } = require('discord.js');
 
 const StorageService = require('./storage');
-const { mountLobbies, renderLobbiesContent, handleLobbyCommand, lobbyCommandBuilder } = require('./lobbies');
+const { mountLobbies, renderLobbiesContent, handleLobbyCommand, lobbyCommandBuilder, handleLobbyButton } = require('./lobbies');
+const { createAdvancedLobby, handleAdvancedLobbyButton } = require('./lobbies-advanced');
 const { createWebServer } = require('./web');
 
 // ==================== VALIDAZIONE ENV ====================
@@ -1256,6 +1257,9 @@ function buildHelpEmbed() {
     .addFields(
       { name: '🎫 Ticket', value: '`/ticketpanel` `/ticket` `/close`', inline: true },
       { name: '🛡️ Moderazione', value: '`/warn` `/timeout` `/unmute` `/modlogs` `/kick` `/ban` `/unban` `/clear`', inline: true },
+      { name: '🚩 Report', value: '`/report` `/reports list|close`', inline: true },
+      { name: '🎭 Reaction role', value: '`/reactionrole add|remove|list|clear`', inline: true },
+      { name: '🎮 Lobby', value: '`/lobby` `/dashboard` (semplice o avanzata)', inline: true },
       { name: '🧹 Purge', value: '`/purge`', inline: true },
       { name: '🚫 Blacklist', value: '`/blacklist add|remove|list|check`', inline: true },
       { name: '📝 Note', value: '`/note add|list|remove`', inline: true },
@@ -1762,9 +1766,10 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildModeration
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildMessageReactions
   ],
-  partials: [Partials.Channel, Partials.Message, Partials.User, Partials.GuildMember]
+  partials: [Partials.Channel, Partials.Message, Partials.User, Partials.GuildMember, Partials.Reaction]
 });
 clientRef = client;
 
@@ -2181,10 +2186,11 @@ async function handlePrefixCommand(message) {
         if (!isAdmin(member))
           return message.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Solo Admin.')] });
         const row = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('create_lobby').setLabel('Crea Lobby').setStyle(ButtonStyle.Primary)
+          new ButtonBuilder().setCustomId('create_lobby').setLabel('Lobby semplice').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('create_advanced_lobby').setLabel('Lobby avanzata').setStyle(ButtonStyle.Primary)
         );
         return channel.send({
-          embeds: [EmbedManager.info('Crea Lobby', 'Clicca per creare una lobby privata.')],
+          embeds: [EmbedManager.info('Crea Lobby', 'Semplice: chat + vocale. Avanzata: registration, dropmap, code, chat, staff, unreg, fills e vocale.')],
           components: [row]
         });
       }
@@ -2668,10 +2674,11 @@ async function handleSlashCommand(interaction) {
       if (!isAdmin(member))
         return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Solo Admin.')], ephemeral: true });
       const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('create_lobby').setLabel('Crea Lobby').setStyle(ButtonStyle.Primary)
+        new ButtonBuilder().setCustomId('create_lobby').setLabel('Lobby semplice').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('create_advanced_lobby').setLabel('Lobby avanzata').setStyle(ButtonStyle.Primary)
       );
       return interaction.reply({
-        embeds: [EmbedManager.info('Crea Lobby', 'Clicca per creare una lobby privata.')],
+        embeds: [EmbedManager.info('Crea Lobby', 'Semplice: chat + vocale. Avanzata: registration, dropmap, code, chat, staff, unreg, fills e vocale.')],
         components: [row]
       });
     }
@@ -2788,10 +2795,51 @@ async function handleSlashCommand(interaction) {
 }
 
 // ==================== BUTTONS ====================
+async function createAdvancedLobbyInteraction(interaction) {
+  const user = interaction.user;
+  const guild = interaction.guild;
+  const botMember = guild.members.me;
+  if (!botMember?.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+    return safeReply(interaction, {
+      embeds: [EmbedManager.error('Permessi Insufficienti', 'Il bot non ha il permesso di gestire canali.')],
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const { category, channels } = await createAdvancedLobby(guild, interaction.member, user.username, log, storage.db);
+    const embed = EmbedManager.success('Lobby avanzata creata', `Struttura pronta per ${user}.`)
+      .addFields(
+        { name: 'Categoria', value: category.name, inline: true },
+        { name: 'Registration', value: `${channels.reg}`, inline: true },
+        { name: 'Vocale', value: `${channels.voice}`, inline: true }
+      );
+    return interaction.editReply({ embeds: [embed] });
+  } catch (err) {
+    if (err && err.message === 'EXISTS') {
+      return interaction.editReply({
+        embeds: [EmbedManager.error('Lobby Esistente', 'Hai già una lobby avanzata con questo nome.')]
+      });
+    }
+    log.err('createAdvancedLobby', err);
+    return interaction.editReply({
+      embeds: [EmbedManager.error('Errore', 'Errore nella creazione della lobby avanzata.')]
+    });
+  }
+}
+
 async function handleButton(interaction) {
   if (interaction.customId === 'create_ticket') return createTicket(interaction, interaction.user);
   if (interaction.customId === 'close_ticket') return closeTicket(interaction, interaction.user);
   if (interaction.customId === 'create_lobby') return createLobby(interaction);
+  if (interaction.customId === 'create_advanced_lobby') return createAdvancedLobbyInteraction(interaction);
+
+  if (interaction.customId.startsWith('adv_')) {
+    const handled = await handleAdvancedLobbyButton(interaction, storage.db, log);
+    if (handled !== false) return;
+  }
+  if (await handleLobbyButton(interaction, storage.db, log)) return;
 
   if (interaction.customId === 'claim_ticket') {
     const ch = interaction.channel;
@@ -2860,7 +2908,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       // 2. Controlla le feature
       for (const feature of features) {
         if (feature.handleSlash && feature.slashCommands?.some(c => c.name === interaction.commandName)) {
-          const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin };
+          const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin, modLog: (guild, data) => ModLogModule.logUserAction(guild, data) };
           return await feature.handleSlash(interaction, ctx);
         }
       }
@@ -2871,7 +2919,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } else if (interaction.isButton()) {
       for (const feature of features) {
         if (feature.handleButton) {
-          const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin };
+          const ctx = { client, storage, log, EmbedManager, safeReply, safeReplySource, hasStaffOrAdmin, isAdmin, modLog: (guild, data) => ModLogModule.logUserAction(guild, data) };
           const handled = await feature.handleButton(interaction, ctx);
           if (handled) return;
         }

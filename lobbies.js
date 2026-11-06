@@ -954,4 +954,11 @@ function renderLobbiesContent() {
   </script>`;
 }
 
-module.exports = { mountLobbies, renderLobbiesContent, handleLobbyCommand, lobbyCommandBuilder, handleLobbyButton };
+module.exports = {
+  mountLobbies,
+  renderLobbiesContent,
+  handleLobbyCommand,
+  lobbyCommandBuilder,
+  handleLobbyButton,
+  saveMeta
+};

@@ -1,25 +1,59 @@
 // lobbies-advanced.js — Sistema di lobby avanzate (stile Nova)
 const { ChannelType, PermissionsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { saveMeta } = require('./lobbies');
 
-// Questa funzione crea la struttura completa di una lobby
-async function createAdvancedLobby(guild, hostMember, lobbyName, log) {
-  const slug = lobbyName.toLowerCase().replace(/\s+/g, '-');
+function slugify(name) {
+  const slug = String(name || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return slug || 'lobby';
+}
 
-  // Permessi base: nessuno può vedere, tranne l'host
-  const overwrites = [
-    { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-    { id: hostMember.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.Speak] }
+function findChild(guild, categoryId, suffix) {
+  return guild.channels.cache.find(c => c.parentId === categoryId && c.name.endsWith(suffix)) || null;
+}
+
+// Crea la struttura completa di una lobby e la registra in lobby_meta
+async function createAdvancedLobby(guild, hostMember, lobbyName, log, db) {
+  const slug = slugify(lobbyName);
+  const categoryName = `lobby-${slug}`;
+
+  const existing = guild.channels.cache.find(
+    c => c.type === ChannelType.GuildCategory && c.name === categoryName
+  );
+  if (existing) {
+    const err = new Error('EXISTS');
+    err.category = existing;
+    throw err;
+  }
+
+  const allow = [
+    PermissionsBitField.Flags.ViewChannel,
+    PermissionsBitField.Flags.SendMessages,
+    PermissionsBitField.Flags.ReadMessageHistory,
+    PermissionsBitField.Flags.Connect,
+    PermissionsBitField.Flags.Speak
   ];
 
-  // 1. Crea la categoria
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+    { id: hostMember.id, allow }
+  ];
+  if (guild.members.me) {
+    overwrites.push({ id: guild.members.me.id, allow });
+  }
+
   const category = await guild.channels.create({
-    name: `lobby-${slug}`,
+    name: categoryName,
     type: ChannelType.GuildCategory,
     permissionOverwrites: overwrites,
     reason: `Lobby avanzata creata da ${hostMember.user.tag}`
   });
 
-  // 2. Crea i canali
   const channels = {};
   const channelNames = [
     { key: 'reg', name: `lobby-${slug}-registration`, type: ChannelType.GuildText },
@@ -37,11 +71,24 @@ async function createAdvancedLobby(guild, hostMember, lobbyName, log) {
       name: ch.name,
       type: ch.type,
       parent: category.id,
-      permissionOverwrites: overwrites
+      permissionOverwrites: overwrites,
+      reason: `Lobby avanzata creata da ${hostMember.user.tag}`
     });
   }
 
-  // 3. Invia i messaggi con i bottoni nei canali principali
+  if (db) {
+    saveMeta(db, category.id, guild.id, {
+      hostId: hostMember.id,
+      regChannelId: channels.reg.id,
+      dropmapChannelId: channels.dropmap.id,
+      codeChannelId: channels.code.id,
+      chatChannelId: channels.chat.id,
+      staffChannelId: channels.staff.id,
+      unregChannelId: channels.unreg.id,
+      fillsChannelId: channels.fills.id
+    });
+  }
+
   const regEmbed = new EmbedBuilder()
     .setTitle(`Lobby: ${lobbyName}`)
     .setDescription(`Clicca **Register** per iscriverti.\n**Host:** <@${hostMember.id}>`)
@@ -64,10 +111,17 @@ async function createAdvancedLobby(guild, hostMember, lobbyName, log) {
   await channels.fills.send({ content: 'Clicca se vuoi essere un rimpiazzo.', components: [fillRow] });
 
   log.ok(`Lobby avanzata "${lobbyName}" creata con successo.`);
-  return category;
+  return { category, channels };
 }
 
-// Questa funzione gestisce i bottoni (da chiamare in index.js)
+function accessChannels(guild, categoryId) {
+  return [
+    findChild(guild, categoryId, '-chat'),
+    findChild(guild, categoryId, '-code'),
+    findChild(guild, categoryId, '-dropmap')
+  ].filter(Boolean);
+}
+
 async function handleAdvancedLobbyButton(interaction, db, log) {
   const id = interaction.customId;
   if (!id.startsWith('adv_')) return false;
@@ -81,42 +135,50 @@ async function handleAdvancedLobbyButton(interaction, db, log) {
   const category = guild.channels.cache.get(categoryId);
   if (!category) return interaction.reply({ content: '❌ Lobby non trovata.', ephemeral: true });
 
-  if (action === 'register') {
-    // Diamo i permessi per chat, code e dropmap
-    const channelsToGive = [
-      guild.channels.cache.find(c => c.parentId === category.id && c.name.endsWith('-chat')),
-      guild.channels.cache.find(c => c.parentId === category.id && c.name.endsWith('-code')),
-      guild.channels.cache.find(c => c.parentId === category.id && c.name.endsWith('-dropmap'))
-    ].filter(Boolean);
-
-    for (const ch of channelsToGive) {
-      await ch.permissionOverwrites.edit(member, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+  try {
+    if (action === 'register') {
+      if (db) {
+        const already = db.prepare('SELECT 1 FROM lobby_registrations WHERE category_id = ? AND user_id = ?').get(categoryId, member.id);
+        if (already) return interaction.reply({ content: '❌ Sei già iscritto.', ephemeral: true });
+        db.prepare('INSERT OR IGNORE INTO lobby_registrations (category_id, user_id, username, registered_at) VALUES (?, ?, ?, ?)')
+          .run(categoryId, member.id, member.displayName, new Date().toISOString());
+      }
+      for (const ch of accessChannels(guild, category.id)) {
+        await ch.permissionOverwrites.edit(member, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
+      }
+      return interaction.reply({ content: '✅ Iscrizione avvenuta con successo!', ephemeral: true });
     }
-    return interaction.reply({ content: '✅ Iscrizione avvenuta con successo!', ephemeral: true });
-  }
 
-  if (action === 'unregister') {
-    const channelsToRemove = [
-      guild.channels.cache.find(c => c.parentId === category.id && c.name.endsWith('-chat')),
-      guild.channels.cache.find(c => c.parentId === category.id && c.name.endsWith('-code')),
-      guild.channels.cache.find(c => c.parentId === category.id && c.name.endsWith('-dropmap'))
-    ].filter(Boolean);
-
-    for (const ch of channelsToRemove) {
-      await ch.permissionOverwrites.delete(member);
+    if (action === 'unregister') {
+      if (db) {
+        const removed = db.prepare('DELETE FROM lobby_registrations WHERE category_id = ? AND user_id = ?').run(categoryId, member.id).changes > 0;
+        if (!removed) return interaction.reply({ content: '❌ Non eri iscritto.', ephemeral: true });
+      }
+      for (const ch of accessChannels(guild, category.id)) {
+        await ch.permissionOverwrites.delete(member.id).catch(() => {});
+      }
+      return interaction.reply({ content: '✅ Disiscrizione avvenuta con successo!', ephemeral: true });
     }
-    return interaction.reply({ content: '✅ Disiscrizione avvenuta con successo!', ephemeral: true });
-  }
 
-  if (action === 'host') {
-    return interaction.reply({ content: '✅ Host in game! La lobby è ora in corso.', ephemeral: true });
-  }
+    if (action === 'host') {
+      if (db) {
+        const meta = db.prepare('SELECT host_id FROM lobby_meta WHERE category_id = ?').get(categoryId);
+        if (meta?.host_id && meta.host_id !== member.id) {
+          return interaction.reply({ content: '❌ Solo l\'host può usare questo bottone.', ephemeral: true });
+        }
+      }
+      return interaction.reply({ content: '✅ Host in game! La lobby è ora in corso.', ephemeral: true });
+    }
 
-  if (action === 'fill') {
-    return interaction.reply({ content: '✅ Ti sei offerto come rimpiazzo!', ephemeral: true });
-  }
+    if (action === 'fill') {
+      return interaction.reply({ content: '✅ Ti sei offerto come rimpiazzo!', ephemeral: true });
+    }
 
-  return false;
+    return false;
+  } catch (err) {
+    log.err('advanced lobby button', err);
+    return interaction.reply({ content: '❌ Errore durante l\'azione sulla lobby.', ephemeral: true });
+  }
 }
 
 module.exports = { createAdvancedLobby, handleAdvancedLobbyButton };

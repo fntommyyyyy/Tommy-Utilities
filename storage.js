@@ -187,25 +187,6 @@ class StorageService {
         updated_at TEXT NOT NULL
       );
 
-      CREATE TABLE IF NOT EXISTS antinuke_config (
-        guild_id TEXT PRIMARY KEY,
-        threshold_channel INTEGER DEFAULT 3,
-        threshold_role INTEGER DEFAULT 3,
-        threshold_ban INTEGER DEFAULT 3,
-        threshold_role_update INTEGER DEFAULT 3,
-        window_ms INTEGER DEFAULT 10000,
-        punishment TEXT DEFAULT 'quarantine',
-        whitelist_ids TEXT DEFAULT '',
-        updated_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS quarantine_roles (
-        user_id TEXT NOT NULL,
-        guild_id TEXT NOT NULL,
-        role_id TEXT NOT NULL,
-        PRIMARY KEY (user_id, guild_id, role_id)
-      );
-
       -- TABELLE PER LE LOBBY AVANZATE
       CREATE TABLE IF NOT EXISTS lobby_meta (
         category_id TEXT PRIMARY KEY,
@@ -234,6 +215,8 @@ class StorageService {
         PRIMARY KEY (category_id, user_id)
       );
     `);
+
+    this.db.exec('DROP TABLE IF EXISTS antinuke_config; DROP TABLE IF EXISTS quarantine_roles;');
 
     // MIGRAZIONE AUTOMATICA per lobby_meta (aggiunge colonne mancanti se la tabella esiste già)
     try {
@@ -459,8 +442,7 @@ class StorageService {
         updated_at = @updatedAt
     `);
 
-    // ANTI-NUKE prepared statements rimossi
-    // QUARANTINE prepared statements rimossi
+    this._repGet = this.db.prepare('SELECT * FROM reports WHERE id = ? AND guild_id = ?');
 
     this._logCounter = 0;
   }
@@ -619,6 +601,7 @@ class StorageService {
     return res.lastInsertRowid;
   }
   getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
+  getReport(guildId, id) { return this._repGet.get(id, guildId) || null; }
   setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
 
   // ==================== DASHBOARD ACCESS ====================
@@ -654,9 +637,6 @@ class StorageService {
       updatedAt: new Date().toISOString()
     });
   }
-
-  // ANTI-NUKE metodi pubblici rimossi
-  // QUARANTINE metodi pubblici rimossi
 
   // ==================== CLOSE ====================
   close() {
