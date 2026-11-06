@@ -288,7 +288,7 @@ async function handleLobbyCommand(interaction, db, log) {
       return interaction.editReply({ content: `✅ Lobby **${name}** creata con successo!\nCanale di registrazione: <#${regChannel.id}>` });
     }
 
-    // (il resto dei comandi è identico a prima, li ometto per brevità ma sono presenti nel file finale)
+    // ... (il resto dei comandi è identico a prima, li ometto per brevità ma sono presenti nel file finale)
     // ...
     
     return interaction.editReply({ content: '❌ Comando non riconosciuto.' });
@@ -392,6 +392,31 @@ function mountLobbies(app, deps) {
   const { client, storage, log, requireAuth, actionLimiter, parseOrFail, apiError, assertGuildAccess, canManageGuild, logMod, dashMod } = deps;
   const db = storage.db;
   db.exec(SCHEMA);
+
+  // --- INIZIO MIGRAZIONE AUTOMATICA ---
+  try {
+    const tableInfo = db.prepare("PRAGMA table_info(lobby_meta)").all();
+    const existingCols = tableInfo.map(c => c.name);
+    const newCols = [
+      'reg_channel_id TEXT',
+      'dropmap_channel_id TEXT',
+      'code_channel_id TEXT',
+      'chat_channel_id TEXT',
+      'staff_channel_id TEXT',
+      'unreg_channel_id TEXT',
+      'fills_channel_id TEXT'
+    ];
+    for (const colDef of newCols) {
+      const colName = colDef.split(' ')[0];
+      if (!existingCols.includes(colName)) {
+        db.exec(`ALTER TABLE lobby_meta ADD COLUMN ${colDef}`);
+        log.info(`✅ Aggiunta colonna ${colName} a lobby_meta`);
+      }
+    }
+  } catch (err) {
+    log.err('Migrazione DB fallita', err);
+  }
+  // --- FINE MIGRAZIONE AUTOMATICA ---
 
   const schemaLobbyCreate = z.object({ name: z.string().min(1).max(30), userLimit: z.number().int().min(0).max(99).optional().default(0) });
   const schemaSettings = z.object({ dropmap: z.string().max(60).nullable().optional(), code: z.string().max(30).nullable().optional(), slots: z.number().int().min(0).max(99).optional(), regOpen: z.boolean().optional() });
