@@ -258,6 +258,18 @@ class StorageService {
     } catch (err) {
       console.error('❌ Migrazione lobby_meta fallita:', err);
     }
+
+    this._ensureColumn('mod_logs', 'guild_id', 'TEXT');
+    this._ensureColumn('ticket_transcripts', 'guild_id', 'TEXT');
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_mod_logs_guild ON mod_logs(guild_id)'); } catch {}
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_tr_guild ON ticket_transcripts(guild_id)'); } catch {}
+  }
+
+  _ensureColumn(table, column, type) {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!cols.some(c => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   _prepare() {
@@ -273,8 +285,8 @@ class StorageService {
 
     // ===== MOD LOGS =====
     this._insertLog = this.db.prepare(`
-      INSERT INTO mod_logs (type, target_id, target, moderator, reason, duration, channel, timestamp)
-      VALUES (@type, @targetId, @target, @moderator, @reason, @duration, @channel, @timestamp)
+      INSERT INTO mod_logs (type, target_id, target, moderator, reason, duration, channel, guild_id, timestamp)
+      VALUES (@type, @targetId, @target, @moderator, @reason, @duration, @channel, @guildId, @timestamp)
     `);
     this._logsByTarget = this.db.prepare('SELECT * FROM mod_logs WHERE target_id = ? ORDER BY id DESC');
     this._allLogs = this.db.prepare('SELECT * FROM mod_logs ORDER BY id DESC LIMIT ?');
@@ -428,8 +440,8 @@ class StorageService {
 
     // ===== TICKET TRANSCRIPTS =====
     this._trInsert = this.db.prepare(`
-      INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, created_at)
-      VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @html, @createdAt)
+      INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, guild_id, created_at)
+      VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @html, @guildId, @createdAt)
     `);
     this._trAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
     this._trGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
@@ -467,6 +479,7 @@ class StorageService {
         targetId: entry.targetId || null, target: entry.target || null,
         moderator: entry.moderator || null, reason: entry.reason || null,
         duration: entry.duration || null, channel: entry.channel || null,
+        guildId: entry.guildId || null,
         timestamp: new Date().toISOString()
       });
       if (++this._logCounter % 100 === 0) this._trimLogs.run();
@@ -615,12 +628,13 @@ class StorageService {
   getDashboardAccessLogs(limit = 500) { return this._getAccess.all(limit); }
 
   // ==================== TICKET TRANSCRIPTS ====================
-  saveTranscript(channelId, channelName, userId, claimedBy, priority, html) {
+  saveTranscript(channelId, channelName, userId, claimedBy, priority, html, guildId = null) {
     const res = this._trInsert.run({
       channelId, channelName, userId,
       claimedBy: claimedBy || null,
       priority: priority || null,
       html,
+      guildId: guildId || null,
       createdAt: new Date().toISOString()
     });
     return res.lastInsertRowid;
