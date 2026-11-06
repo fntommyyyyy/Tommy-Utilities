@@ -1,5 +1,4 @@
 // web.js — Dashboard web (sicurezza + azioni di moderazione allineate al bot)
-const { mountLobbies, renderLobbiesContent } = require('./lobbies');
 const express = require('express');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
@@ -21,6 +20,9 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
+
+// IMPORT LOBBY
+const { mountLobbies, renderLobbiesContent } = require('./lobbies');
 
 function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml, modLog: modLogFn }) {
   const app = express();
@@ -425,6 +427,12 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { log.err('requireAuth recheck', e); }
     next();
   }
+
+  // ==================== LOBBY (API) ====================
+  mountLobbies(app, {
+    client, storage, log, requireAuth, actionLimiter, parseOrFail, apiError,
+    assertGuildAccess, canManageGuild, logMod, dashMod
+  });
 
   // ==================== PUBBLICI ====================
   app.get('/health', (req, res) => {
@@ -1310,8 +1318,6 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
-  // Endpoint /api/antinuke rimossi
-
   // ==================== PAGINE HTML ====================
   const pageHandler = (page, paramsFn) => (req, res, next) => {
     if (!req.sessionID) {
@@ -1355,7 +1361,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
   });
   app.get('/reminders', requireAuth, pageHandler('reminders'));
-  // app.get('/antinuke') rimosso
+  
+  // ROTTA LOBBY (HTML)
+  app.get('/lobbies', requireAuth, pageHandler('lobbies'));
 
   app.use((err, req, res, next) => {
     log.err('web-error', err);
@@ -1403,7 +1411,8 @@ function renderLayout(user, page, params = {}, security = {}) {
     accesslogs: () => renderAccessLogsContent(),
     messages: () => renderMessagesContent(),
     userActions: () => renderUserActionsContent(params.userId || ''),
-    reminders: () => renderRemindersContent()
+    reminders: () => renderRemindersContent(),
+    lobbies: () => renderLobbiesContent() // <-- AGGIUNTO RENDERER LOBBY
   };
   const body = renderers[page] ? renderers[page]() : '<p>Pagina non trovata</p>';
 
@@ -1570,6 +1579,8 @@ function renderLayout(user, page, params = {}, security = {}) {
     <a href="/messages" class="${page === 'messages' ? 'active' : ''}">✉️ Messaggi</a>
     <a href="/user-actions" class="${page === 'userActions' ? 'active' : ''}">🛠️ Gestione Utenti</a>
     <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
+    <!-- VOCE LOBBY AGGIUNTA -->
+    <a href="/lobbies" class="${page === 'lobbies' ? 'active' : ''}">🗺️ Lobby</a>
   </nav>
 
   ${body}
@@ -1588,8 +1599,6 @@ function safeEqual(a, b) {
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
-// Serializza dati dentro un <script> senza poter chiudere il tag.
-// undefined diventa null, così non si tenta mai di fare .replace su undefined.
 function safeJson(v) {
   return JSON.stringify(v ?? null)
     .replace(/</g, '\\u003c')
@@ -1987,8 +1996,6 @@ function renderCommandsContent() {
 
 // ---------- CONFIG ----------
 function renderConfigContent() {
-  // NB: nel template server-side ${...} con un solo backslash (\${...}) viene
-  // scritto come ${...} nel browser, dove si interpola con il guildId reale.
   return `
   <div class="section">
     <h2>⚙️ Configurazione Server</h2>
@@ -2748,7 +2755,5 @@ function renderRemindersContent() {
   loadReminders();
   </script>`;
 }
-
-// renderAntinukeContent rimosso
 
 module.exports = { createWebServer };
