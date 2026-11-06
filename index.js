@@ -282,7 +282,7 @@ async function buildTranscriptHtml(channel) {
 // ==================== MOD LOG ====================
 const ModLogModule = {
   async logUserAction(guild, logData = {}) {
-    storage.saveLog(logData);
+    storage.saveLog({ ...logData, guildId: logData.guildId || guild?.id || null });
     try {
       if (!guild) return;
       const config = storage.getGuildConfig(guild.id);
@@ -508,7 +508,8 @@ async function closeTicket(source, user) {
             still.id, still.name, still.name.replace('ticket-', ''),
             meta?.claimed_by_tag || 'N/D',
             meta?.priority || 'N/D',
-            html
+            html,
+            still.guild?.id || null
           );
         }
         if (channel.deletable) await channel.delete();
@@ -1600,7 +1601,7 @@ const CommandLogic = {
     if (!current || !current.deny.has(PermissionsBitField.Flags.SendMessages))
       return { success: false, message: '❌ Questo canale non è bloccato!' };
 
-    await channel.permissionOverwrites.delete(everyone);
+    await channel.permissionOverwrites.edit(everyone, { SendMessages: null });
     const name = executor.user ? executor.user.tag : executor.username;
     await ModLogModule.logUserAction(channel.guild, {
       type: 'Unlock', title: 'Canale Sbloccato',
@@ -1797,7 +1798,7 @@ async function handlePrefixCommand(message) {
     }
     return channel.send({
       content: custom,
-      allowedMentions: { parse: ['users', 'everyone'], repliedUser: false }
+      allowedMentions: { parse: ['users'], repliedUser: false }
     }).catch(err => log.err('custom command send', err));
   }
 
