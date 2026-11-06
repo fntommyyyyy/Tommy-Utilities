@@ -16,7 +16,7 @@ const {
 } = require('discord.js');
 
 const StorageService = require('./storage');
-const { mountLobbies, renderLobbiesContent } = require('./lobbies');
+const { mountLobbies, renderLobbiesContent, handleLobbyCommand, lobbyCommandBuilder } = require('./lobbies');
 const { createWebServer } = require('./web');
 
 // ==================== VALIDAZIONE ENV ====================
