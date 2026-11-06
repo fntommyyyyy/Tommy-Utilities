@@ -205,7 +205,59 @@ class StorageService {
         role_id TEXT NOT NULL,
         PRIMARY KEY (user_id, guild_id, role_id)
       );
+
+      -- TABELLE PER LE LOBBY AVANZATE
+      CREATE TABLE IF NOT EXISTS lobby_meta (
+        category_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        host_id TEXT,
+        dropmap TEXT,
+        code TEXT,
+        slots INTEGER NOT NULL DEFAULT 0,
+        reg_open INTEGER NOT NULL DEFAULT 1,
+        staff TEXT NOT NULL DEFAULT '[]',
+        reg_channel_id TEXT,
+        dropmap_channel_id TEXT,
+        code_channel_id TEXT,
+        chat_channel_id TEXT,
+        staff_channel_id TEXT,
+        unreg_channel_id TEXT,
+        fills_channel_id TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS lobby_registrations (
+        category_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        PRIMARY KEY (category_id, user_id)
+      );
     `);
+
+    // MIGRAZIONE AUTOMATICA per lobby_meta (aggiunge colonne mancanti se la tabella esiste già)
+    try {
+      const tableInfo = this.db.prepare("PRAGMA table_info(lobby_meta)").all();
+      const existingCols = tableInfo.map(c => c.name);
+      const newCols = [
+        'reg_channel_id TEXT',
+        'dropmap_channel_id TEXT',
+        'code_channel_id TEXT',
+        'chat_channel_id TEXT',
+        'staff_channel_id TEXT',
+        'unreg_channel_id TEXT',
+        'fills_channel_id TEXT'
+      ];
+      for (const colDef of newCols) {
+        const colName = colDef.split(' ')[0];
+        if (!existingCols.includes(colName)) {
+          this.db.exec(`ALTER TABLE lobby_meta ADD COLUMN ${colDef}`);
+          console.log(`✅ Aggiunta colonna ${colName} a lobby_meta`);
+        }
+      }
+    } catch (err) {
+      console.error('❌ Migrazione lobby_meta fallita:', err);
+    }
   }
 
   _prepare() {
