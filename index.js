@@ -1255,13 +1255,13 @@ function buildHelpEmbed() {
     .setColor('#0099ff')
     .addFields(
       { name: '🎫 Ticket', value: '`/ticketpanel` `/ticket` `/close`', inline: true },
-      { name: '🛡️ Moderazione', value: '`/warn` `/timeout` `/modlogs` `/kick` `/ban` `/unban` `/clear`', inline: true },
+      { name: '🛡️ Moderazione', value: '`/warn` `/timeout` `/unmute` `/modlogs` `/kick` `/ban` `/unban` `/clear`', inline: true },
       { name: '🧹 Purge', value: '`/purge`', inline: true },
       { name: '🚫 Blacklist', value: '`/blacklist add|remove|list|check`', inline: true },
       { name: '📝 Note', value: '`/note add|list|remove`', inline: true },
       { name: '⚙️ Config', value: '`/autorole set|clear`\n`/welcome channel|message|toggle|test|disable`', inline: true },
       { name: '👤 Utente', value: '`/userinfo` `/roles` `/stats` `/ping` `/uptime`', inline: true },
-      { name: '📨 Inviti & Ruoli', value: '`/invite` `/giverole` `/removerole`', inline: true },
+      { name: '📨 Inviti & Ruoli', value: '`/invite` `/giverole` `/removerole` `/deleterole`', inline: true },
       { name: '🔒 Canali', value: '`/lock` `/unlock`', inline: true },
       { name: '⏰ Reminder', value: '`/remind`', inline: true },
       { name: '🔧 Custom', value: '`/addcmd` `/delcmd` `/listcmd`', inline: true }
@@ -1550,6 +1550,40 @@ const CommandLogic = {
     return { success: true, message: `✅ Ruolo **${role.name}** rimosso da ${member.user.tag}!` };
   },
 
+  async deleteRole(guild, executor, roleId, reason = 'Nessun motivo') {
+    if (!executor.permissions.has(PermissionsBitField.Flags.ManageRoles))
+      return { success: false, message: '❌ Non hai il permesso "Gestisci Ruoli"!' };
+
+    const roleIdMatch = extractRoleId(roleId);
+    if (!roleIdMatch) return { success: false, message: '❌ ID ruolo non valido!' };
+    if (roleIdMatch === guild.id)
+      return { success: false, message: '❌ Non puoi eliminare @everyone!' };
+
+    const role = guild.roles.cache.get(roleIdMatch);
+    if (!role) return { success: false, message: '❌ Ruolo non trovato!' };
+    if (role.managed)
+      return { success: false, message: '❌ Questo ruolo è gestito da un\'integrazione e non si può eliminare!' };
+
+    const botMember = guild.members.me;
+    if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles))
+      return { success: false, message: '❌ Non ho il permesso "Gestisci Ruoli"!' };
+    if (role.position >= botMember.roles.highest.position)
+      return { success: false, message: '❌ Non posso eliminare un ruolo più alto o uguale al mio!' };
+    if (guild.ownerId !== executor.id && role.position >= executor.roles.highest.position)
+      return { success: false, message: '❌ Non puoi eliminare un ruolo più alto o uguale al tuo!' };
+
+    const roleName = role.name;
+    await role.delete(reason);
+    await ModLogModule.logUserAction(guild, {
+      type: 'Delete Role', title: 'Ruolo Eliminato',
+      moderator: `${actorName(executor)} (${executor.id})`,
+      target: `${roleName} (${roleIdMatch})`,
+      targetId: roleIdMatch,
+      reason
+    });
+    return { success: true, message: `✅ Ruolo **${roleName}** eliminato dal server. Motivo: ${reason}` };
+  },
+
   async listRoles(guild) {
     const roles = guild.roles.cache
       .filter(r => r.name !== '@everyone')
@@ -1634,6 +1668,9 @@ const slashCommands = [
     .addUserOption(o => o.setName('utente').setDescription('Utente').setRequired(true))
     .addIntegerOption(o => o.setName('secondi').setDescription('Durata in secondi (1-2419200)').setRequired(true))
     .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
+  new SlashCommandBuilder().setName('unmute').setDescription('Toglie il timeout a un utente')
+    .addUserOption(o => o.setName('utente').setDescription('Utente').setRequired(true))
+    .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
   new SlashCommandBuilder().setName('kick').setDescription('Espelle un utente')
     .addUserOption(o => o.setName('utente').setDescription('Utente').setRequired(true))
     .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
@@ -1694,6 +1731,9 @@ const slashCommands = [
   new SlashCommandBuilder().setName('removerole').setDescription('Rimuove un ruolo')
     .addUserOption(o => o.setName('utente').setDescription('Utente').setRequired(true))
     .addRoleOption(o => o.setName('ruolo').setDescription('Ruolo').setRequired(true)),
+  new SlashCommandBuilder().setName('deleterole').setDescription('Elimina un ruolo dal server')
+    .addRoleOption(o => o.setName('ruolo').setDescription('Ruolo da eliminare').setRequired(true))
+    .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
 
   new SlashCommandBuilder().setName('lock').setDescription('Blocca il canale')
     .addStringOption(o => o.setName('motivo').setDescription('Motivo')),
@@ -1766,8 +1806,8 @@ setInterval(async () => {
 // ==================== PREFIX COMMANDS ====================
 const BUILTIN_PREFIX_COMMANDS = new Set([
   'help', 'stats', 'ping', 'uptime', 'kick', 'ban', 'unban', 'clear', 'purge', 'invite',
-  'giverole', 'removerole', 'roles', 'lock', 'unlock', 'addcmd', 'delcmd', 'listcmd', 'cmds',
-  'remind', 'reminder', 'ticketpanel', 'ticket', 'close', 'userinfo', 'warn', 'timeout',
+  'giverole', 'removerole', 'deleterole', 'delrole', 'roles', 'lock', 'unlock', 'addcmd', 'delcmd', 'listcmd', 'cmds',
+  'remind', 'reminder', 'ticketpanel', 'ticket', 'close', 'userinfo', 'warn', 'timeout', 'unmute',
   'modlogs', 'md', 'dashboard', 'bl', 'blacklist', 'note', 'notes', 'autorole', 'welcome'
 ]);
 
@@ -1896,6 +1936,12 @@ async function handlePrefixCommand(message) {
         if (!args[0] || !args[1]) return message.reply('❌ Uso: `-removerole <user> <role>`');
         const r = await CommandLogic.removeRole(guild, member, args[0], args[1]);
         return replyMethod({ ...r, title: 'Remove Role' });
+      }
+      case 'deleterole':
+      case 'delrole': {
+        if (!args[0]) return message.reply('❌ Uso: `-deleterole <@ruolo o ID> [motivo]`');
+        const r = await CommandLogic.deleteRole(guild, member, args[0], args.slice(1).join(' ') || 'Nessun motivo');
+        return replyMethod({ ...r, title: 'Ruolo Eliminato' });
       }
       case 'roles': {
         const r = await CommandLogic.listRoles(guild);
@@ -2080,6 +2126,43 @@ async function handlePrefixCommand(message) {
             ],
             timestamp: true
           })]
+        });
+      }
+      case 'unmute': {
+        if (!hasStaffOrAdmin(member))
+          return message.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')] });
+        let target = message.mentions.users.first();
+        if (!target && args[0]) {
+          const id = extractUserId(args[0]);
+          if (id) { try { target = await client.users.fetch(id); } catch {} }
+        }
+        if (!target)
+          return message.reply({ embeds: [EmbedManager.error('Sintassi', 'Uso: `-unmute <@utente o ID> [motivo]`')] });
+        const m = await guild.members.fetch(target.id).catch(() => null);
+        if (!m) return message.reply({ embeds: [EmbedManager.error('Errore', 'Utente non nel server.')] });
+        if (!m.communicationDisabledUntilTimestamp)
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Questo utente non è in timeout.')] });
+        const bot = guild.members.me;
+        if (!bot.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+          return message.reply({ embeds: [EmbedManager.error('Permessi', 'Manca "Modera Membri".')] });
+        if (!m.moderatable)
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso togliere il timeout a questo utente.')] });
+        if (!outranks(member, m, guild))
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi togliere il timeout a un utente con ruolo uguale o superiore al tuo.')] });
+        const reason = args.slice(1).join(' ') || 'Nessun motivo specificato';
+        try { await m.timeout(null, reason); }
+        catch { return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso togliere il timeout a questo utente.')] }); }
+        await ModLogModule.logUserAction(guild, {
+          type: 'Unmute', title: 'Timeout Rimosso', targetId: target.id,
+          target: `${target.username} (${target.id})`,
+          moderator: `${message.author.username} (${message.author.id})`, reason
+        });
+        return channel.send({
+          embeds: [EmbedManager.success('Unmute', `Timeout rimosso a **${target.username}**.`).addFields(
+            { name: 'Utente', value: `${target.username} (${target.id})`, inline: true },
+            { name: 'Moderatore', value: message.author.username, inline: true },
+            { name: 'Motivo', value: reason, inline: false }
+          )]
         });
       }
       case 'modlogs':
@@ -2451,6 +2534,38 @@ async function handleSlashCommand(interaction) {
       });
     }
 
+    case 'unmute': {
+      if (!hasStaffOrAdmin(member))
+        return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')], ephemeral: true });
+      const target = interaction.options.getUser('utente');
+      const reason = interaction.options.getString('motivo') || 'Nessun motivo specificato';
+      const m = await guild.members.fetch(target.id).catch(() => null);
+      if (!m) return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Utente non nel server.')], ephemeral: true });
+      if (!m.communicationDisabledUntilTimestamp)
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Questo utente non è in timeout.')], ephemeral: true });
+      const bot = guild.members.me;
+      if (!bot.permissions.has(PermissionsBitField.Flags.ModerateMembers))
+        return safeReply(interaction, { embeds: [EmbedManager.error('Permessi', 'Manca "Modera Membri".')], ephemeral: true });
+      if (!m.moderatable)
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non posso togliere il timeout a questo utente.')], ephemeral: true });
+      if (!outranks(member, m, guild))
+        return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non puoi togliere il timeout a un utente con ruolo uguale o superiore al tuo.')], ephemeral: true });
+      try { await m.timeout(null, reason); }
+      catch { return safeReply(interaction, { embeds: [EmbedManager.error('Errore', 'Non posso togliere il timeout a questo utente.')], ephemeral: true }); }
+      await ModLogModule.logUserAction(guild, {
+        type: 'Unmute', title: 'Timeout Rimosso', targetId: target.id,
+        target: `${target.username} (${target.id})`,
+        moderator: `${interaction.user.username} (${interaction.user.id})`, reason
+      });
+      return interaction.reply({
+        embeds: [EmbedManager.success('Unmute', `Timeout rimosso a **${target.username}**.`).addFields(
+          { name: 'Utente', value: `${target.username} (${target.id})`, inline: true },
+          { name: 'Moderatore', value: interaction.user.username, inline: true },
+          { name: 'Motivo', value: reason, inline: false }
+        )]
+      });
+    }
+
     case 'kick': {
       if (!member.permissions.has(PermissionsBitField.Flags.KickMembers))
         return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve "Espelli Membri".')], ephemeral: true });
@@ -2641,6 +2756,14 @@ async function handleSlashCommand(interaction) {
       const role = interaction.options.getRole('ruolo');
       const res = await CommandLogic.removeRole(guild, member, u.id, role.id);
       return interaction.reply({ embeds: [buildResultEmbed({ ...res, title: 'Remove Role' })], ephemeral: !res.success });
+    }
+    case 'deleterole': {
+      if (!member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+        return safeReply(interaction, { embeds: [EmbedManager.error('Accesso Negato', 'Serve "Gestisci Ruoli".')], ephemeral: true });
+      const role = interaction.options.getRole('ruolo');
+      const reason = interaction.options.getString('motivo') || 'Nessun motivo';
+      const res = await CommandLogic.deleteRole(guild, member, role.id, reason);
+      return interaction.reply({ embeds: [buildResultEmbed({ ...res, title: 'Ruolo Eliminato' })], ephemeral: !res.success });
     }
 
     case 'lock': {
