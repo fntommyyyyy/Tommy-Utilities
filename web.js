@@ -1,2906 +1,668 @@
-// web.js — Dashboard web (sicurezza + azioni di moderazione allineate al bot)
-const express = require('express');
-const session = require('express-session');
-const FileStore = require('session-file-store')(session);
-const cookieParser = require('cookie-parser');
-const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
-const {
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ChannelType,
-  PermissionsBitField
-} = require('discord.js');
+const Database = require('better-sqlite3');
 
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const { doubleCsrf } = require('csrf-csrf');
-const { z } = require('zod');
+class StorageService {
+  constructor(dbPath) {
+    let finalPath;
+    if (dbPath) {
+      finalPath = path.isAbsolute(dbPath)
+        ? dbPath
+        : path.join(__dirname, dbPath);
+    } else {
+      finalPath = path.join(__dirname, 'data', 'bot.db');
+    }
 
-// IMPORT LOBBY
-const { mountLobbies, renderLobbiesContent } = require('./lobbies');
+    const dir = path.dirname(finalPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml, modLog: modLogFn }) {
-  const app = express();
-  const PORT = parseInt(process.env.PORT) || 3000;
-  const HOST = process.env.WEB_HOST || '0.0.0.0';
-  const IS_PROD = process.env.NODE_ENV === 'production';
+    this.dbPath = finalPath;
+    this.db = new Database(finalPath);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 5000');
+    this._migrate();
+    this._prepare();
 
-  app.set('trust proxy', parseInt(process.env.TRUST_PROXY, 10) || 1);
-  app.disable('x-powered-by');
-
-  const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
-  const CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
-  const DASHBOARD_URL = (process.env.DASHBOARD_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
-  if (IS_PROD && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
-    throw new Error('SESSION_SECRET mancante o troppo corto (minimo 32 caratteri) in produzione');
+    try { this._trimLogs.run(); } catch {}
   }
-  const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-only-non-usare-in-produzione';
-  const ENV_ADMIN_IDS = (process.env.DASHBOARD_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const BLACKLIST_ADMIN_SERVERS = (process.env.BLACKLIST_ADMIN_SERVERS || '').split(',').map(s => s.trim()).filter(Boolean);
-  const DASHBOARD_ROLES = ['Senior Admin'];
 
-  const AUTH_CACHE_TTL = 60 * 1000;
-  const authCache = new Map();
+  _migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS custom_commands (
+        name TEXT PRIMARY KEY,
+        response TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
 
-  async function isAuthorizedByRole(userId) {
-    const now = Date.now();
-    const cached = authCache.get(userId);
-    if (cached && cached.expires > now) return cached.authorized;
+      CREATE TABLE IF NOT EXISTS mod_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        type TEXT NOT NULL,
+        target_id TEXT,
+        target TEXT,
+        moderator TEXT,
+        reason TEXT,
+        duration TEXT,
+        channel TEXT,
+        timestamp TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mod_logs_target ON mod_logs(target_id);
 
-    let authorized = ENV_ADMIN_IDS.includes(userId);
-    if (!authorized) {
-      try {
-        for (const guild of client.guilds.cache.values()) {
-          const member = await guild.members.fetch(userId).catch(() => null);
-          if (!member) continue;
-          if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) { authorized = true; break; }
+      CREATE TABLE IF NOT EXISTS blacklist (
+        user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        moderator_id TEXT NOT NULL,
+        moderator_tag TEXT NOT NULL,
+        added_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS guild_config (
+        guild_id TEXT PRIMARY KEY,
+        autorole_id TEXT,
+        log_channel_id TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS member_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        author_id TEXT NOT NULL,
+        author_tag TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_notes_user ON member_notes(guild_id, user_id);
+
+      CREATE TABLE IF NOT EXISTS welcome_config (
+        guild_id TEXT PRIMARY KEY,
+        channel_id TEXT,
+        message TEXT,
+        embed_enabled INTEGER DEFAULT 1,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS reaction_roles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_rr_message ON reaction_roles(guild_id, message_id);
+
+      CREATE TABLE IF NOT EXISTS autoresponses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        response TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_ar_trigger ON autoresponses(guild_id, trigger);
+
+      CREATE TABLE IF NOT EXISTS birthdays (
+        user_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        day INTEGER NOT NULL,
+        month INTEGER NOT NULL,
+        year INTEGER,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        remind_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_remind_at ON reminders(remind_at);
+
+      CREATE TABLE IF NOT EXISTS personal_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_pnotes_user ON personal_notes(guild_id, user_id);
+
+      CREATE TABLE IF NOT EXISTS cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        moderator_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        reason TEXT,
+        duration TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cases_user ON cases(guild_id, user_id);
+
+      CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        reporter_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_reports_guild ON reports(guild_id, status);
+
+      CREATE TABLE IF NOT EXISTS dashboard_access (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        ip TEXT,
+        user_agent TEXT,
+        timestamp TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS ticket_transcripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id TEXT NOT NULL,
+        channel_name TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        claimed_by TEXT,
+        priority TEXT,
+        html_content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_tr_channel ON ticket_transcripts(channel_id);
+
+      CREATE TABLE IF NOT EXISTS ticket_meta (
+        channel_id TEXT PRIMARY KEY,
+        claimed_by_id TEXT,
+        claimed_by_tag TEXT,
+        priority TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS antinuke_config (
+        guild_id TEXT PRIMARY KEY,
+        threshold_channel INTEGER DEFAULT 3,
+        threshold_role INTEGER DEFAULT 3,
+        threshold_ban INTEGER DEFAULT 3,
+        threshold_role_update INTEGER DEFAULT 3,
+        window_ms INTEGER DEFAULT 10000,
+        punishment TEXT DEFAULT 'quarantine',
+        whitelist_ids TEXT DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS quarantine_roles (
+        user_id TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        PRIMARY KEY (user_id, guild_id, role_id)
+      );
+
+      -- TABELLE PER LE LOBBY AVANZATE
+      CREATE TABLE IF NOT EXISTS lobby_meta (
+        category_id TEXT PRIMARY KEY,
+        guild_id TEXT NOT NULL,
+        host_id TEXT,
+        dropmap TEXT,
+        code TEXT,
+        slots INTEGER NOT NULL DEFAULT 0,
+        reg_open INTEGER NOT NULL DEFAULT 1,
+        staff TEXT NOT NULL DEFAULT '[]',
+        reg_channel_id TEXT,
+        dropmap_channel_id TEXT,
+        code_channel_id TEXT,
+        chat_channel_id TEXT,
+        staff_channel_id TEXT,
+        unreg_channel_id TEXT,
+        fills_channel_id TEXT,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS lobby_registrations (
+        category_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        PRIMARY KEY (category_id, user_id)
+      );
+    `);
+
+    // MIGRAZIONE AUTOMATICA per lobby_meta (aggiunge colonne mancanti se la tabella esiste già)
+    try {
+      const tableInfo = this.db.prepare("PRAGMA table_info(lobby_meta)").all();
+      const existingCols = tableInfo.map(c => c.name);
+      const newCols = [
+        'reg_channel_id TEXT',
+        'dropmap_channel_id TEXT',
+        'code_channel_id TEXT',
+        'chat_channel_id TEXT',
+        'staff_channel_id TEXT',
+        'unreg_channel_id TEXT',
+        'fills_channel_id TEXT'
+      ];
+      for (const colDef of newCols) {
+        const colName = colDef.split(' ')[0];
+        if (!existingCols.includes(colName)) {
+          this.db.exec(`ALTER TABLE lobby_meta ADD COLUMN ${colDef}`);
+          console.log(`✅ Aggiunta colonna ${colName} a lobby_meta`);
         }
-      } catch (err) { log.err('isAuthorizedByRole', err); }
+      }
+    } catch (err) {
+      console.error('❌ Migrazione lobby_meta fallita:', err);
     }
-    authCache.set(userId, { authorized, expires: now + AUTH_CACHE_TTL });
-    return authorized;
+
+    this._ensureColumn('mod_logs', 'guild_id', 'TEXT');
+    this._ensureColumn('ticket_transcripts', 'guild_id', 'TEXT');
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_mod_logs_guild ON mod_logs(guild_id)'); } catch {}
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_tr_guild ON ticket_transcripts(guild_id)'); } catch {}
   }
 
-  // ==================== AUTORIZZAZIONE PER SERVER ====================
-  const guildAccessCache = new Map();
-
-  async function canManageGuild(userId, guild) {
-    if (ENV_ADMIN_IDS.includes(userId)) return true;
-    const key = `${userId}:${guild.id}`;
-    const cached = guildAccessCache.get(key);
-    if (cached && cached.expires > Date.now()) return cached.ok;
-    const member = await guild.members.fetch(userId).catch(() => null);
-    const ok = !!member && member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name));
-    guildAccessCache.set(key, { ok, expires: Date.now() + AUTH_CACHE_TTL });
-    return ok;
+  _ensureColumn(table, column, type) {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!cols.some(c => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
-  async function allowedGuildIds(userId) {
-    const ids = new Set();
-    for (const g of client.guilds.cache.values()) {
-      if (await canManageGuild(userId, g)) ids.add(g.id);
-    }
-    return ids;
+  _prepare() {
+    // ===== CUSTOM COMMANDS =====
+    this._allCmds = this.db.prepare('SELECT name, response FROM custom_commands');
+    this._getCmd = this.db.prepare('SELECT response FROM custom_commands WHERE name = ?');
+    this._upsertCmd = this.db.prepare(`
+      INSERT INTO custom_commands (name, response, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(name) DO UPDATE SET response = excluded.response
+    `);
+    this._delCmd = this.db.prepare('DELETE FROM custom_commands WHERE name = ?');
+
+    // ===== MOD LOGS =====
+    this._insertLog = this.db.prepare(`
+      INSERT INTO mod_logs (type, target_id, target, moderator, reason, duration, channel, guild_id, timestamp)
+      VALUES (@type, @targetId, @target, @moderator, @reason, @duration, @channel, @guildId, @timestamp)
+    `);
+    this._logsByTarget = this.db.prepare('SELECT * FROM mod_logs WHERE target_id = ? ORDER BY id DESC');
+    this._allLogs = this.db.prepare('SELECT * FROM mod_logs ORDER BY id DESC LIMIT ?');
+    this._countLogs = this.db.prepare('SELECT COUNT(*) as c FROM mod_logs');
+    this._countByType = this.db.prepare('SELECT type, COUNT(*) as c FROM mod_logs GROUP BY type');
+    this._trimLogs = this.db.prepare(`
+      DELETE FROM mod_logs WHERE id NOT IN (
+        SELECT id FROM mod_logs ORDER BY id DESC LIMIT 5000
+      )
+    `);
+
+    // ===== BLACKLIST =====
+    this._blGet = this.db.prepare('SELECT * FROM blacklist WHERE user_id = ?');
+    this._blAll = this.db.prepare('SELECT * FROM blacklist ORDER BY added_at DESC');
+    this._blInsert = this.db.prepare(`
+      INSERT INTO blacklist (user_id, username, reason, moderator_id, moderator_tag, added_at)
+      VALUES (@userId, @username, @reason, @moderatorId, @moderatorTag, @addedAt)
+    `);
+    this._blDelete = this.db.prepare('DELETE FROM blacklist WHERE user_id = ?');
+    this._blCount = this.db.prepare('SELECT COUNT(*) as c FROM blacklist');
+
+    // ===== GUILD CONFIG =====
+    this._getConfig = this.db.prepare('SELECT * FROM guild_config WHERE guild_id = ?');
+    this._upsertConfig = this.db.prepare(`
+      INSERT INTO guild_config (guild_id, autorole_id, log_channel_id, updated_at)
+      VALUES (@guildId, @autoroleId, @logChannelId, @updatedAt)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        autorole_id = excluded.autorole_id,
+        log_channel_id = excluded.log_channel_id,
+        updated_at = excluded.updated_at
+    `);
+
+    // ===== MEMBER NOTES =====
+    this._insertNote = this.db.prepare(`
+      INSERT INTO member_notes (guild_id, user_id, author_id, author_tag, content, created_at)
+      VALUES (@guildId, @userId, @authorId, @authorTag, @content, @createdAt)
+    `);
+    this._notesForUser = this.db.prepare('SELECT * FROM member_notes WHERE guild_id = ? AND user_id = ? ORDER BY id DESC');
+    this._allNotes = this.db.prepare('SELECT * FROM member_notes ORDER BY id DESC LIMIT 500');
+    this._getNote = this.db.prepare('SELECT * FROM member_notes WHERE id = ? AND guild_id = ?');
+    this._deleteNote = this.db.prepare('DELETE FROM member_notes WHERE id = ? AND guild_id = ?');
+    this._deleteNoteById = this.db.prepare('DELETE FROM member_notes WHERE id = ?');
+    this._countNotes = this.db.prepare('SELECT COUNT(*) as c FROM member_notes WHERE guild_id = ?');
+
+    // ===== WELCOME =====
+    this._getWelcome = this.db.prepare(`
+      SELECT guild_id, channel_id, message,
+             COALESCE(embed_enabled, 1) AS embed_enabled,
+             updated_at
+      FROM welcome_config WHERE guild_id = ?
+    `);
+    this._setWelcome = this.db.prepare(`
+      INSERT INTO welcome_config (guild_id, channel_id, message, embed_enabled, updated_at)
+      VALUES (@guildId, @channelId, @message, COALESCE(@embedEnabled, 1), @updatedAt)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        channel_id = COALESCE(@channelId, channel_id),
+        message = COALESCE(@message, message),
+        embed_enabled = COALESCE(@embedEnabled, embed_enabled),
+        updated_at = @updatedAt
+    `);
+    this._disableWelcome = this.db.prepare(
+      'UPDATE welcome_config SET channel_id = NULL, updated_at = ? WHERE guild_id = ?'
+    );
+    this._clearWelcomeMessage = this.db.prepare(
+      'UPDATE welcome_config SET message = NULL, updated_at = ? WHERE guild_id = ?'
+    );
+
+    // ===== REACTION ROLES =====
+    this._rrInsert = this.db.prepare(`
+      INSERT INTO reaction_roles (guild_id, message_id, channel_id, emoji, role_id, created_at)
+      VALUES (@guildId, @messageId, @channelId, @emoji, @roleId, @createdAt)
+    `);
+    this._rrByMessage = this.db.prepare('SELECT * FROM reaction_roles WHERE guild_id = ? AND message_id = ?');
+    this._rrByEmoji = this.db.prepare('SELECT * FROM reaction_roles WHERE guild_id = ? AND message_id = ? AND emoji = ?');
+    this._rrDelete = this.db.prepare('DELETE FROM reaction_roles WHERE id = ? AND guild_id = ?');
+    this._rrDeleteByMessage = this.db.prepare('DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ?');
+
+    // ===== AUTORESPONSES =====
+    this._arInsert = this.db.prepare(`
+      INSERT INTO autoresponses (guild_id, trigger, response, created_at)
+      VALUES (@guildId, @trigger, @response, @createdAt)
+    `);
+    this._arAll = this.db.prepare('SELECT * FROM autoresponses WHERE guild_id = ? ORDER BY id DESC');
+    this._arByTrigger = this.db.prepare('SELECT * FROM autoresponses WHERE guild_id = ? AND trigger = ?');
+    this._arDelete = this.db.prepare('DELETE FROM autoresponses WHERE id = ? AND guild_id = ?');
+
+    // ===== BIRTHDAYS =====
+    this._bdSet = this.db.prepare(`
+      INSERT INTO birthdays (user_id, guild_id, day, month, year, updated_at)
+      VALUES (@userId, @guildId, @day, @month, @year, @updatedAt)
+      ON CONFLICT(user_id) DO UPDATE SET
+        guild_id = excluded.guild_id,
+        day = excluded.day,
+        month = excluded.month,
+        year = excluded.year,
+        updated_at = excluded.updated_at
+    `);
+    this._bdGet = this.db.prepare('SELECT * FROM birthdays WHERE user_id = ? AND guild_id = ?');
+    this._bdToday = this.db.prepare('SELECT * FROM birthdays WHERE guild_id = ? AND day = ? AND month = ?');
+    this._bdAll = this.db.prepare('SELECT * FROM birthdays WHERE guild_id = ? ORDER BY month, day');
+    this._bdDelete = this.db.prepare('DELETE FROM birthdays WHERE user_id = ? AND guild_id = ?');
+
+    // ===== REMINDERS =====
+    this._remInsert = this.db.prepare(`
+      INSERT INTO reminders (user_id, guild_id, channel_id, content, remind_at, created_at)
+      VALUES (@userId, @guildId, @channelId, @content, @remindAt, @createdAt)
+    `);
+    this._remDue = this.db.prepare('SELECT * FROM reminders WHERE remind_at <= ? ORDER BY remind_at ASC LIMIT 100');
+    this._remAll = this.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT ?');
+    this._remDelete = this.db.prepare('DELETE FROM reminders WHERE id = ?');
+    this._remByUser = this.db.prepare('SELECT * FROM reminders WHERE user_id = ? AND guild_id = ? ORDER BY remind_at ASC');
+    this._remCount = this.db.prepare('SELECT COUNT(*) as c FROM reminders');
+
+    // ===== PERSONAL NOTES =====
+    this._pnInsert = this.db.prepare(`
+      INSERT INTO personal_notes (user_id, guild_id, content, created_at)
+      VALUES (@userId, @guildId, @content, @createdAt)
+    `);
+    this._pnByUser = this.db.prepare('SELECT * FROM personal_notes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC');
+    this._pnDelete = this.db.prepare('DELETE FROM personal_notes WHERE id = ? AND user_id = ?');
+
+    // ===== CASES =====
+    this._caseInsert = this.db.prepare(`
+      INSERT INTO cases (guild_id, user_id, moderator_id, action, reason, duration, status, created_at, updated_at)
+      VALUES (@guildId, @userId, @moderatorId, @action, @reason, @duration, 'active', @now, @now)
+    `);
+    this._caseGet = this.db.prepare('SELECT * FROM cases WHERE id = ? AND guild_id = ?');
+    this._caseByUser = this.db.prepare('SELECT * FROM cases WHERE guild_id = ? AND user_id = ? ORDER BY id DESC');
+    this._caseUpdate = this.db.prepare(`
+      UPDATE cases SET reason = COALESCE(@reason, reason),
+                       status = COALESCE(@status, status),
+                       updated_at = @now
+      WHERE id = @id AND guild_id = @guildId
+    `);
+    this._caseDelete = this.db.prepare('DELETE FROM cases WHERE id = ? AND guild_id = ?');
+
+    // ===== REPORTS =====
+    this._repInsert = this.db.prepare(`
+      INSERT INTO reports (guild_id, reporter_id, target_id, reason, status, created_at)
+      VALUES (@guildId, @reporterId, @targetId, @reason, 'open', @createdAt)
+    `);
+    this._repAllOpen = this.db.prepare("SELECT * FROM reports WHERE guild_id = ? AND status = 'open' ORDER BY id DESC");
+    this._repSetStatus = this.db.prepare('UPDATE reports SET status = ? WHERE id = ? AND guild_id = ?');
+
+    // ===== DASHBOARD ACCESS =====
+    this._saveAccess = this.db.prepare(`
+      INSERT INTO dashboard_access (user_id, username, ip, user_agent, timestamp)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    this._getAccess = this.db.prepare('SELECT * FROM dashboard_access ORDER BY id DESC LIMIT ?');
+
+    // ===== TICKET TRANSCRIPTS =====
+    this._trInsert = this.db.prepare(`
+      INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, guild_id, created_at)
+      VALUES (@channelId, @channelName, @userId, @claimedBy, @priority, @html, @guildId, @createdAt)
+    `);
+    this._trAll = this.db.prepare('SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at FROM ticket_transcripts ORDER BY id DESC LIMIT 100');
+    this._trGet = this.db.prepare('SELECT * FROM ticket_transcripts WHERE id = ?');
+    this._trCount = this.db.prepare('SELECT COUNT(*) as c FROM ticket_transcripts');
+
+    // ===== TICKET META =====
+    this._tmGet = this.db.prepare('SELECT * FROM ticket_meta WHERE channel_id = ?');
+    this._tmUpsert = this.db.prepare(`
+      INSERT INTO ticket_meta (channel_id, claimed_by_id, claimed_by_tag, priority, updated_at)
+      VALUES (@channelId, @claimedById, @claimedByTag, @priority, @updatedAt)
+      ON CONFLICT(channel_id) DO UPDATE SET
+        claimed_by_id = COALESCE(@claimedById, claimed_by_id),
+        claimed_by_tag = COALESCE(@claimedByTag, claimed_by_tag),
+        priority = COALESCE(@priority, priority),
+        updated_at = @updatedAt
+    `);
+
+    // ANTI-NUKE prepared statements rimossi
+    // QUARANTINE prepared statements rimossi
+
+    this._logCounter = 0;
   }
 
-  async function assertGuildAccess(req, res, guildId) {
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) { res.status(404).json({ error: 'Server non trovato' }); return false; }
-    if (!(await canManageGuild(req.session.user.id, guild))) {
-      res.status(403).json({ error: 'Non hai i permessi su questo server' });
-      return false;
-    }
+  // ==================== CUSTOM COMMANDS ====================
+  loadCommands() { return Object.fromEntries(this._allCmds.all().map(r => [r.name, r.response])); }
+  getCommand(name) { return this._getCmd.get(name)?.response ?? null; }
+  saveCommand(name, response) { this._upsertCmd.run(name, response, new Date().toISOString()); }
+  deleteCommand(name) { return this._delCmd.run(name).changes > 0; }
+
+  // ==================== MOD LOGS ====================
+  saveLog(entry) {
+    try {
+      this._insertLog.run({
+        type: entry.type || 'N/A',
+        targetId: entry.targetId || null, target: entry.target || null,
+        moderator: entry.moderator || null, reason: entry.reason || null,
+        duration: entry.duration || null, channel: entry.channel || null,
+        guildId: entry.guildId || null,
+        timestamp: new Date().toISOString()
+      });
+      if (++this._logCounter % 100 === 0) this._trimLogs.run();
+    } catch (err) { console.error('❌ saveLog error:', err); }
+  }
+  getLogsForUser(userId) { return this._logsByTarget.all(userId); }
+  getAllLogs(limit = 500) { return this._allLogs.all(limit); }
+  getStats() {
+    return { total: this._countLogs.get().c, byType: this._countByType.all(), blacklist: this._blCount.get().c };
+  }
+
+  // ==================== BLACKLIST ====================
+  isBlacklisted(userId) { return !!this._blGet.get(userId); }
+  getBlacklistEntry(userId) { return this._blGet.get(userId) || null; }
+  getAllBlacklist() { return this._blAll.all(); }
+  addToBlacklist(userId, username, reason, moderatorId, moderatorTag) {
+    if (this.isBlacklisted(userId)) return false;
+    this._blInsert.run({ userId, username, reason, moderatorId, moderatorTag, addedAt: new Date().toISOString() });
     return true;
   }
+  removeFromBlacklist(userId) { return this._blDelete.run(userId).changes > 0; }
 
-  // Note dei soli server autorizzati, lette direttamente dal DB (nessun limite a 500)
-  function notesForGuilds(allowed, limit = 1000) {
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const placeholders = ids.map(() => '?').join(',');
-    return storage.db
-      .prepare(`SELECT * FROM member_notes WHERE guild_id IN (${placeholders}) ORDER BY id DESC LIMIT ?`)
-      .all(...ids, limit);
+  // ==================== GUILD CONFIG ====================
+  getGuildConfig(guildId) {
+    return this._getConfig.get(guildId) || { guild_id: guildId, autorole_id: null, log_channel_id: null };
+  }
+  setAutorole(guildId, roleId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: roleId, logChannelId: current.log_channel_id, updatedAt: new Date().toISOString() });
+  }
+  clearAutorole(guildId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: null, logChannelId: current.log_channel_id, updatedAt: new Date().toISOString() });
+  }
+  setLogChannel(guildId, channelId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: current.autorole_id, logChannelId: channelId, updatedAt: new Date().toISOString() });
+  }
+  clearLogChannel(guildId) {
+    const current = this.getGuildConfig(guildId);
+    this._upsertConfig.run({ guildId, autoroleId: current.autorole_id, logChannelId: null, updatedAt: new Date().toISOString() });
   }
 
-  function isEnvAdmin(userId) {
-    return ENV_ADMIN_IDS.includes(userId);
+  // ==================== NOTES ====================
+  addNote(guildId, userId, authorId, authorTag, content) {
+    const res = this._insertNote.run({ guildId, userId, authorId, authorTag, content, createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
   }
-
-  function logsForViewer(userId, allowed, limit = 500) {
-    if (isEnvAdmin(userId)) return storage.getAllLogs(limit);
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const ph = ids.map(() => '?').join(',');
-    return storage.db.prepare(
-      `SELECT * FROM mod_logs WHERE guild_id IN (${ph}) ORDER BY id DESC LIMIT ?`
-    ).all(...ids, limit);
-  }
-
-  function logsForUserViewer(actorId, targetId, allowed) {
-    if (isEnvAdmin(actorId)) return storage.getLogsForUser(targetId);
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const ph = ids.map(() => '?').join(',');
-    return storage.db.prepare(
-      `SELECT * FROM mod_logs WHERE target_id = ? AND guild_id IN (${ph}) ORDER BY id DESC`
-    ).all(targetId, ...ids);
-  }
-
-  function transcriptsForViewer(userId, allowed) {
-    if (isEnvAdmin(userId)) return storage.getAllTranscripts ? storage.getAllTranscripts() : [];
-    const ids = [...allowed];
-    if (!ids.length) return [];
-    const ph = ids.map(() => '?').join(',');
-    return storage.db.prepare(
-      `SELECT id, channel_id, channel_name, user_id, claimed_by, priority, created_at
-       FROM ticket_transcripts WHERE guild_id IN (${ph}) ORDER BY id DESC LIMIT 100`
-    ).all(...ids);
-  }
-
-  function countWhereGuilds(table, allowed, userId) {
-    if (isEnvAdmin(userId)) {
-      const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get();
-      return row?.c || 0;
-    }
-    const ids = [...allowed];
-    if (!ids.length) return 0;
-    const ph = ids.map(() => '?').join(',');
-    const row = storage.db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE guild_id IN (${ph})`).get(...ids);
-    return row?.c || 0;
-  }
-
-  // ==================== HELPER AZIONI (allineati al bot) ====================
-  function dashActor(req) {
-    const u = req.session.user;
-    return { id: u.id, name: u.username, label: `${u.username} (${u.id}) [dashboard]` };
-  }
-  function dashMod(req) {
-    return dashActor(req).label;
-  }
-
-  // Scrive nel DB e, se disponibile, nel canale mod-log (stessa logica del bot)
-  async function logMod(guild, data) {
-    const payload = { ...data, guildId: data.guildId || guild?.id || null };
-    try {
-      if (typeof modLogFn === 'function') await modLogFn(guild, payload);
-      else storage.saveLog(payload);
-    } catch (err) { log.err('logMod', err); }
-  }
-
-  async function dmUser(userId, payload) {
-    try {
-      const user = await client.users.fetch(userId).catch(() => null);
-      if (!user) return false;
-      await user.send(payload);
-      return true;
-    } catch { return false; }
-  }
-
-  // Il dashboard agisce con i permessi gerarchici dell'utente loggato
-  async function actorCanActOn(guild, actorId, target) {
-    if (ENV_ADMIN_IDS.includes(actorId)) return true;
-    const actor = await guild.members.fetch(actorId).catch(() => null);
-    if (!actor) return false;
-    if (guild.ownerId === actor.id) return true;
-    if (target.id === guild.ownerId) return false;
-    return actor.roles.highest.position > target.roles.highest.position;
-  }
-
-  async function actorCanGrantRole(guild, actorId, role) {
-    if (ENV_ADMIN_IDS.includes(actorId)) return true;
-    const actor = await guild.members.fetch(actorId).catch(() => null);
-    if (!actor) return false;
-    if (guild.ownerId === actor.id) return true;
-    return role.position < actor.roles.highest.position;
-  }
-
-  async function actorHas(guild, actorId, flag) {
-    if (ENV_ADMIN_IDS.includes(actorId)) return true;
-    const actor = await guild.members.fetch(actorId).catch(() => null);
-    return !!actor && actor.permissions.has(flag);
-  }
-
-  async function canUseGlobalBlacklist(userId) {
-    if (ENV_ADMIN_IDS.includes(userId)) return true;
-    if (!BLACKLIST_ADMIN_SERVERS.length) return true;
-    for (const id of BLACKLIST_ADMIN_SERVERS) {
-      const guild = client.guilds.cache.get(id);
-      if (guild && await canManageGuild(userId, guild)) return true;
-    }
-    return false;
-  }
-
-  async function createSingleUseInvite(guild, reason) {
-    const botMember = guild.members.me;
-    const ch = guild.channels.cache.find(c =>
-      c.type === ChannelType.GuildText &&
-      c.permissionsFor(botMember)?.has(PermissionsBitField.Flags.CreateInstantInvite)
-    );
-    if (!ch) return null;
-    try {
-      const invite = await ch.createInvite({ maxUses: 1, maxAge: 3600, unique: true, reason });
-      return invite.url;
-    } catch (e) {
-      log.warn(`Impossibile creare invito: ${e.message}`);
-      return null;
-    }
-  }
-
-  // Sban + invito monouso + DM con bottone (identico al comando -unban del bot)
-  async function unbanWithInvite(guild, targetId, moderatorName) {
-    await guild.bans.remove(targetId, `Sbannato dalla dashboard (${moderatorName})`);
-    const inviteUrl = await createSingleUseInvite(guild, `Invito per utente sbannato (${targetId})`);
-    const description = inviteUrl
-      ? `Sei stato sbannato dal server **${guild.name}**.\n\nUsa il pulsante qui sotto per rientrare. L'invito è valido per 1 utilizzo e scade tra 60 minuti.`
-      : `Sei stato sbannato dal server **${guild.name}**.`;
-    const payload = { embeds: [makeEmbed('Sei stato sbannato', description, 0x00FF00)] };
-    if (inviteUrl) {
-      payload.components = [
-        new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel('Rientra nel server').setStyle(ButtonStyle.Link).setURL(inviteUrl)
-        )
-      ];
-    }
-    await dmUser(targetId, payload);
-    return inviteUrl;
-  }
-
-  // Blacklist globale: DB + DM + ban su tutti i server dove l'utente è presente (come il bot)
-  async function blacklistAddFull(targetId, username, reason, mod) {
-    storage.addToBlacklist(targetId, username, reason, mod.id, mod.name);
-    await dmUser(targetId, { embeds: [makeEmbed('Aggiunto alla Blacklist Globale', `Sei stato aggiunto alla blacklist globale.\n**Motivo:** ${reason}`, 0x8B0000)] });
-    let bannedIn = 0;
-    for (const guild of client.guilds.cache.values()) {
-      try {
-        const member = await guild.members.fetch(targetId).catch(() => null);
-        if (!member) continue;
-        await guild.members.ban(targetId, { reason: `[BLACKLIST GLOBALE] ${reason}` });
-        await logMod(guild, {
-          type: 'Blacklist Ban', title: 'Ban Globale (Blacklist)', targetId,
-          target: `${username} (${targetId})`, moderator: mod.label, reason
-        });
-        bannedIn++;
-      } catch (err) { log.err(`ban ${guild.name}`, err); }
-    }
-    return bannedIn;
-  }
-
-  // Rimozione dalla blacklist: DB + unban su tutti i server + DM (come il bot)
-  async function blacklistRemoveFull(targetId, mod) {
-    const entry = storage.getBlacklistEntry(targetId);
-    storage.removeFromBlacklist(targetId);
-    const targetLabel = `${entry?.username || targetId} (${targetId})`;
-    let unbannedIn = 0;
-    for (const guild of client.guilds.cache.values()) {
-      try {
-        const ban = await guild.bans.fetch(targetId).catch(() => null);
-        if (!ban) continue;
-        await guild.bans.remove(targetId, `[BLACKLIST RIMOSSA] ${mod.name}`);
-        await logMod(guild, {
-          type: 'Blacklist Unban', title: 'Unban Globale (Blacklist Rimossa)', targetId,
-          target: targetLabel, moderator: mod.label, reason: 'Blacklist globale rimossa'
-        });
-        unbannedIn++;
-      } catch (err) { log.err(`unban ${guild.name}`, err); }
-    }
-    await dmUser(targetId, { embeds: [makeEmbed('Rimosso dalla Blacklist Globale', 'Sei stato rimosso dalla blacklist globale.', 0x00FF00)] });
-    return unbannedIn;
-  }
-
-  // Recupera un canale ticket e verifica i permessi; in caso di errore risponde e ritorna null
-  async function ticketChannelOrFail(req, res) {
-    const channelId = req.params.channelId;
-    if (!/^\d{17,20}$/.test(channelId)) { res.status(400).json({ error: 'ID canale non valido' }); return null; }
-    const ch = await client.channels.fetch(channelId).catch(() => null);
-    if (!ch || !ch.guild) { res.status(404).json({ error: 'Canale non trovato' }); return null; }
-    if (!ch.name?.startsWith('ticket-')) { res.status(400).json({ error: 'Non è un canale ticket' }); return null; }
-    if (!(await canManageGuild(req.session.user.id, ch.guild))) {
-      res.status(403).json({ error: 'Non hai i permessi su questo server' });
-      return null;
-    }
-    return ch;
-  }
-
-  // ==================== HELMET ====================
-  app.use(helmet({
-    contentSecurityPolicy: {
-      useDefaults: true,
-      directives: {
-        'default-src': ["'self'"],
-        'script-src': ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
-        'script-src-attr': ["'unsafe-inline'"],
-        'style-src': ["'self'", "'unsafe-inline'"],
-        'img-src': ["'self'", "data:", "https://cdn.discordapp.com"],
-        'connect-src': ["'self'", "https://cdn.jsdelivr.net"],
-        'frame-ancestors': ["'none'"],
-        'object-src': ["'none'"],
-        'base-uri': ["'self'"],
-        'form-action': ["'self'"]
-      }
-    },
-    crossOriginEmbedderPolicy: false,
-    hsts: IS_PROD ? { maxAge: 15552000, includeSubDomains: true } : false,
-    referrerPolicy: { policy: 'no-referrer' }
-  }));
-
-  app.use(express.json({ limit: '100kb' }));
-  app.use(express.urlencoded({ extended: true, limit: '100kb' }));
-
-  // ==================== COOKIE PARSER ====================
-  app.use(cookieParser());
-
-  // ==================== SESSION ====================
-  const SESSION_DIR = path.join(__dirname, 'data', 'sessions');
-  try { if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true }); } catch {}
-
-  app.use(session({
-    store: new FileStore({ path: SESSION_DIR, ttl: 7 * 24 * 60 * 60, retries: 0 }),
-    secret: SESSION_SECRET,
-    resave: false,
-    saveUninitialized: false,
-    proxy: true,
-    cookie: {
-      secure: IS_PROD,
-      httpOnly: true,
-      sameSite: 'lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    }
-  }));
-
-  // ==================== CSRF ====================
-  const CSRF_SECRET = process.env.CSRF_SECRET || SESSION_SECRET;
-
-  const {
-    doubleCsrfProtection,
-    generateCsrfToken
-  } = doubleCsrf({
-    getSecret: () => CSRF_SECRET,
-    getSessionIdentifier: (req) => {
-      if (!req.sessionID) {
-        throw new Error('Sessione non inizializzata: req.sessionID mancante');
-      }
-      return req.sessionID;
-    },
-    cookieName: 'x-csrf-token',
-    cookieOptions: {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: IS_PROD,
-      path: '/'
-    },
-    size: 32,
-    ignoredMethods: ['GET', 'HEAD', 'OPTIONS'],
-    getCsrfTokenFromRequest: (req) => {
-      const h = req.headers['x-csrf-token'];
-      const b = req.body && req.body._csrf;
-      return h ? String(h) : (b ? String(b) : '');
-    }
-  });
-
-  app.use(doubleCsrfProtection);
-
-  app.get('/api/csrf-token', (req, res) => {
-    if (!req.sessionID) {
-      return res.status(500).json({ error: 'Sessione non inizializzata (sessionID mancante)' });
-    }
-    req.session.save((err) => {
-      if (err) { log.err('csrf session save', err); return res.status(500).json({ error: 'Errore sessione' }); }
-      try {
-        const token = generateCsrfToken(req, res);
-        if (!token) return res.status(500).json({ error: 'Token CSRF vuoto' });
-        res.json({ csrfToken: token });
-      } catch (e) {
-        log.err('csrf-token', e);
-        res.status(500).json({ error: 'Errore CSRF' });
-      }
-    });
-  });
-
-  // ==================== RATE LIMIT ====================
-  const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste di login, riprova più tardi.' } });
-  const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 600, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe richieste, riprova più tardi.' } });
-  const actionLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppe azioni distruttive, riprova tra un minuto.' } });
-  const messageLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Troppi messaggi inviati, riprova tra un minuto.' } });
-
-  app.use('/auth', authLimiter);
-  app.use('/api', apiLimiter);
-
-  // ==================== ZOD ====================
-  const userIdSchema = z.string().regex(/^\d{17,20}$/, 'ID utente non valido');
-  const guildIdSchema = z.string().regex(/^\d{17,20}$/, 'ID server non valido');
-  const channelIdSchema = z.string().regex(/^\d{17,20}$/, 'ID canale non valido');
-  const roleIdSchema = z.string().regex(/^\d{17,20}$/, 'ID ruolo non valido');
-  const reasonSchema = z.string().max(512).optional().default('');
-
-  const schemaBlacklistAdd = z.object({ userId: userIdSchema, username: z.string().min(1).max(64), reason: z.string().min(1).max(500) });
-  const schemaBulkDelete = z.object({ ids: z.array(z.union([z.string(), z.number()])).min(1).max(500) });
-  const schemaConfig = z.object({ autoroleId: z.string().regex(/^\d{17,20}$/).nullable().optional(), logChannelId: z.string().regex(/^\d{17,20}$/).nullable().optional() });
-  const schemaWelcome = z.object({ channelId: z.string().regex(/^\d{17,20}$/).nullable().optional(), message: z.string().max(2000).nullable().optional(), embedEnabled: z.boolean().optional() });
-  const schemaCommandAdd = z.object({
-    name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i),
-    response: z.string().min(1).max(4096)
-  }).refine(d => !/@(everyone|here)\b/i.test(d.response), { message: 'La risposta non può menzionare everyone o here' });
-  const schemaMessagesSend = z.object({
-    channelId: z.string().regex(/^\d{17,20}$/),
-    content: z.string().max(2000).optional(),
-    embed: z.object({
-      title: z.string().max(256).optional(),
-      description: z.string().max(4096).optional(),
-      color: z.string().max(20).optional(),
-      image: z.string().url().max(500).optional(),
-      thumbnail: z.string().url().max(500).optional(),
-      footer: z.string().max(2048).optional()
-    }).optional()
-  }).refine(d => (d.content && d.content.length > 0) || (d.embed && (d.embed.title || d.embed.description)), { message: 'Testo o embed obbligatorio' });
-  const schemaUserAction = z.object({
-    action: z.enum(['kick', 'ban', 'unban']),
-    userId: userIdSchema,
-    guildId: guildIdSchema,
-    reason: z.string().max(512).optional().default('')
-  });
-  const schemaReminder = z.object({
-    guildId: guildIdSchema,
-    channelId: z.string().regex(/^\d{17,20}$/),
-    content: z.string().min(1).max(500),
-    when: z.string().min(1).max(20)
-  });
-  const schemaModWarn = z.object({ guildId: guildIdSchema, userId: userIdSchema, reason: reasonSchema });
-  const schemaModTimeout = z.object({ guildId: guildIdSchema, userId: userIdSchema, seconds: z.number().int().min(1).max(2419200), reason: reasonSchema });
-  const schemaModClear = z.object({ guildId: guildIdSchema, channelId: channelIdSchema, amount: z.number().int().min(1).max(100) });
-  const schemaModLock = z.object({ guildId: guildIdSchema, channelId: channelIdSchema, reason: reasonSchema });
-  const schemaModUnlock = z.object({ guildId: guildIdSchema, channelId: channelIdSchema });
-  const schemaModInvite = z.object({ guildId: guildIdSchema, channelId: channelIdSchema, userId: userIdSchema });
-  const schemaModRole = z.object({ guildId: guildIdSchema, userId: userIdSchema, roleId: roleIdSchema, action: z.enum(['add', 'remove']) });
-  const schemaNoteAdd = z.object({ guildId: guildIdSchema, userId: userIdSchema, content: z.string().min(2).max(1000) });
-  const schemaTicketPriority = z.object({ priority: z.enum(['low', 'med', 'high', 'urgent']) });
-
-  function parseOrFail(schema, data, res) {
-    const r = schema.safeParse(data);
-    if (!r.success) {
-      const issues = r.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
-      log.warn(`Validazione fallita: ${issues} — body: ${JSON.stringify(data)}`);
-      res.status(400).json({ error: `Dati non validi — ${issues}`, issues: r.error.issues });
-      return null;
-    }
-    return r.data;
-  }
-
-  function apiError(res, e, msg = 'Errore interno') {
-    try { log.err('api-error', e); } catch {}
-    res.status(500).json(IS_PROD ? { error: msg } : { error: msg, detail: e?.message });
-  }
-
-  async function requireAuth(req, res, next) {
-    if (!req.session.user) {
-      if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
-      return res.redirect('/auth/login');
-    }
-    if (!req.session.user.dashboardAuthorized) {
-      if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Non autorizzato' });
-      return res.status(403).send('Accesso negato.');
-    }
-    try {
-      const ok = await isAuthorizedByRole(req.session.user.id);
-      if (!ok) {
-        req.session.user.dashboardAuthorized = false;
-        if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Ruolo non più valido' });
-        return res.status(403).send('Accesso negato.');
-      }
-    } catch (e) { log.err('requireAuth recheck', e); }
-    next();
-  }
-
-  // ==================== LOBBY (API) ====================
-  mountLobbies(app, {
-    client, storage, log, requireAuth, actionLimiter, parseOrFail, apiError,
-    assertGuildAccess, canManageGuild, logMod, dashMod
-  });
-
-  // ==================== PUBBLICI ====================
-  app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
-  });
-  app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.4.4', loggedIn: !!req.session.user });
-  });
-
-  // ==================== OAUTH ====================
-  app.get('/auth/login', (req, res) => {
-    if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).send('OAuth2 non configurato.');
-    const state = crypto.randomBytes(24).toString('hex');
-    req.session.oauthState = state;
-    req.session.save((err) => {
-      if (err) return res.status(500).send('Errore sessione');
-      const params = new URLSearchParams({
-        client_id: CLIENT_ID,
-        redirect_uri: `${DASHBOARD_URL}/auth/callback`,
-        response_type: 'code',
-        scope: 'identify',
-        state
-      });
-      res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
-    });
-  });
-
-  app.get('/auth/callback', async (req, res) => {
-    const { code, state } = req.query;
-    const expected = req.session.oauthState;
-    delete req.session.oauthState;
-    if (!code || !state || !expected || !safeEqual(state, expected)) {
-      return res.status(403).send('Richiesta di login non valida, riprova dalla dashboard.');
-    }
-    try {
-      const tokenRes = await axios.post('https://discord.com/api/oauth2/token',
-        new URLSearchParams({ client_id: CLIENT_ID, client_secret: CLIENT_SECRET, grant_type: 'authorization_code', code, redirect_uri: `${DASHBOARD_URL}/auth/callback` }),
-        { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 10000 }
-      );
-      const userRes = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }, timeout: 10000 });
-      const user = userRes.data;
-
-      if (!(await isAuthorizedByRole(user.id))) {
-        return res.status(403).send('Accesso negato.');
-      }
-      log.ok(`OAuth login: ${user.username} (${user.id})`);
-
-      try {
-        const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || 'sconosciuto';
-        storage.saveDashboardAccess(user.id, user.username, ip, (req.headers['user-agent'] || '').slice(0, 300));
-      } catch (e) { log.err('saveDashboardAccess', e); }
-
-      req.session.regenerate((err) => {
-        if (err) return res.status(500).send('Errore login');
-        req.session.user = { id: user.id, username: user.username, global_name: user.global_name || user.username, avatar: user.avatar, dashboardAuthorized: true };
-        req.session.save(() => res.redirect('/dashboard'));
-      });
-    } catch (err) {
-      log.err('OAuth', err.response?.data || err.message);
-      res.status(500).send('Errore login');
-    }
-  });
-
-  app.get('/auth/logout', (req, res) => req.session.destroy(() => res.redirect('/')));
-  app.get('/auth/me', (req, res) => res.json({ user: req.session.user || null }));
-
-  app.post('/api/logout-all', requireAuth, (req, res) => {
-    const userId = req.session.user.id;
-    try {
-      const files = fs.readdirSync(SESSION_DIR);
-      let removed = 0;
-      for (const f of files) {
-        try {
-          const content = JSON.parse(fs.readFileSync(path.join(SESSION_DIR, f), 'utf8'));
-          if (content?.user?.id === userId) { fs.unlinkSync(path.join(SESSION_DIR, f)); removed++; }
-        } catch {}
-      }
-      authCache.delete(userId);
-      req.session.destroy(() => res.json({ ok: true, removed }));
-    } catch (e) { apiError(res, e, 'Errore logout globale'); }
-  });
-
-  // ==================== API ====================
-  app.get('/api/stats', requireAuth, async (req, res) => {
-    try {
-      const s = storage.getStats();
-      const allowed = await allowedGuildIds(req.session.user.id);
-      let ticketsCount = 0;
-      for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
-        for (const ch of guild.channels.cache.values()) {
-          if (ch.name && ch.name.startsWith('ticket-')) ticketsCount++;
-        }
-      }
-      let notesCount = 0, transcriptsCount = 0, remindersCount = 0;
-      try {
-        const perGuild = storage.db.prepare('SELECT guild_id, COUNT(*) AS c FROM member_notes GROUP BY guild_id').all();
-        notesCount = perGuild.filter(r => allowed.has(r.guild_id)).reduce((sum, r) => sum + r.c, 0);
-      } catch {}
-      try { transcriptsCount = countWhereGuilds('ticket_transcripts', allowed, req.session.user.id); } catch {}
-      try { remindersCount = countWhereGuilds('reminders', allowed, req.session.user.id); } catch {}
-      const logCount = isEnvAdmin(req.session.user.id) ? s.total : countWhereGuilds('mod_logs', allowed, req.session.user.id);
-      res.json({
-        logs: logCount, blacklist: s.blacklist, guilds: allowed.size, ping: client.ws.ping,
-        uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType,
-        tickets: ticketsCount, notes: notesCount, transcripts: transcriptsCount, reminders: remindersCount
-      });
-    } catch (e) { apiError(res, e, 'Errore statistiche'); }
-  });
-
-  app.get('/api/blacklist', requireAuth, async (req, res) => {
-    try {
-      if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi vedere la blacklist globale' });
-      res.json(storage.getAllBlacklist());
-    } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/blacklist', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaBlacklistAdd, req.body || {}, res);
-    if (!data) return;
-    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi gestire la blacklist globale' });
-    if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist il bot' });
-    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi mettere in blacklist te stesso' });
-    try {
-      if (storage.isBlacklisted(data.userId)) return res.status(409).json({ error: 'Già in blacklist' });
-      const bannedIn = await blacklistAddFull(data.userId, data.username, data.reason, dashActor(req));
-      res.json({ ok: true, bannedIn });
-    } catch (e) { apiError(res, e); }
-  });
-  app.delete('/api/blacklist/:userId', actionLimiter, requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
-    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi gestire la blacklist globale' });
-    try {
-      if (!storage.isBlacklisted(req.params.userId)) return res.status(404).json({ error: 'Utente non in blacklist' });
-      const unbannedIn = await blacklistRemoveFull(req.params.userId, dashActor(req));
-      res.json({ ok: true, unbannedIn });
-    } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/blacklist/bulk-delete', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
-    if (!data) return;
-    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi gestire la blacklist globale' });
-    try {
-      const mod = dashActor(req);
-      let count = 0;
-      for (const raw of data.ids) {
-        const id = String(raw);
-        if (!/^\d{17,20}$/.test(id) || !storage.isBlacklisted(id)) continue;
-        await blacklistRemoveFull(id, mod);
-        count++;
-      }
-      res.json({ ok: true, count });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/logs/all', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      res.json(logsForViewer(req.session.user.id, allowed, 500));
-    } catch (e) { res.json([]); }
-  });
-  app.get('/api/logs/:userId', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      res.json(logsForUserViewer(req.session.user.id, req.params.userId, allowed));
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/notes/all', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      res.json(notesForGuilds(allowed));
-    } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/notes', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaNoteAdd, req.body || {}, res);
-    if (!data) return;
-    const content = data.content.trim();
-    if (content.length < 2) return res.status(400).json({ error: 'Il contenuto della nota è troppo corto' });
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const target = await client.users.fetch(data.userId).catch(() => null);
-      if (!target) return res.status(404).json({ error: 'Utente non trovato' });
-      const id = storage.addNote(data.guildId, data.userId, req.session.user.id, req.session.user.username, content);
-      await logMod(guild, {
-        type: 'Nota Aggiunta', title: 'Nota Staff', targetId: data.userId,
-        target: `${target.username} (${target.id})`, moderator: dashMod(req), reason: content.slice(0, 500)
-      });
-      res.json({ ok: true, id });
-    } catch (e) { apiError(res, e, 'Errore salvataggio nota'); }
-  });
-  app.delete('/api/notes/:id', requireAuth, async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'ID non valido' });
-    try {
-      const note = storage.db.prepare('SELECT id, guild_id FROM member_notes WHERE id = ?').get(id);
-      if (!note) return res.status(404).json({ error: 'Nota non trovata' });
-      const allowed = await allowedGuildIds(req.session.user.id);
-      if (!allowed.has(note.guild_id)) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
-      res.json({ ok: storage.deleteNoteById(id) });
-    } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/notes/bulk-delete', requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
-    if (!data) return;
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const lookup = storage.db.prepare('SELECT id, guild_id FROM member_notes WHERE id = ?');
-      let count = 0;
-      for (const raw of data.ids) {
-        const id = parseInt(raw, 10);
-        if (!Number.isInteger(id) || id <= 0) continue;
-        const note = lookup.get(id);
-        if (note && allowed.has(note.guild_id) && storage.deleteNoteById(id)) count++;
-      }
-      res.json({ ok: true, count });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/config/:guildId', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
-    try { res.json(storage.getGuildConfig(req.params.guildId)); } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/config/:guildId', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
-    const data = parseOrFail(schemaConfig, req.body || {}, res);
-    if (!data) return;
-    const guildId = req.params.guildId;
-    try {
-      if (data.autoroleId !== undefined) {
-        if (data.autoroleId) storage.setAutorole(guildId, data.autoroleId);
-        else storage.clearAutorole(guildId);
-      }
-      if (data.logChannelId !== undefined) {
-        if (data.logChannelId) storage.setLogChannel(guildId, data.logChannelId);
-        else storage.clearLogChannel(guildId);
-      }
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/welcome/:guildId', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
-    try { res.json(storage.getWelcomeConfig(req.params.guildId) || {}); } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/welcome/:guildId', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
-    const data = parseOrFail(schemaWelcome, req.body || {}, res);
-    if (!data) return;
-    const guildId = req.params.guildId;
-    try {
-      if (data.channelId !== undefined) {
-        if (data.channelId) storage.setWelcomeChannel(guildId, data.channelId);
-        else storage.disableWelcome(guildId);
-      }
-      if (data.message !== undefined && data.message !== null) {
-        if (data.message.trim()) storage.setWelcomeMessage(guildId, data.message);
-        else storage.clearWelcomeMessage(guildId);
-      }
-      if (data.embedEnabled !== undefined) {
-        const current = storage.getWelcomeConfig(guildId);
-        storage.setWelcomeConfig(guildId, { channelId: current?.channel_id ?? null, message: current?.message ?? null, embedEnabled: data.embedEnabled });
-      }
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.post('/api/welcome/:guildId/test', requireAuth, async (req, res) => {
-    if (!/^\d{17,20}$/.test(req.params.guildId)) return res.status(400).json({ error: 'ID server non valido' });
-    if (!(await assertGuildAccess(req, res, req.params.guildId))) return;
-    const guild = client.guilds.cache.get(req.params.guildId);
-
-    const config = storage.getWelcomeConfig(req.params.guildId);
-    if (!config || !config.channel_id) return res.status(400).json({ error: 'Canale welcome non configurato' });
-
-    const channel = guild.channels.cache.get(config.channel_id);
-    if (!channel || !channel.isTextBased()) return res.status(400).json({ error: 'Canale welcome non valido' });
-
-    try {
-      const user = req.session.user;
-      const fill = (t) => String(t || 'Benvenuto {user} in {server}!')
-        .replace(/{user}/g, `<@${user.id}>`)
-        .replace(/{username}/g, user.username)
-        .replace(/{server}/g, guild.name)
-        .replace(/{memberCount}/g, guild.memberCount);
-
-      const text = fill(config.message);
-      if (config.embed_enabled) {
-        const avatarUrl = user.avatar
-          ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
-          : `https://cdn.discordapp.com/embed/avatars/0.png`;
-        const embed = new EmbedBuilder()
-          .setTitle('👋 Benvenuto!').setDescription(text).setColor(0x00FF00)
-          .setThumbnail(avatarUrl).setFooter({ text: `Sei il membro #${guild.memberCount}` }).setTimestamp();
-        await channel.send({ embeds: [embed] });
-      } else {
-        await channel.send({ content: text, allowedMentions: { parse: ['users'] } });
-      }
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore test welcome'); }
-  });
-
-  app.get('/api/tickets', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const tickets = [];
-      for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
-        for (const ch of guild.channels.cache.values()) {
-          if (ch.name && ch.name.startsWith('ticket-')) {
-            const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
-            tickets.push({
-              guild: guild.name, guildId: guild.id,
-              channel: ch.name, channelId: ch.id,
-              userId: ch.name.replace('ticket-', ''),
-              claimedBy: meta.claimed_by_tag || null,
-              priority: meta.priority || null
-            });
-          }
-        }
-      }
-      res.json(tickets);
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.delete('/api/tickets/:channelId', requireAuth, async (req, res) => {
-    try {
-      const ch = await ticketChannelOrFail(req, res);
-      if (!ch) return;
-      const userId = ch.name.replace('ticket-', '');
-      const html = await buildTranscriptHtml(ch);
-      const meta = storage.getTicketMeta ? storage.getTicketMeta(ch.id) : null;
-      if (html && storage.saveTranscript) {
-        storage.saveTranscript(
-          ch.id, ch.name, userId,
-          meta?.claimed_by_tag || 'N/D', meta?.priority || 'N/D', html, ch.guild.id
-        );
-      }
-      await logMod(ch.guild, {
-        type: 'Ticket Chiuso', title: 'Ticket Chiuso', targetId: userId,
-        target: userId, moderator: dashMod(req), channel: ch.name
-      });
-      await ch.delete('Chiuso dalla dashboard web');
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.post('/api/tickets/:channelId/claim', actionLimiter, requireAuth, async (req, res) => {
-    try {
-      const ch = await ticketChannelOrFail(req, res);
-      if (!ch) return;
-      storage.setTicketMeta(ch.id, { claimedById: req.session.user.id, claimedByTag: req.session.user.username });
-      await logMod(ch.guild, {
-        type: 'Ticket Claim', title: 'Ticket preso in carico', targetId: ch.name.replace('ticket-', ''),
-        target: ch.name, moderator: dashMod(req), channel: ch.name
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.post('/api/tickets/:channelId/priority', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaTicketPriority, req.body || {}, res);
-    if (!data) return;
-    try {
-      const ch = await ticketChannelOrFail(req, res);
-      if (!ch) return;
-      storage.setTicketMeta(ch.id, { priority: data.priority });
-      await logMod(ch.guild, {
-        type: 'Ticket Priorità', title: 'Priorità ticket', targetId: ch.name.replace('ticket-', ''),
-        target: ch.name, moderator: dashMod(req), channel: ch.name,
-        reason: `Priorità: ${data.priority.toUpperCase()}`
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.post('/api/ticketpanel', requireAuth, async (req, res) => {
-    const schema = z.object({ channelId: z.string().regex(/^\d{17,20}$/) });
-    const data = parseOrFail(schema, req.body || {}, res);
-    if (!data) return;
-    try {
-      const channel = await client.channels.fetch(data.channelId).catch(() => null);
-      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
-      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
-        return res.status(403).json({ error: 'Non hai i permessi su questo server' });
-      }
-      const panelActor = await channel.guild.members.fetch(req.session.user.id).catch(() => null);
-      if (!isEnvAdmin(req.session.user.id) && !channel.permissionsFor(panelActor)?.has(PermissionsBitField.Flags.SendMessages)) {
-        return res.status(403).json({ error: 'Non puoi scrivere in questo canale' });
-      }
-
-      const embed = new EmbedBuilder().setTitle('Pannello Ticket').setDescription('Premi il bottone qui sotto per aprire un ticket.').setColor(0x0099FF).setTimestamp();
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('create_ticket').setLabel('Apri Ticket').setStyle(ButtonStyle.Primary)
-      );
-      await channel.send({ embeds: [embed], components: [row] });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore creazione pannello'); }
-  });
-
-  app.get('/api/tickets/transcripts', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      res.json(transcriptsForViewer(req.session.user.id, allowed));
-    } catch (e) { apiError(res, e); }
-  });
-  app.get('/api/tickets/transcripts/:id', requireAuth, async (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).send('ID non valido');
-    try {
-      const t = storage.getTranscript ? storage.getTranscript(id) : null;
-      if (!t) return res.status(404).send('Transcript non trovato');
-      if (t.guild_id) {
-        if (!(await assertGuildAccess(req, res, t.guild_id))) return;
-      } else if (!isEnvAdmin(req.session.user.id)) {
-        return res.status(403).send('Transcript senza server: visibile solo agli admin dashboard');
-      }
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.send(t.html_content);
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/commands', requireAuth, (req, res) => {
-    try {
-      const cmds = storage.loadCommands();
-      res.json(Object.entries(cmds).map(([name, response]) => ({ name, response })));
-    } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/commands', requireAuth, (req, res) => {
-    const data = parseOrFail(schemaCommandAdd, req.body || {}, res);
-    if (!data) return;
-    try { storage.saveCommand(data.name.toLowerCase(), data.response); res.json({ ok: true }); }
-    catch (e) { apiError(res, e); }
-  });
-  app.delete('/api/commands/:name', requireAuth, (req, res) => {
-    const name = String(req.params.name || '').toLowerCase();
-    if (!/^[a-z0-9_-]{1,50}$/.test(name)) return res.status(400).json({ error: 'Nome non valido' });
-    try { res.json({ ok: storage.deleteCommand(name) }); } catch (e) { apiError(res, e); }
-  });
-  app.post('/api/commands/bulk-delete', requireAuth, (req, res) => {
-    const schema = z.object({ names: z.array(z.string().regex(/^[a-z0-9_-]{1,50}$/i)).min(1).max(500) });
-    const data = parseOrFail(schema, req.body || {}, res);
-    if (!data) return;
-    try {
-      let count = 0;
-      for (const n of data.names) if (storage.deleteCommand(n)) count++;
-      res.json({ ok: true, count });
-    } catch (e) { apiError(res, e); }
-  });
-
-  function logScope(userId, allowed) {
-    if (isEnvAdmin(userId)) return { sql: '', params: [] };
-    const ids = [...allowed];
-    if (!ids.length) return { sql: ' AND 1=0', params: [] };
-    return { sql: ` AND guild_id IN (${ids.map(() => '?').join(',')})`, params: ids };
-  }
-
-  app.get('/api/charts', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const scope = logScope(req.session.user.id, allowed);
-      const where = scope.sql ? `WHERE 1=1${scope.sql}` : '';
-      const byType = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs ${where} GROUP BY type`).all(...scope.params);
-      const byDay = storage.db.prepare(`SELECT substr(timestamp,1,10) as day, COUNT(*) as c FROM mod_logs ${where} GROUP BY day ORDER BY day DESC LIMIT 30`).all(...scope.params);
-      res.json({ byType, byDay });
-    } catch (e) { res.json({ byType: [], byDay: [] }); }
-  });
-
-  app.get('/api/top', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const scope = logScope(req.session.user.id, allowed);
-      const moderators = storage.db.prepare(`SELECT moderator, COUNT(*) as c FROM mod_logs WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico'${scope.sql} GROUP BY moderator ORDER BY c DESC LIMIT 10`).all(...scope.params);
-      const targets = storage.db.prepare(`SELECT target_id, target, COUNT(*) as c FROM mod_logs WHERE target_id IS NOT NULL${scope.sql} GROUP BY target_id ORDER BY c DESC LIMIT 10`).all(...scope.params);
-      const types = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs WHERE 1=1${scope.sql} GROUP BY type ORDER BY c DESC`).all(...scope.params);
-      const byMonth = storage.db.prepare(`SELECT substr(timestamp,1,7) as month, COUNT(*) as c FROM mod_logs WHERE 1=1${scope.sql} GROUP BY month ORDER BY month DESC LIMIT 12`).all(...scope.params);
-      res.json({ moderators, targets, types, byMonth });
-    } catch (e) { log.err('api/top', e); res.json({ moderators: [], targets: [], types: [], byMonth: [] }); }
-  });
-
-  app.get('/api/guilds', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const guilds = [...client.guilds.cache.values()]
-        .filter(g => allowed.has(g.id))
-        .map(g => ({
-          id: g.id, name: g.name,
-          roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
-          channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
-        }));
-      res.json(guilds);
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/user/:userId', requireAuth, async (req, res) => {
-    const userId = req.params.userId;
-    if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const logs = logsForUserViewer(req.session.user.id, userId, allowed);
-      const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 1000').all(userId)
-        .filter(n => allowed.has(n.guild_id))
-        .slice(0, 100);
-      const blacklistEntry = (await canUseGlobalBlacklist(req.session.user.id)) ? storage.getBlacklistEntry(userId) : null;
-      const tickets = [];
-      for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
-        for (const ch of guild.channels.cache.values()) {
-          if (ch.name && ch.name === `ticket-${userId}`) {
-            const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
-            tickets.push({ guild: guild.name, guildId: guild.id, channel: ch.name, channelId: ch.id, claimedBy: meta.claimed_by_tag || null, priority: meta.priority || null });
-          }
-        }
-      }
-      const byTypeMap = logs.reduce((acc, l) => { acc[l.type] = (acc[l.type] || 0) + 1; return acc; }, {});
-      res.json({ userId, logs, notes, blacklist: blacklistEntry, tickets, byType: Object.entries(byTypeMap).map(([type, c]) => ({ type, c })) });
-    } catch (e) { apiError(res, e, 'Errore caricamento utente'); }
-  });
-
-  app.get('/api/search', requireAuth, async (req, res) => {
-    const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
-    if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const blacklist = (await canUseGlobalBlacklist(req.session.user.id))
-        ? storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q))
-        : [];
-      const notes = notesForGuilds(allowed, 5000).filter(n => (n.user_id || '').toLowerCase().includes(q) || (n.content || '').toLowerCase().includes(q) || (n.author_tag || '').toLowerCase().includes(q));
-      const logs = logsForViewer(req.session.user.id, allowed, 500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
-      const tickets = [];
-      for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
-        for (const ch of guild.channels.cache.values()) {
-          if (ch.name && ch.name.startsWith('ticket-') && ch.name.toLowerCase().includes(q)) {
-            tickets.push({ guild: guild.name, channel: ch.name, channelId: ch.id, userId: ch.name.replace('ticket-', '') });
-          }
-        }
-      }
-      res.json({ blacklist, notes, logs, tickets });
-    } catch (e) { apiError(res, e, 'Errore ricerca'); }
-  });
-
-  function sanitizeCsvCell(v) {
-    const s = (v === null || v === undefined) ? '' : String(v);
-    if (/^[=+\-@\t\r]/.test(s)) return "'" + s;
-    return s;
-  }
-  function toCsv(rows, headers) {
-    if (!rows.length) return headers.join(',');
-    const esc = (v) => {
-      const s = sanitizeCsvCell(v);
-      return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
-    };
-    return headers.join(',') + '\n' + rows.map(r => headers.map(h => esc(r[h])).join(',')).join('\n');
-  }
-
-  app.get('/api/export/blacklist.csv', requireAuth, async (req, res) => {
-    if (!(await canUseGlobalBlacklist(req.session.user.id))) return res.status(403).json({ error: 'Non puoi esportare la blacklist globale' });
-    try {
-      const csv = toCsv(storage.getAllBlacklist(), ['user_id', 'username', 'reason', 'moderator_tag', 'added_at']);
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="blacklist.csv"');
-      res.send(csv);
-    } catch (e) { apiError(res, e); }
-  });
-  app.get('/api/export/notes.csv', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const csv = toCsv(
-        notesForGuilds(allowed, 100000),
-        ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']
-      );
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="notes.csv"');
-      res.send(csv);
-    } catch (e) { apiError(res, e); }
-  });
-  app.get('/api/export/logs.csv', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const csv = toCsv(logsForViewer(req.session.user.id, allowed, 5000), ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'guild_id', 'timestamp']);
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
-      res.send(csv);
-    } catch (e) { apiError(res, e); }
-  });
-  app.get('/api/export/access-logs.csv', requireAuth, (req, res) => {
-    if (ENV_ADMIN_IDS.length && !isEnvAdmin(req.session.user.id)) return res.status(403).json({ error: 'Solo gli admin dashboard vedono gli IP' });
-    try {
-      const csv = toCsv(storage.getDashboardAccessLogs(), ['id', 'user_id', 'username', 'ip', 'user_agent', 'timestamp']);
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename="access-logs.csv"');
-      res.send(csv);
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.get('/api/access-logs', requireAuth, (req, res) => {
-    if (ENV_ADMIN_IDS.length && !isEnvAdmin(req.session.user.id)) return res.status(403).json({ error: 'Solo gli admin dashboard vedono gli IP' });
-    try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
-  });
-
-  app.get('/api/messages/channels', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const out = [];
-      for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
-        for (const ch of guild.channels.cache.values()) {
-          if (ch.type === 0) out.push({ guildId: guild.id, guildName: guild.name, channelId: ch.id, channelName: ch.name });
-        }
-      }
-      out.sort((a, b) => a.guildName.localeCompare(b.guildName) || a.channelName.localeCompare(b.channelName));
-      res.json(out);
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.post('/api/messages/send', messageLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaMessagesSend, req.body || {}, res);
-    if (!data) return;
-    try {
-      const channel = await client.channels.fetch(data.channelId).catch(() => null);
-      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
-      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
-        return res.status(403).json({ error: 'Non hai i permessi su questo server' });
-      }
-      const sender = await channel.guild.members.fetch(req.session.user.id).catch(() => null);
-      if (!isEnvAdmin(req.session.user.id) && !channel.permissionsFor(sender)?.has(PermissionsBitField.Flags.SendMessages)) {
-        return res.status(403).json({ error: 'Non puoi scrivere in questo canale' });
-      }
-      const botMember = channel.guild?.members?.me;
-      if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
-
-      const payload = { allowedMentions: { parse: ['users'] } };
-      if (data.content) payload.content = data.content;
-      if (data.embed && (data.embed.title || data.embed.description)) {
-        const e = new EmbedBuilder();
-        if (data.embed.title) e.setTitle(String(data.embed.title).slice(0, 256));
-        if (data.embed.description) e.setDescription(String(data.embed.description).slice(0, 4096));
-        if (data.embed.color) { try { e.setColor(data.embed.color); } catch {} }
-        if (data.embed.image) e.setImage(data.embed.image);
-        if (data.embed.thumbnail) e.setThumbnail(data.embed.thumbnail);
-        if (data.embed.footer) e.setFooter({ text: String(data.embed.footer).slice(0, 2048) });
-        payload.embeds = [e];
-      }
-
-      const sent = await channel.send(payload);
-      try {
-        storage.saveDashboardAccess(req.session.user.id, `MSG→#${channel.name} (${channel.guild?.name || 'DM'})`, (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-', (req.headers['user-agent'] || '').slice(0, 300));
-      } catch {}
-      res.json({ ok: true, messageId: sent.id, channelId: channel.id });
-    } catch (e) { apiError(res, e, 'Errore invio messaggio'); }
-  });
-
-  // ---------- Moderazione canale (come -clear, -lock, -unlock del bot) ----------
-  app.post('/api/mod/clear', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModClear, req.body || {}, res);
-    if (!data) return;
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const channel = guild.channels.cache.get(data.channelId);
-      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale testuale non valido' });
-      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageMessages))) {
-        return res.status(403).json({ error: 'Ti manca "Gestisci Messaggi"' });
-      }
-      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
-        return res.status(403).json({ error: 'Il bot non può gestire i messaggi in questo canale' });
-      }
-      const deleted = await channel.bulkDelete(data.amount, true);
-      await logMod(guild, {
-        type: 'Clear', title: 'Clear Messaggi', moderator: dashMod(req),
-        channel: channel.name, reason: `Cancellati ${deleted.size} messaggi`
-      });
-      res.json({ ok: true, count: deleted.size });
-    } catch (e) {
-      if (e?.code === 50034) return res.status(400).json({ error: 'Non posso cancellare messaggi più vecchi di 14 giorni' });
-      apiError(res, e, 'Errore pulizia messaggi');
-    }
-  });
-
-  app.post('/api/mod/lock', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModLock, req.body || {}, res);
-    if (!data) return;
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const channel = guild.channels.cache.get(data.channelId);
-      if (!channel) return res.status(404).json({ error: 'Canale non trovato' });
-      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageChannels))) {
-        return res.status(403).json({ error: 'Ti manca "Gestisci Canali"' });
-      }
-      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageChannels)) {
-        return res.status(403).json({ error: 'Il bot non può gestire questo canale' });
-      }
-      const everyone = guild.roles.everyone;
-      const current = channel.permissionOverwrites.cache.get(everyone.id);
-      if (current && current.deny.has(PermissionsBitField.Flags.SendMessages)) {
-        return res.status(409).json({ error: 'Questo canale è già bloccato' });
-      }
-      await channel.permissionOverwrites.edit(everyone, { SendMessages: false });
-      await logMod(guild, {
-        type: 'Lock', title: 'Canale Bloccato', moderator: dashMod(req),
-        channel: channel.name, reason: data.reason || 'Nessun motivo'
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore blocco canale'); }
-  });
-
-  app.post('/api/mod/unlock', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModUnlock, req.body || {}, res);
-    if (!data) return;
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const channel = guild.channels.cache.get(data.channelId);
-      if (!channel) return res.status(404).json({ error: 'Canale non trovato' });
-      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageChannels))) {
-        return res.status(403).json({ error: 'Ti manca "Gestisci Canali"' });
-      }
-      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageChannels)) {
-        return res.status(403).json({ error: 'Il bot non può gestire questo canale' });
-      }
-      const everyone = guild.roles.everyone;
-      const current = channel.permissionOverwrites.cache.get(everyone.id);
-      if (!current || !current.deny.has(PermissionsBitField.Flags.SendMessages)) {
-        return res.status(409).json({ error: 'Questo canale non è bloccato' });
-      }
-      await channel.permissionOverwrites.edit(everyone, { SendMessages: null });
-      await logMod(guild, {
-        type: 'Unlock', title: 'Canale Sbloccato', moderator: dashMod(req), channel: channel.name
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore sblocco canale'); }
-  });
-
-  // ---------- Azioni su utente (come -warn, -timeout, -invite, -giverole, -removerole) ----------
-  app.post('/api/mod/warn', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModWarn, req.body || {}, res);
-    if (!data) return;
-    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
-    if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi warnare il bot' });
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const member = await guild.members.fetch(data.userId).catch(() => null);
-      if (!member) return res.status(404).json({ error: 'Utente non nel server' });
-      if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return res.status(403).json({ error: 'Non puoi warnare un admin' });
-      if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
-      await logMod(guild, {
-        type: 'Warn', title: 'Warn', targetId: member.id, target: `${member.user.username} (${member.id})`,
-        moderator: dashMod(req), reason: data.reason || 'Nessun motivo specificato'
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore warn'); }
-  });
-
-  app.post('/api/mod/timeout', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModTimeout, req.body || {}, res);
-    if (!data) return;
-    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
-    if (data.userId === client.user.id) return res.status(400).json({ error: 'Non puoi fare timeout al bot' });
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const member = await guild.members.fetch(data.userId).catch(() => null);
-      if (!member) return res.status(404).json({ error: 'Utente non nel server' });
-      if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return res.status(403).json({ error: 'Non puoi fare timeout a un admin' });
-      if (!guild.members.me.permissions.has(PermissionsBitField.Flags.ModerateMembers)) return res.status(403).json({ error: 'Il bot non ha "Modera Membri"' });
-      if (!member.moderatable) return res.status(403).json({ error: 'Non posso fare timeout a questo utente' });
-      if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
-      const reason = data.reason || 'Nessun motivo specificato';
-      await member.timeout(data.seconds * 1000, reason);
-      await logMod(guild, {
-        type: 'Timeout', title: 'Timeout', targetId: member.id, target: `${member.user.username} (${member.id})`,
-        moderator: dashMod(req), reason, duration: formatDuration(data.seconds)
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore timeout'); }
-  });
-
-  app.post('/api/mod/invite', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModInvite, req.body || {}, res);
-    if (!data) return;
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const channel = guild.channels.cache.get(data.channelId);
-      if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale testuale non valido' });
-      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.CreateInstantInvite))) {
-        return res.status(403).json({ error: 'Ti manca "Crea Invito"' });
-      }
-      if (!channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.CreateInstantInvite)) {
-        return res.status(403).json({ error: 'Il bot non può creare inviti in questo canale' });
-      }
-      const target = await client.users.fetch(data.userId).catch(() => null);
-      if (!target) return res.status(404).json({ error: 'Utente non trovato' });
-      const invite = await channel.createInvite({
-        maxUses: 1, maxAge: 3600, unique: true,
-        reason: `Invito dalla dashboard (${req.session.user.username})`
-      });
-      const text = `${req.session.user.username} ti ha inviato un invito per il server **${guild.name}**\n${invite.url}\nValido per 1 utilizzo, scade tra 60 minuti.`;
-      const sent = await dmUser(data.userId, { content: text });
-      if (sent) return res.json({ ok: true, via: 'dm' });
-      await channel.send({ content: `${target}\n${text}`, allowedMentions: { users: [data.userId] } }).catch(() => {});
-      res.json({ ok: true, via: 'channel' });
-    } catch (e) { apiError(res, e, 'Errore invito'); }
-  });
-
-  app.post('/api/mod/role', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaModRole, req.body || {}, res);
-    if (!data) return;
-    if (data.userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
-    if (!(await assertGuildAccess(req, res, data.guildId))) return;
-    try {
-      const guild = client.guilds.cache.get(data.guildId);
-      const botMember = guild.members.me;
-      const role = guild.roles.cache.get(data.roleId);
-      if (!role || role.name === '@everyone') return res.status(404).json({ error: 'Ruolo non trovato' });
-      const member = await guild.members.fetch(data.userId).catch(() => null);
-      if (!member) return res.status(404).json({ error: 'Utente non nel server' });
-      if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.ManageRoles))) return res.status(403).json({ error: 'Ti manca "Gestisci Ruoli"' });
-      if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) return res.status(403).json({ error: 'Il bot non ha "Gestisci Ruoli"' });
-      if (role.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Non posso gestire un ruolo più alto o uguale al mio' });
-      if (!(await actorCanGrantRole(guild, req.session.user.id, role))) return res.status(403).json({ error: 'Non puoi gestire un ruolo più alto o uguale al tuo' });
-
-      if (data.action === 'add') {
-        if (member.roles.cache.has(role.id)) return res.status(409).json({ error: `L'utente ha già il ruolo ${role.name}` });
-        await member.roles.add(role);
-      } else {
-        if (!member.roles.cache.has(role.id)) return res.status(409).json({ error: `L'utente non ha il ruolo ${role.name}` });
-        await member.roles.remove(role);
-      }
-      await logMod(guild, {
-        type: data.action === 'add' ? 'Ruolo Aggiunto' : 'Ruolo Rimosso',
-        title: data.action === 'add' ? 'Ruolo assegnato' : 'Ruolo rimosso',
-        targetId: member.id,
-        target: `${member.user.username} (${member.id})`,
-        moderator: dashMod(req),
-        reason: role.name
-      });
-      res.json({ ok: true });
-    } catch (e) { apiError(res, e, 'Errore gestione ruolo'); }
-  });
-
-  app.get('/api/user-lookup/:userId', requireAuth, async (req, res) => {
-    const userId = req.params.userId;
-    if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
-    try {
-      const user = await client.users.fetch(userId).catch(() => null);
-      if (!user) return res.status(404).json({ error: 'Utente non trovato' });
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const memberships = [];
-      for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
-        const member = await guild.members.fetch(userId).catch(() => null);
-        if (member) memberships.push({ guildId: guild.id, guildName: guild.name, joinedAt: member.joinedAt, roles: member.roles.cache.filter(r => r.name !== '@everyone').map(r => r.name) });
-      }
-      res.json({ id: user.id, username: user.username, tag: user.tag, bot: user.bot, avatar: user.displayAvatarURL({ size: 128 }), createdAt: user.createdAt, memberships });
-    } catch (e) { apiError(res, e, 'Errore lookup utente'); }
-  });
-
-  app.post('/api/user-action', actionLimiter, requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaUserAction, req.body || {}, res);
-    if (!data) return;
-    const { action, userId, guildId, reason } = data;
-    if (userId === req.session.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni su te stesso' });
-    if (userId === client.user.id) return res.status(400).json({ error: 'Non puoi eseguire azioni sul bot' });
-    try {
-      if (!(await assertGuildAccess(req, res, guildId))) return;
-      const guild = client.guilds.cache.get(guildId);
-      const botMember = guild.members.me;
-      if (!botMember) return res.status(500).json({ error: 'Bot non nel server' });
-      const r = (reason || `Azione da dashboard (${req.session.user.username})`).slice(0, 512);
-
-      if (action === 'kick') {
-        if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.KickMembers))) return res.status(403).json({ error: 'Ti manca "Espelli Membri"' });
-        if (!botMember.permissions.has('KickMembers')) return res.status(403).json({ error: 'Il bot non ha "Espelli Membri"' });
-        const member = await guild.members.fetch(userId).catch(() => null);
-        if (!member) return res.status(404).json({ error: 'Utente non nel server' });
-        if (member.id === guild.ownerId) return res.status(403).json({ error: 'Non puoi espellere il proprietario' });
-        if (member.roles.highest.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
-        if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
-        if (!member.kickable) return res.status(403).json({ error: 'Utente non espellibile' });
-        await member.kick(r);
-        await logMod(guild, { type: 'Kick (dashboard)', targetId: userId, target: `${member.user.tag} (${userId})`, moderator: dashMod(req), reason: r, channel: 'Web Dashboard' });
-      }
-
-      if (action === 'ban') {
-        if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.BanMembers))) return res.status(403).json({ error: 'Ti manca "Banna Membri"' });
-        if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
-        if (userId === guild.ownerId) return res.status(403).json({ error: 'Non puoi bannare il proprietario' });
-        const member = await guild.members.fetch(userId).catch(() => null);
-        if (member) {
-          if (member.roles.highest.position >= botMember.roles.highest.position) return res.status(403).json({ error: 'Ruolo troppo alto per il bot' });
-          if (!member.bannable) return res.status(403).json({ error: 'Utente non bannabile' });
-          if (!(await actorCanActOn(guild, req.session.user.id, member))) return res.status(403).json({ error: 'Ruolo troppo alto per il tuo account' });
-        }
-        // DM prima del ban: dopo il ban il bot potrebbe non condividere più un server con l'utente
-        const targetUser = await client.users.fetch(userId).catch(() => null);
-        if (targetUser) {
-          await dmUser(userId, { embeds: [makeEmbed('Sei stato bannato', `Sei stato bannato dal server **${guild.name}**.\n\n**Motivo:** ${r}`, 0xFF0000)] });
-        }
-        await guild.members.ban(userId, { reason: r });
-        await logMod(guild, { type: 'Ban (dashboard)', targetId: userId, target: member ? `${member.user.tag} (${userId})` : userId, moderator: dashMod(req), reason: r, channel: 'Web Dashboard' });
-      }
-
-      if (action === 'unban') {
-        if (!(await actorHas(guild, req.session.user.id, PermissionsBitField.Flags.BanMembers))) return res.status(403).json({ error: 'Ti manca "Banna Membri"' });
-        if (!botMember.permissions.has('BanMembers')) return res.status(403).json({ error: 'Il bot non ha "Banna Membri"' });
-        const ban = await guild.bans.fetch(userId).catch(e => { if (e.code === 10026) return null; throw e; });
-        if (!ban) return res.status(404).json({ error: 'Utente non bannato' });
-        await unbanWithInvite(guild, userId, req.session.user.username);
-        await logMod(guild, { type: 'Unban (dashboard)', targetId: userId, target: `${ban.user.tag} (${userId})`, moderator: dashMod(req), reason: r, channel: 'Web Dashboard' });
-      }
-
-      try {
-        storage.saveDashboardAccess(req.session.user.id, `${action.toUpperCase()} ${userId} su ${guild.name}`, (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-', (req.headers['user-agent'] || '').slice(0, 300));
-      } catch {}
-
-      res.json({ ok: true, action, userId, guildId });
-    } catch (e) { apiError(res, e, 'Errore azione utente'); }
-  });
-
-  app.get('/api/reminders', requireAuth, async (req, res) => {
-    try {
-      const allowed = await allowedGuildIds(req.session.user.id);
-      const rows = storage.getAllReminders
-        ? storage.getAllReminders(200)
-        : storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all();
-      res.json(rows.filter(r => allowed.has(r.guild_id)));
-    } catch (e) { apiError(res, e); }
-  });
-
-  app.post('/api/reminders', requireAuth, async (req, res) => {
-    const data = parseOrFail(schemaReminder, req.body || {}, res);
-    if (!data) return;
-    const guild = client.guilds.cache.get(data.guildId);
-    if (!guild || !guild.channels.cache.has(data.channelId)) return res.status(400).json({ error: 'Server o canale non valido' });
-    if (!(await canManageGuild(req.session.user.id, guild))) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
-    const m = data.when.trim().match(/^(\d+)\s*(s|m|h|d)$/i);
-    if (!m) return res.status(400).json({ error: 'Formato tempo non valido (es. 10m, 1h, 2d)' });
-    const n = parseInt(m[1], 10);
-    const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2].toLowerCase()];
-    const ms = n * mult;
-    if (ms < 5000 || ms > 30 * 24 * 60 * 60 * 1000) return res.status(400).json({ error: 'Durata tra 5s e 30g' });
-    try {
-      const id = storage.addReminder(req.session.user.id, data.guildId, data.channelId, data.content, new Date(Date.now() + ms));
-      res.json({ ok: true, id });
-    } catch (e) { apiError(res, e); }
-  });
-
-  // ==================== PAGINE HTML ====================
-  const pageHandler = (page, paramsFn) => (req, res, next) => {
-    if (!req.sessionID) {
-      return res.status(500).send('Errore: sessione non inizializzata');
-    }
-    req.session.save((saveErr) => {
-      if (saveErr) { log.err('session save', saveErr); return res.status(500).send('Errore sessione'); }
-      try {
-        const params = paramsFn ? paramsFn(req) : {};
-        let token = '';
-        try {
-          token = generateCsrfToken(req, res);
-          if (!token) log.warn(`csrf token vuoto per ${page} (sessione: ${req.sessionID})`);
-        } catch (e) { log.err(`csrf gen ${page}`, e); }
-        res.send(renderLayout(req.session.user, page, params, { csrfToken: token }));
-      } catch (e) {
-        log.err(`page ${page}`, e);
-        res.status(500).send('Errore rendering');
-      }
-    });
-  };
-
-  app.get('/dashboard', requireAuth, pageHandler('dashboard'));
-  app.get('/modlogs', requireAuth, pageHandler('modlogs'));
-  app.get('/notes', requireAuth, pageHandler('notes'));
-  app.get('/tickets', requireAuth, pageHandler('tickets'));
-  app.get('/commands', requireAuth, pageHandler('commands'));
-  app.get('/config', requireAuth, pageHandler('config'));
-  app.get('/charts', requireAuth, pageHandler('charts'));
-  app.get('/top', requireAuth, pageHandler('top'));
-  app.get('/user/:userId', requireAuth, (req, res, next) => {
-    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).send('ID non valido');
-    pageHandler('user', r => ({ userId: r.params.userId }))(req, res, next);
-  });
-  app.get('/search', requireAuth, pageHandler('search', r => ({ q: (r.query.q || '').toString().slice(0, 100) })));
-  app.get('/access-logs', requireAuth, pageHandler('accesslogs'));
-  app.get('/messages', requireAuth, pageHandler('messages'));
-  app.get('/user-actions', requireAuth, pageHandler('userActions'));
-  app.get('/user-actions/:userId', requireAuth, (req, res, next) => {
-    if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).send('ID non valido');
-    pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
-  });
-  app.get('/reminders', requireAuth, pageHandler('reminders'));
-  
-  // ROTTA LOBBY (HTML)
-  app.get('/lobbies', requireAuth, pageHandler('lobbies'));
-
-  app.use((err, req, res, next) => {
-    log.err('web-error', err);
-    if (req.path.startsWith('/api/')) return res.status(500).json({ error: 'Errore interno' });
-    res.status(500).send('Errore interno');
-  });
-
-  const server = app.listen(PORT, HOST, () => {
-    log.ok(`🌐 Dashboard web su http://${HOST}:${PORT}`);
-    log.info(`   Login URL: ${DASHBOARD_URL}/auth/login`);
-    log.info(`   Sicurezza: helmet ✓ rate-limit ✓ csrf ✓ zod ✓ cache-auth ✓ cookie-parser ✓`);
-  });
-
-  server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      log.warn(`Porta ${PORT} occupata, provo ${PORT + 1}...`);
-      server.listen(PORT + 1, HOST);
-    } else log.err('Web server', err);
-  });
-
-  return server;
-}
-
-// ============================================================
-// ================= HTML — TUTTE LE PAGINE ===================
-// ============================================================
-function renderLayout(user, page, params = {}, security = {}) {
-  const name = escapeHtml(user.global_name || user.username);
-  const avatar = user.avatar ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64` : `https://cdn.discordapp.com/embed/avatars/0.png`;
-  const csrfToken = security.csrfToken || '';
-  const safeQ = escapeHtml(params.q || '');
-
-  // Ogni pagina viene generata solo quando è quella richiesta
-  const renderers = {
-    dashboard: () => renderDashboardContent(),
-    modlogs: () => renderModlogsContent(),
-    notes: () => renderNotesContent(),
-    tickets: () => renderTicketsContent(),
-    commands: () => renderCommandsContent(),
-    config: () => renderConfigContent(),
-    charts: () => renderChartsContent(),
-    top: () => renderTopContent(),
-    user: () => renderUserContent(params.userId),
-    search: () => renderSearchContent(params.q || ''),
-    accesslogs: () => renderAccessLogsContent(),
-    messages: () => renderMessagesContent(),
-    userActions: () => renderUserActionsContent(params.userId || ''),
-    reminders: () => renderRemindersContent(),
-    lobbies: () => renderLobbiesContent() // <-- RENDERER LOBBY
-  };
-  const body = renderers[page] ? renderers[page]() : '<p>Pagina non trovata</p>';
-
-  return `<!DOCTYPE html>
-<html lang="it">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="csrf-token" content="${escapeHtml(csrfToken)}">
-<title>Dashboard - ${escapeHtml(page)}</title>
-<script>
-  window.__CSRF__ = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
-  console.log('[csrf] iniziale:', window.__CSRF__ ? 'OK (' + window.__CSRF__.length + ' char)' : 'VUOTO');
-
-  window.__refreshCsrf = async function () {
-    try {
-      const res = await fetch('/api/csrf-token', { credentials: 'same-origin' });
-      if (res.ok) {
-        const data = await res.json();
-        window.__CSRF__ = data.csrfToken || '';
-        const meta = document.querySelector('meta[name="csrf-token"]');
-        if (meta) meta.content = window.__CSRF__;
-        console.log('[csrf] refresh:', window.__CSRF__ ? 'OK (' + window.__CSRF__.length + ' char)' : 'VUOTO');
-      } else {
-        const err = await res.json().catch(() => ({}));
-        console.error('[csrf] refresh HTTP', res.status, err);
-      }
-    } catch (e) { console.error('[csrf] refresh error', e); }
-  };
-
-  window.apiFetch = async function (url, options = {}) {
-    if (!window.__CSRF__) await window.__refreshCsrf();
-
-    const opts = Object.assign({}, options);
-    opts.credentials = 'same-origin';
-    opts.headers = Object.assign({}, opts.headers || {});
-
-    const method = (opts.method || 'GET').toUpperCase();
-    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-      opts.headers['X-CSRF-Token'] = window.__CSRF__;
-      if (opts.body && typeof opts.body === 'string' && !opts.headers['Content-Type']) {
-        opts.headers['Content-Type'] = 'application/json';
-      }
-    }
-
-    console.log('[apiFetch]', method, url, '| CSRF:', opts.headers['X-CSRF-Token'] ? 'sì' : 'NO');
-
-    let res = await fetch(url, opts);
-    console.log('[apiFetch]', method, url, '→', res.status);
-
-    if (res.status === 403) {
-      let body = null;
-      try { body = await res.clone().json(); } catch {}
-      if (body && /csrf/i.test(body.error || '')) {
-        console.warn('[apiFetch] CSRF 403, rigenero token e riprovo');
-        await window.__refreshCsrf();
-        opts.headers['X-CSRF-Token'] = window.__CSRF__;
-        res = await fetch(url, opts);
-        console.log('[apiFetch] retry →', res.status);
-      }
-    }
-
-    return res;
-  };
-
-  window.postJson = async function (url, body) {
-    const res = await apiFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
-    const data = await res.json().catch(() => ({}));
-    return { ok: res.ok, status: res.status, data: data };
-  };
-
-  async function logoutAll() {
-    if (!confirm('Vuoi disconnetterti da TUTTE le sessioni?')) return;
-    const res = await apiFetch('/api/logout-all', { method: 'POST' });
-    if (res.ok) window.location.href = '/';
-    else alert('Errore logout globale');
-  }
-</script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111214; color: #eee; padding: 28px 20px 48px; line-height: 1.45; }
-  header { display: flex; justify-content: space-between; align-items: center; margin: 0 auto 16px; padding-bottom: 18px; border-bottom: 1px solid #2b2d31; gap: 16px; flex-wrap: wrap; max-width: 1180px; }
-  h1 { font-size: 22px; letter-spacing: -0.02em; }
-  .user { display: flex; align-items: center; gap: 12px; }
-  .user img { width: 40px; height: 40px; border-radius: 50%; }
-  .search-box { flex: 1; max-width: 420px; min-width: 200px; }
-  .search-box form { display: flex; gap: 8px; }
-  .search-box input, .search-box button { margin: 0; }
-  nav { display: flex; gap: 8px; margin: 0 auto 24px; flex-wrap: wrap; max-width: 1180px; position: sticky; top: 0; z-index: 5; background: rgba(17,18,20,0.92); padding: 8px 0; }
-  nav a { padding: 8px 14px; background: #1e1f22; border: 1px solid #2b2d31; border-radius: 999px; color: #b5bac1; font-size: 13px; }
-  nav a:hover { background: #2b2d31; color: #fff; }
-  nav a.active { background: #5865F2; color: white; border-color: #5865F2; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 0 auto 28px; max-width: 1180px; }
-  .card { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 16px 18px; }
-  .card h2 { font-size: 11px; color: #949ba4; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-  .card .value { font-size: 28px; font-weight: 700; color: #5865F2; }
-  .section { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 20px; margin: 0 auto 16px; max-width: 1180px; overflow-x: auto; }
-  .section h2 { font-size: 18px; margin-bottom: 14px; }
-  table { width: 100%; border-collapse: collapse; min-width: 640px; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2b2d31; font-size: 14px; vertical-align: top; }
-  th { color: #949ba4; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-  tr:hover td { background: rgba(255,255,255,0.02); }
-  button { background: #5865F2; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #4752c4; }
-  button:disabled { opacity: 0.6; cursor: not-allowed; }
-  button.danger { background: #ed4245; }
-  button.danger:hover { background: #c93b3e; }
-  button.small { padding: 5px 10px; font-size: 12px; }
-  button.secondary { background: #444; }
-  button.secondary:hover { background: #555; }
-  input, select, textarea { background: #1a1a1a; border: 1px solid #444; color: #eee; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 10px; font-family: inherit; }
-  .form-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
-  .form-row input, .form-row select { flex: 1; min-width: 150px; }
-  .loading { color: #888; font-style: italic; }
-  a { color: #5865F2; text-decoration: none; }
-  a.user-link { color: #5865F2; text-decoration: none; border-bottom: 1px dashed #5865F2; }
-  a.user-link:hover { color: #4752c4; border-bottom-style: solid; }
-  .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
-  .filter-bar select, .filter-bar input { max-width: 250px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
-  .badge.kick, .badge.warn { background: #faa61a; color: #000; }
-  .badge.ban { background: #ed4245; color: #fff; }
-  .badge.timeout { background: #5865F2; color: #fff; }
-  .badge.default { background: #444; color: #eee; }
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } }
-  .chart-box { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
-  .config-block { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .config-block h3 { font-size: 16px; margin-bottom: 12px; color: #bbb; }
-  .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
-  .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
-  code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-  .export-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-  .export-bar a { padding: 6px 12px; background: #444; border-radius: 6px; font-size: 12px; color: #eee; }
-  .export-bar a:hover { background: #555; }
-</style>
-</head>
-<body>
-  <header>
-    <h1>🤖 Dashboard Bot</h1>
-    <div class="search-box">
-      <form action="/search" method="get">
-        <input type="text" name="q" placeholder="Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
-        <button type="submit" class="secondary">Cerca</button>
-      </form>
-    </div>
-    <div class="user">
-      <img src="${avatar}" alt="">
-      <span>${name}</span>
-      <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
-      <a href="/auth/logout"><button class="danger">Logout</button></a>
-    </div>
-  </header>
-
-  <nav>
-    <a href="/dashboard" class="${page === 'dashboard' ? 'active' : ''}">📊 Dashboard</a>
-    <a href="/modlogs" class="${page === 'modlogs' ? 'active' : ''}">📋 Mod Logs</a>
-    <a href="/notes" class="${page === 'notes' ? 'active' : ''}">📝 Note</a>
-    <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
-    <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
-    <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
-    <a href="/reminders" class="${page === 'reminders' ? 'active' : ''}">⏰ Reminder</a>
-    <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
-    <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
-    <a href="/messages" class="${page === 'messages' ? 'active' : ''}">✉️ Messaggi</a>
-    <a href="/user-actions" class="${page === 'userActions' ? 'active' : ''}">🛠️ Gestione Utenti</a>
-    <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
-    <!-- VOCE LOBBY AGGIUNTA -->
-    <a href="/lobbies" class="${page === 'lobbies' ? 'active' : ''}">🗺️ Lobby</a>
-  </nav>
-
-  ${body}
-</body>
-</html>`;
-}
-
-function escapeHtml(str) {
-  if (str === null || str === undefined) return '';
-  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-function safeEqual(a, b) {
-  const ba = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
-}
-
-function safeJson(v) {
-  return JSON.stringify(v ?? null)
-    .replace(/</g, '\\u003c')
-    .replace(/>/g, '\\u003e')
-    .replace(/&/g, '\\u0026')
-    .replace(/\u2028/g, '\\u2028')
-    .replace(/\u2029/g, '\\u2029');
-}
-
-function makeEmbed(title, description, color) {
-  return new EmbedBuilder()
-    .setTitle(String(title).slice(0, 256))
-    .setDescription(String(description).slice(0, 4096))
-    .setColor(color)
-    .setTimestamp();
-}
-
-function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}g`;
-}
-
-// ---------- DASHBOARD ----------
-function renderDashboardContent() {
-  return `
-  <div class="grid">
-    <div class="card"><h2>Log Totali</h2><div class="value" id="stat-logs">...</div></div>
-    <div class="card"><h2>Blacklist</h2><div class="value" id="stat-bl">...</div></div>
-    <div class="card"><h2>Server</h2><div class="value" id="stat-guilds">...</div></div>
-    <div class="card"><h2>Ping</h2><div class="value" id="stat-ping">...</div></div>
-    <div class="card"><h2>Uptime</h2><div class="value" id="stat-uptime">...</div></div>
-    <div class="card"><h2>Ticket Aperti</h2><div class="value" id="stat-tickets">...</div></div>
-    <div class="card"><h2>Note</h2><div class="value" id="stat-notes">...</div></div>
-    <div class="card"><h2>Transcripts</h2><div class="value" id="stat-transcripts">...</div></div>
-    <div class="card"><h2>Reminder</h2><div class="value" id="stat-reminders">...</div></div>
-  </div>
-
-  <div class="section">
-    <h2>➕ Aggiungi alla Blacklist</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:12px;">Bannerà l'utente in tutti i server dove il bot è presente e gli invierà un DM.</p>
-    <div class="form-row">
-      <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)" maxlength="20">
-      <input type="text" id="bl-username" placeholder="Username" maxlength="64">
-      <input type="text" id="bl-reason" placeholder="Motivo" maxlength="500">
-      <button onclick="addBL()">Aggiungi</button>
-    </div>
-    <div id="bl-msg"></div>
-  </div>
-
-  <div class="section">
-    <h2>🚫 Blacklist Globale</h2>
-    <div class="export-bar">
-      <a href="/api/export/blacklist.csv">📥 Esporta CSV</a>
-      <a href="#" onclick="bulkDeleteBL();return false;">🗑️ Elimina selezionati</a>
-    </div>
-    <div id="blacklist-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  async function loadStats() {
-    const res = await apiFetch('/api/stats'); if (!res.ok) return;
-    const s = await res.json();
-    document.getElementById('stat-logs').textContent = s.logs;
-    document.getElementById('stat-bl').textContent = s.blacklist;
-    document.getElementById('stat-guilds').textContent = s.guilds;
-    document.getElementById('stat-ping').textContent = s.ping + 'ms';
-    const h = Math.floor(s.uptime/3600), m = Math.floor((s.uptime%3600)/60);
-    document.getElementById('stat-uptime').textContent = h + 'h ' + m + 'm';
-    document.getElementById('stat-tickets').textContent = s.tickets || 0;
-    document.getElementById('stat-notes').textContent = s.notes || 0;
-    document.getElementById('stat-transcripts').textContent = s.transcripts || 0;
-    document.getElementById('stat-reminders').textContent = s.reminders || 0;
-  }
-  async function loadBlacklist() {
-    const res = await apiFetch('/api/blacklist');
-    const list = await res.json().catch(() => ({}));
-    const el = document.getElementById('blacklist-content');
-    if (!res.ok) { el.innerHTML = '<p class="error">' + esc(list.error || 'Blacklist non disponibile') + '</p>'; return; }
-    if (!list.length) { el.innerHTML = '<p class="loading">Nessun utente in blacklist.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="bl-select-all" onclick="toggleAllBL()"></th><th>Utente</th><th>Motivo</th><th>Aggiunto da</th><th></th></tr></thead><tbody>' +
-      list.map(e => '<tr><td><input type="checkbox" class="bl-check" value="' + esc(e.user_id) + '"></td><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a><br><small style="color:#666">' + esc(e.user_id) + '</small></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td><td><button class="danger small" onclick="removeBL(\\'' + esc(e.user_id) + '\\')">Rimuovi</button></td></tr>').join('') +
-      '</tbody></table>';
-  }
-  function toggleAllBL() {
-    const checked = document.getElementById('bl-select-all').checked;
-    document.querySelectorAll('.bl-check').forEach(c => c.checked = checked);
-  }
-  async function bulkDeleteBL() {
-    const ids = Array.from(document.querySelectorAll('.bl-check:checked')).map(c => c.value);
-    if (!ids.length) { alert('Nessun utente selezionato'); return; }
-    if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist? Verranno sbannati in tutti i server.')) return;
-    const res = await apiFetch('/api/blacklist/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); loadStats(); }
-    else alert('❌ ' + (data.error || 'Errore'));
-  }
-  async function addBL() {
-    const userId = document.getElementById('bl-userId').value.trim();
-    const username = document.getElementById('bl-username').value.trim();
-    const reason = document.getElementById('bl-reason').value.trim();
-    const msg = document.getElementById('bl-msg');
-    if (!userId || !username || !reason) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/blacklist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId, username, reason }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto (bannato in ' + esc(data.bannedIn || 0) + ' server)</span>';
-      document.getElementById('bl-userId').value = '';
-      document.getElementById('bl-username').value = '';
-      document.getElementById('bl-reason').value = '';
-      loadBlacklist(); loadStats();
-    } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
-  }
-  async function removeBL(userId) {
-    if (!confirm('Rimuovere ' + userId + ' dalla blacklist? Verrà sbannato dove è bannato.')) return;
-    const res = await apiFetch('/api/blacklist/' + encodeURIComponent(userId), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadBlacklist(); loadStats();
-  }
-  loadStats(); loadBlacklist();
-  setInterval(loadStats, 10000);
-  </script>`;
-}
-
-// ---------- MOD LOGS ----------
-function renderModlogsContent() {
-  return `
-  <div class="section">
-    <h2>📋 Mod Logs</h2>
-    <div class="export-bar"><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
-    <div class="filter-bar">
-      <select id="filter-type" onchange="loadLogs()">
-        <option value="">Tutti i tipi</option>
-        <option value="Kick">Kick</option>
-        <option value="Ban">Ban</option>
-        <option value="Warn">Warn</option>
-        <option value="Timeout">Timeout</option>
-        <option value="Clear">Clear</option>
-        <option value="Purge">Purge</option>
-        <option value="Lock">Lock</option>
-        <option value="Unlock">Unlock</option>
-        <option value="Ticket Claim">Ticket Claim</option>
-        <option value="Ticket Priorità">Ticket Priorità</option>
-      </select>
-      <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()" maxlength="20">
-    </div>
-    <div id="logs-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let allLogs = [];
-  async function loadLogs() {
-    if (!allLogs.length) { const res = await apiFetch('/api/logs/all'); allLogs = await res.json(); }
-    const type = document.getElementById('filter-type').value;
-    const userId = document.getElementById('filter-user').value.trim();
-    let logs = allLogs;
-    if (type) logs = logs.filter(l => l.type === type);
-    if (userId) logs = logs.filter(l => (l.target_id || '').includes(userId));
-    const el = document.getElementById('logs-content');
-    if (!logs.length) { el.innerHTML = '<p class="loading">Nessun log trovato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
-      logs.map(l => '<tr>' +
-        '<td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td>' +
-        '<td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td>' +
-        '<td>' + (l.target_id ? '<a class="user-link" href="/user/' + esc(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td>' +
-        '<td>' + esc(l.moderator || '-') + '</td>' +
-        '<td>' + esc(l.reason || '-') + '</td>' +
-        '<td>' + esc(l.duration || '-') + '</td>' +
-      '</tr>').join('') + '</tbody></table>';
-  }
-  loadLogs();
-  </script>`;
-}
-
-// ---------- NOTE ----------
-function renderNotesContent() {
-  return `
-  <div class="section">
-    <h2>📝 Note Staff</h2>
-    <div class="export-bar">
-      <a href="/api/export/notes.csv">📥 Esporta CSV</a>
-      <a href="#" onclick="bulkDeleteNotes();return false;">🗑️ Elimina selezionate</a>
-    </div>
-    <div id="notes-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  async function loadNotes() {
-    const res = await apiFetch('/api/notes/all');
-    const notes = await res.json();
-    const el = document.getElementById('notes-content');
-    if (!notes.length) { el.innerHTML = '<p class="loading">Nessuna nota.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="note-select-all" onclick="toggleAllNotes()"></th><th>#</th><th>Utente</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      notes.map(n => '<tr><td><input type="checkbox" class="note-check" value="' + esc(n.id) + '"></td><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + esc(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.author_tag) + '</td><td>' + esc(n.content) + '</td><td>' + esc(new Date(n.created_at).toLocaleString('it-IT')) + '</td><td><button class="danger small" onclick="deleteNote(' + esc(n.id) + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
-  }
-  function toggleAllNotes() {
-    const checked = document.getElementById('note-select-all').checked;
-    document.querySelectorAll('.note-check').forEach(c => c.checked = checked);
-  }
-  async function bulkDeleteNotes() {
-    const ids = Array.from(document.querySelectorAll('.note-check:checked')).map(c => c.value);
-    if (!ids.length) { alert('Nessuna nota selezionata'); return; }
-    if (!confirm('Eliminare ' + ids.length + ' note?')) return;
-    const res = await apiFetch('/api/notes/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) { alert('✅ Eliminate ' + data.count + ' note'); loadNotes(); }
-    else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
-  }
-  async function deleteNote(id) {
-    if (!confirm('Eliminare la nota #' + id + '?')) return;
-    const res = await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
-    if (res.ok) loadNotes();
-    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
-  }
-  loadNotes();
-  </script>`;
-}
-
-// ---------- TICKET ----------
-function renderTicketsContent() {
-  return `
-  <div class="section">
-    <h2>🎫 Ticket Aperti</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Gestisci i ticket aperti sul server.</p>
-    <div class="form-row" style="margin-bottom:14px;">
-      <select id="tp-channel"></select>
-      <button onclick="createTicketPanel()">📋 Crea Pannello Ticket</button>
-    </div>
-    <div id="tickets-content" class="loading">Caricamento...</div>
-  </div>
-
-  <div class="section">
-    <h2>📜 Archivio Transcripts (Ultimi 100)</h2>
-    <div id="transcripts-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-
-  async function loadChannelsForPanel() {
-    const res = await apiFetch('/api/messages/channels');
-    const chs = await res.json();
-    const sel = document.getElementById('tp-channel');
-    sel.innerHTML = chs.map(c => '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
-  }
-
-  async function createTicketPanel() {
-    const channelId = document.getElementById('tp-channel').value;
-    if (!channelId) { alert('Seleziona un canale'); return; }
-    if (!confirm('Inviare il pannello ticket in questo canale?')) return;
-    const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
-    if (res.ok) alert('✅ Pannello inviato');
-    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
-  }
-
-  async function loadTickets() {
-    const res = await apiFetch('/api/tickets');
-    const tickets = await res.json();
-    const el = document.getElementById('tickets-content');
-    if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Azioni</th></tr></thead><tbody>' +
-      tickets.map(t => '<tr>' +
-        '<td>' + esc(t.guild) + '</td>' +
-        '<td>#' + esc(t.channel) + '</td>' +
-        '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
-        '<td>' + esc(t.claimedBy || '-') + '</td>' +
-        '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td>' +
-          '<button class="secondary small" onclick="claimTicket(\\'' + esc(t.channelId) + '\\')">Prendi</button> ' +
-          '<select style="width:auto;display:inline-block;margin:0 6px 0 0;padding:4px 8px;" onchange="setPriority(\\'' + esc(t.channelId) + '\\', this.value)">' +
-            '<option value="">Priorità</option>' +
-            '<option value="low">🟢 Bassa</option>' +
-            '<option value="med">🟡 Media</option>' +
-            '<option value="high">🟠 Alta</option>' +
-            '<option value="urgent">🔴 Urgente</option>' +
-          '</select>' +
-          '<button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button>' +
-        '</td>' +
-      '</tr>').join('') + '</tbody></table>';
-  }
-
-  async function claimTicket(channelId) {
-    const r = await postJson('/api/tickets/' + encodeURIComponent(channelId) + '/claim', {});
-    if (r.ok) loadTickets();
-    else alert('❌ ' + ((r.data && r.data.error) || 'Errore'));
-  }
-
-  async function setPriority(channelId, priority) {
-    if (!priority) return;
-    const r = await postJson('/api/tickets/' + encodeURIComponent(channelId) + '/priority', { priority: priority });
-    if (r.ok) loadTickets();
-    else alert('❌ ' + ((r.data && r.data.error) || 'Errore'));
-  }
-
-  async function loadTranscripts() {
-    const res = await apiFetch('/api/tickets/transcripts');
-    const transcripts = await res.json();
-    const el = document.getElementById('transcripts-content');
-    if (!transcripts.length) { el.innerHTML = '<p class="loading">Nessun transcript salvato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Link</th></tr></thead><tbody>' +
-      transcripts.map(t => '<tr>' +
-        '<td>' + esc(new Date(t.created_at).toLocaleString('it-IT')) + '</td>' +
-        '<td>#' + esc(t.channel_name) + '</td>' +
-        '<td>' + esc(t.user_id) + '</td>' +
-        '<td>' + esc(t.claimed_by || '-') + '</td>' +
-        '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td><a href="/api/tickets/transcripts/' + esc(t.id) + '" target="_blank" rel="noopener" style="padding:5px 10px;background:#444;color:#eee;border-radius:6px;font-size:12px;">Visualizza</a></td>' +
-      '</tr>').join('') + '</tbody></table>';
-  }
-
-  async function closeTicket(channelId) {
-    if (!confirm('Chiudere ed eliminare questo ticket? Verrà salvato un transcript.')) return;
-    const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
-    if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(); loadTranscripts(); }
-    else { const data = await res.json().catch(() => ({})); alert('Errore: ' + (data.error || 'sconosciuto')); }
-  }
-
-  loadChannelsForPanel();
-  loadTickets();
-  loadTranscripts();
-  setInterval(loadTickets, 15000);
-  </script>`;
-}
-
-// ---------- COMANDI CUSTOM ----------
-function renderCommandsContent() {
-  return `
-  <div class="section">
-    <h2>➕ Aggiungi Comando Custom</h2>
-    <div class="form-row">
-      <input type="text" id="cmd-name" placeholder="Nome (es. regole)" maxlength="50">
-      <input type="text" id="cmd-response" placeholder="Risposta" maxlength="4096">
-      <button onclick="addCmd()">Aggiungi</button>
-    </div>
-    <div id="cmd-msg"></div>
-  </div>
-
-  <div class="section">
-    <h2>🔧 Comandi Custom</h2>
-    <div class="export-bar">
-      <a href="#" onclick="bulkDeleteCmds();return false;">🗑️ Elimina selezionati</a>
-    </div>
-    <div id="commands-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  async function loadCmds() {
-    const res = await apiFetch('/api/commands');
-    const cmds = await res.json();
-    const el = document.getElementById('commands-content');
-    if (!cmds.length) { el.innerHTML = '<p class="loading">Nessun comando custom.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
-      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + esc(c.name) + '"></td><td><code>-' + esc(c.name) + '</code></td><td>' + esc(c.response) + '</td><td><button class="danger small" onclick="removeCmd(\\'' + esc(c.name) + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table>';
-  }
-  function toggleAllCmds() {
-    const checked = document.getElementById('cmd-select-all').checked;
-    document.querySelectorAll('.cmd-check').forEach(c => c.checked = checked);
-  }
-  async function bulkDeleteCmds() {
-    const names = Array.from(document.querySelectorAll('.cmd-check:checked')).map(c => c.value);
-    if (!names.length) { alert('Nessun comando selezionato'); return; }
-    if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
-    const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) { alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(); }
-    else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
-  }
-  async function addCmd() {
-    const name = document.getElementById('cmd-name').value.trim();
-    const response = document.getElementById('cmd-response').value.trim();
-    const msg = document.getElementById('cmd-msg');
-    if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
-      document.getElementById('cmd-name').value = '';
-      document.getElementById('cmd-response').value = '';
-      loadCmds();
-    } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
-  }
-  async function removeCmd(name) {
-    if (!confirm('Eliminare il comando -' + name + '?')) return;
-    const res = await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadCmds();
-  }
-  loadCmds();
-  </script>`;
-}
-
-// ---------- CONFIG ----------
-function renderConfigContent() {
-  return `
-  <div class="section">
-    <h2>⚙️ Configurazione Server</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Seleziona un server per configurare autorole, canale log e welcome.</p>
-    <select id="guild-select" onchange="loadGuildConfig()"></select>
-  </div>
-
-  <div id="config-content"></div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let guildsData = [];
-
-  async function loadGuilds() {
-    const res = await apiFetch('/api/guilds');
-    guildsData = await res.json();
-    const sel = document.getElementById('guild-select');
-    sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
-    if (guildsData.length) loadGuildConfig();
-  }
-
-  async function loadGuildConfig() {
-    const guildId = document.getElementById('guild-select').value;
-    const guild = guildsData.find(g => g.id === guildId);
-    if (!guild) return;
-
-    const [configRes, welcomeRes] = await Promise.all([
-      apiFetch('/api/config/' + encodeURIComponent(guildId)),
-      apiFetch('/api/welcome/' + encodeURIComponent(guildId))
-    ]);
-    const config = await configRes.json();
-    const welcome = await welcomeRes.json();
-
-    const content = document.getElementById('config-content');
-    content.innerHTML = \`
-      <div class="section">
-        <div class="config-block">
-          <h3>🎭 Autorole</h3>
-          <select id="cfg-autorole">
-            <option value="">— Nessuno —</option>
-            \${guild.roles.map(r => '<option value="' + esc(r.id) + '" ' + (config.autorole_id === r.id ? 'selected' : '') + '>' + esc(r.name) + '</option>').join('')}
-          </select>
-          <button onclick="saveAutorole('\${esc(guildId)}')">Salva</button>
-          <div id="autorole-msg"></div>
-        </div>
-
-        <div class="config-block">
-          <h3>📋 Canale Log Moderazione</h3>
-          <select id="cfg-logchannel">
-            <option value="">— Nessuno —</option>
-            \${guild.channels.map(c => '<option value="' + esc(c.id) + '" ' + (config.log_channel_id === c.id ? 'selected' : '') + '>#' + esc(c.name) + '</option>').join('')}
-          </select>
-          <button onclick="saveLogChannel('\${esc(guildId)}')">Salva</button>
-          <div id="logchannel-msg"></div>
-        </div>
-
-        <div class="config-block">
-          <h3>👋 Welcome</h3>
-          <label style="font-size:13px;color:#888;">Canale di benvenuto</label>
-          <select id="cfg-welcomechannel">
-            <option value="">— Disattivato —</option>
-            \${guild.channels.map(c => '<option value="' + esc(c.id) + '" ' + (welcome.channel_id === c.id ? 'selected' : '') + '>#' + esc(c.name) + '</option>').join('')}
-          </select>
-          <label style="font-size:13px;color:#888;">Messaggio (usa {user}, {username}, {server}, {memberCount})</label>
-          <textarea id="cfg-welcomemessage" rows="3" placeholder="Benvenuto {user} in {server}!">\${esc(welcome.message || '')}</textarea>
-          <label style="font-size:13px;color:#888;">
-            <input type="checkbox" id="cfg-welcomeembed" style="width:auto;margin-right:6px;" \${welcome.embed_enabled ? 'checked' : ''}>
-            Usa formato embed
-          </label>
-          <br><button onclick="saveWelcome('\${esc(guildId)}')">Salva</button>
-          <button class="secondary" onclick="testWelcome('\${esc(guildId)}')">🧪 Test Welcome</button>
-          <div id="welcome-msg"></div>
-        </div>
-      </div>
-    \`;
-  }
-
-  async function saveAutorole(guildId) {
-    const autoroleId = document.getElementById('cfg-autorole').value || null;
-    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autoroleId }) });
-    document.getElementById('autorole-msg').innerHTML = res.ok ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
-  }
-  async function saveLogChannel(guildId) {
-    const logChannelId = document.getElementById('cfg-logchannel').value || null;
-    const res = await apiFetch('/api/config/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ logChannelId }) });
-    document.getElementById('logchannel-msg').innerHTML = res.ok ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
-  }
-  async function saveWelcome(guildId) {
-    const channelId = document.getElementById('cfg-welcomechannel').value || null;
-    const message = document.getElementById('cfg-welcomemessage').value;
-    const embedEnabled = document.getElementById('cfg-welcomeembed').checked;
-    const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, message, embedEnabled }) });
-    document.getElementById('welcome-msg').innerHTML = res.ok ? '<span class="success">✅ Salvato</span>' : '<span class="error">❌ Errore</span>';
-  }
-  async function testWelcome(guildId) {
-    if (!confirm('Inviare un messaggio di test nel canale welcome?')) return;
-    const res = await apiFetch('/api/welcome/' + encodeURIComponent(guildId) + '/test', { method: 'POST' });
-    if (res.ok) alert('✅ Test inviato');
-    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
-  }
-  loadGuilds();
-  </script>`;
-}
-
-// ---------- GRAFICI ----------
-function renderChartsContent() {
-  return `
-  <div class="section">
-    <h2>📊 Statistiche Visuali</h2>
-    <div class="charts-grid">
-      <div class="chart-box"><canvas id="chart-types"></canvas></div>
-      <div class="chart-box"><canvas id="chart-days"></canvas></div>
-    </div>
-  </div>
-
-  <script>
-  async function loadCharts() {
-    const res = await apiFetch('/api/charts');
-    const data = await res.json();
-    const colors = ['#5865F2','#ed4245','#faa61a','#00FF00','#9B59B6','#1ABC9C'];
-    new Chart(document.getElementById('chart-types'), {
-      type: 'doughnut',
-      data: { labels: data.byType.map(t => t.type), datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }] },
-      options: { plugins: { title: { display: true, text: 'Azioni per tipo', color: '#eee' }, legend: { labels: { color: '#eee' } } } }
-    });
-    new Chart(document.getElementById('chart-days'), {
-      type: 'line',
-      data: {
-        labels: data.byDay.map(d => d.day).reverse(),
-        datasets: [{ label: 'Azioni', data: data.byDay.map(d => d.c).reverse(), borderColor: '#5865F2', backgroundColor: 'rgba(88,101,242,0.2)', fill: true }]
-      },
-      options: { plugins: { title: { display: true, text: 'Azioni negli ultimi 30 giorni', color: '#eee' }, legend: { labels: { color: '#eee' } } }, scales: { x: { ticks: { color: '#888' } }, y: { ticks: { color: '#888' } } } }
+  getNotesForUser(guildId, userId) { return this._notesForUser.all(guildId, userId); }
+  getNote(guildId, noteId) { return this._getNote.get(noteId, guildId) || null; }
+  deleteNote(guildId, noteId) { return this._deleteNote.run(noteId, guildId).changes > 0; }
+  deleteNoteById(noteId) { return this._deleteNoteById.run(noteId).changes > 0; }
+  countNotes(guildId) { return this._countNotes.get(guildId).c; }
+  getAllNotes() { return this._allNotes.all(); }
+
+  // ==================== WELCOME ====================
+  getWelcomeConfig(guildId) { return this._getWelcome.get(guildId) || null; }
+  setWelcomeConfig(guildId, { channelId, message, embedEnabled }) {
+    this._setWelcome.run({
+      guildId, channelId: channelId || null, message: message || null,
+      embedEnabled: (embedEnabled === undefined) ? null : (embedEnabled === false ? 0 : 1),
+      updatedAt: new Date().toISOString()
     });
   }
-  loadCharts();
-  </script>`;
+  disableWelcome(guildId) { return this._disableWelcome.run(new Date().toISOString(), guildId).changes > 0; }
+  clearWelcomeMessage(guildId) { return this._clearWelcomeMessage.run(new Date().toISOString(), guildId).changes > 0; }
+  setWelcomeChannel(guildId, channelId) {
+    const current = this.getWelcomeConfig(guildId);
+    this.setWelcomeConfig(guildId, { channelId, message: current?.message ?? null, embedEnabled: current?.embed_enabled });
+  }
+  setWelcomeMessage(guildId, message) {
+    const current = this.getWelcomeConfig(guildId);
+    this.setWelcomeConfig(guildId, { channelId: current?.channel_id ?? null, message, embedEnabled: current?.embed_enabled });
+  }
+
+  // ==================== REACTION ROLES ====================
+  addReactionRole(guildId, messageId, channelId, emoji, roleId) {
+    this._rrInsert.run({ guildId, messageId, channelId, emoji, roleId, createdAt: new Date().toISOString() });
+  }
+  getReactionRolesForMessage(guildId, messageId) { return this._rrByMessage.all(guildId, messageId); }
+  getReactionRoleByEmoji(guildId, messageId, emoji) { return this._rrByEmoji.get(guildId, messageId, emoji) || null; }
+  deleteReactionRole(guildId, id) { return this._rrDelete.run(id, guildId).changes > 0; }
+  deleteReactionRolesForMessage(guildId, messageId) { return this._rrDeleteByMessage.run(guildId, messageId).changes > 0; }
+
+  // ==================== AUTORESPONSES ====================
+  addAutoresponse(guildId, trigger, response) {
+    this._arInsert.run({ guildId, trigger: trigger.toLowerCase(), response, createdAt: new Date().toISOString() });
+  }
+  getAllAutoresponses(guildId) { return this._arAll.all(guildId); }
+  getAutoresponseByTrigger(guildId, trigger) { return this._arByTrigger.get(guildId, trigger.toLowerCase()) || null; }
+  deleteAutoresponse(guildId, id) { return this._arDelete.run(id, guildId).changes > 0; }
+
+  // ==================== BIRTHDAYS ====================
+  setBirthday(userId, guildId, day, month, year) {
+    this._bdSet.run({ userId, guildId, day, month, year: year || null, updatedAt: new Date().toISOString() });
+  }
+  getBirthday(userId, guildId) { return this._bdGet.get(userId, guildId) || null; }
+  getBirthdaysToday(guildId, day, month) { return this._bdToday.all(guildId, day, month); }
+  getAllBirthdays(guildId) { return this._bdAll.all(guildId); }
+  deleteBirthday(userId, guildId) { return this._bdDelete.run(userId, guildId).changes > 0; }
+
+  // ==================== REMINDERS ====================
+  addReminder(userId, guildId, channelId, content, remindAt) {
+    const res = this._remInsert.run({ userId, guildId, channelId, content, remindAt: remindAt.toISOString(), createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
+  }
+  getDueReminders(now = new Date()) { return this._remDue.all(now.toISOString()); }
+  getAllReminders(limit = 200) { return this._remAll.all(limit); }
+  countReminders() { return this._remCount.get().c; }
+  deleteReminder(id) { return this._remDelete.run(id).changes > 0; }
+  getRemindersForUser(userId, guildId) { return this._remByUser.all(userId, guildId); }
+
+  // ==================== PERSONAL NOTES ====================
+  addPersonalNote(userId, guildId, content) {
+    const res = this._pnInsert.run({ userId, guildId, content, createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
+  }
+  getPersonalNotes(userId, guildId) { return this._pnByUser.all(userId, guildId); }
+  deletePersonalNote(id, userId) { return this._pnDelete.run(id, userId).changes > 0; }
+
+  // ==================== CASES ====================
+  addCase(guildId, userId, moderatorId, action, reason, duration) {
+    const now = new Date().toISOString();
+    const res = this._caseInsert.run({ guildId, userId, moderatorId, action, reason, duration, now });
+    return res.lastInsertRowid;
+  }
+  getCase(guildId, id) { return this._caseGet.get(id, guildId) || null; }
+  getCasesForUser(guildId, userId) { return this._caseByUser.all(guildId, userId); }
+  updateCase(guildId, id, { reason, status }) {
+    this._caseUpdate.run({ id, guildId, reason: reason || null, status: status || null, now: new Date().toISOString() });
+  }
+  deleteCase(guildId, id) { return this._caseDelete.run(id, guildId).changes > 0; }
+
+  // ==================== REPORTS ====================
+  addReport(guildId, reporterId, targetId, reason) {
+    const res = this._repInsert.run({ guildId, reporterId, targetId, reason, createdAt: new Date().toISOString() });
+    return res.lastInsertRowid;
+  }
+  getOpenReports(guildId) { return this._repAllOpen.all(guildId); }
+  setReportStatus(guildId, id, status) { return this._repSetStatus.run(status, id, guildId).changes > 0; }
+
+  // ==================== DASHBOARD ACCESS ====================
+  saveDashboardAccess(userId, username, ip, userAgent) {
+    this._saveAccess.run(userId, username, ip || null, userAgent || null, new Date().toISOString());
+  }
+  getDashboardAccessLogs(limit = 500) { return this._getAccess.all(limit); }
+
+  // ==================== TICKET TRANSCRIPTS ====================
+  saveTranscript(channelId, channelName, userId, claimedBy, priority, html, guildId = null) {
+    const res = this._trInsert.run({
+      channelId, channelName, userId,
+      claimedBy: claimedBy || null,
+      priority: priority || null,
+      html,
+      guildId: guildId || null,
+      createdAt: new Date().toISOString()
+    });
+    return res.lastInsertRowid;
+  }
+  getAllTranscripts() { return this._trAll.all(); }
+  getTranscript(id) { return this._trGet.get(id) || null; }
+  countTranscripts() { return this._trCount.get().c; }
+
+  // ==================== TICKET META ====================
+  getTicketMeta(channelId) { return this._tmGet.get(channelId) || null; }
+  setTicketMeta(channelId, { claimedById, claimedByTag, priority }) {
+    this._tmUpsert.run({
+      channelId,
+      claimedById: claimedById ?? null,
+      claimedByTag: claimedByTag ?? null,
+      priority: priority ?? null,
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  // ANTI-NUKE metodi pubblici rimossi
+  // QUARANTINE metodi pubblici rimossi
+
+  // ==================== CLOSE ====================
+  close() {
+    try { if (this.db && this.db.open) this.db.close(); }
+    catch (err) { console.error('❌ close error:', err); }
+  }
 }
 
-// ---------- TOP 10 ----------
-function renderTopContent() {
-  return `
-  <div class="grid">
-    <div class="card"><h2>Top Moderatori</h2><div class="value" id="top-mod">...</div></div>
-    <div class="card"><h2>Top Utenti</h2><div class="value" id="top-user">...</div></div>
-    <div class="card"><h2>Tipi Azione</h2><div class="value" id="top-types">...</div></div>
-  </div>
-
-  <div class="section">
-    <h2>🏆 Top 10 Moderatori</h2>
-    <div id="top-mod-content" class="loading">Caricamento...</div>
-  </div>
-
-  <div class="section">
-    <h2>🎯 Top 10 Utenti più Moderati</h2>
-    <div id="top-user-content" class="loading">Caricamento...</div>
-  </div>
-
-  <div class="section">
-    <h2>📈 Azioni per Mese (ultimi 12)</h2>
-    <div class="chart-box"><canvas id="chart-month"></canvas></div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  async function loadTop() {
-    const res = await apiFetch('/api/top');
-    const data = await res.json();
-    document.getElementById('top-mod').textContent = data.moderators.length;
-    document.getElementById('top-user').textContent = data.targets.length;
-    document.getElementById('top-types').textContent = data.types.length;
-
-    const modEl = document.getElementById('top-mod-content');
-    if (!data.moderators.length) modEl.innerHTML = '<p class="loading">Nessun dato.</p>';
-    else modEl.innerHTML = '<table><thead><tr><th>#</th><th>Moderatore</th><th>Azioni</th></tr></thead><tbody>' +
-      data.moderators.map((m, i) => '<tr><td>#' + (i + 1) + '</td><td>' + esc(m.moderator || '-') + '</td><td><b>' + esc(m.c) + '</b></td></tr>').join('') + '</tbody></table>';
-
-    const userEl = document.getElementById('top-user-content');
-    if (!data.targets.length) userEl.innerHTML = '<p class="loading">Nessun dato.</p>';
-    else userEl.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Azioni</th></tr></thead><tbody>' +
-      data.targets.map((t, i) => '<tr><td>#' + (i + 1) + '</td><td>' + (t.target_id ? '<a class="user-link" href="/user/' + esc(t.target_id) + '">' + esc(t.target || t.target_id) + '</a>' : esc(t.target || '-')) + '</td><td><b>' + esc(t.c) + '</b></td></tr>').join('') + '</tbody></table>';
-
-    if (data.byMonth.length) {
-      new Chart(document.getElementById('chart-month'), {
-        type: 'bar',
-        data: { labels: data.byMonth.map(m => m.month).reverse(), datasets: [{ label: 'Azioni', data: data.byMonth.map(m => m.c).reverse(), backgroundColor: '#5865F2' }] },
-        options: { plugins: { legend: { labels: { color: '#eee' } } }, scales: { x: { ticks: { color: '#888' } }, y: { ticks: { color: '#888' } } } }
-      });
-    }
-  }
-  loadTop();
-  </script>`;
-}
-
-// ---------- PAGINA UTENTE ----------
-function renderUserContent(userId) {
-  const safeUserId = escapeHtml(userId);
-  return `
-  <div class="section">
-    <h2>👤 Utente <code>${safeUserId}</code></h2>
-    <p style="color:#888;font-size:13px;">Dettagli completi su questo utente.</p>
-    <a href="/user-actions/${encodeURIComponent(userId)}"><button class="secondary small" style="margin-top:10px;">🛠️ Gestisci utente</button></a>
-  </div>
-
-  <div class="grid">
-    <div class="card"><h2>Log Totali</h2><div class="value" id="u-logs">...</div></div>
-    <div class="card"><h2>Note</h2><div class="value" id="u-notes">...</div></div>
-    <div class="card"><h2>Ticket Aperti</h2><div class="value" id="u-tickets">...</div></div>
-    <div class="card"><h2>Blacklist</h2><div class="value" id="u-bl">...</div></div>
-  </div>
-
-  <div class="section" id="user-blacklist-section" style="display:none;">
-    <h2>🚫 Stato Blacklist</h2>
-    <div id="user-blacklist-content"></div>
-  </div>
-
-  <div class="section">
-    <h2>📊 Azioni per Tipo</h2>
-    <div class="chart-box" style="max-width:400px;margin:0 auto;"><canvas id="user-chart"></canvas></div>
-  </div>
-
-  <div class="section">
-    <h2>📋 Mod Logs</h2>
-    <div id="user-logs-content" class="loading">Caricamento...</div>
-  </div>
-
-  <div class="section">
-    <h2>📝 Note</h2>
-    <div id="user-notes-content" class="loading">Caricamento...</div>
-  </div>
-
-  <div class="section">
-    <h2>🎫 Ticket Aperti</h2>
-    <div id="user-tickets-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  const USER_ID = ${safeJson(userId)};
-  let chartInstance = null;
-
-  async function loadUser() {
-    const res = await apiFetch('/api/user/' + encodeURIComponent(USER_ID));
-    if (!res.ok) { document.getElementById('u-logs').textContent = 'Errore'; return; }
-    const data = await res.json();
-
-    document.getElementById('u-logs').textContent = data.logs.length;
-    document.getElementById('u-notes').textContent = data.notes.length;
-    document.getElementById('u-tickets').textContent = data.tickets.length;
-    document.getElementById('u-bl').textContent = data.blacklist ? 'Sì' : 'No';
-    document.getElementById('u-bl').style.color = data.blacklist ? '#ed4245' : '#00FF00';
-
-    if (data.blacklist) {
-      document.getElementById('user-blacklist-section').style.display = 'block';
-      const b = data.blacklist;
-      document.getElementById('user-blacklist-content').innerHTML =
-        '<table><thead><tr><th>Username</th><th>Motivo</th><th>Aggiunto da</th><th>Data</th><th></th></tr></thead><tbody>' +
-        '<tr><td>' + esc(b.username) + '</td><td>' + esc(b.reason) + '</td><td>' + esc(b.moderator_tag) + '</td><td>' + esc(new Date(b.added_at).toLocaleString('it-IT')) + '</td><td><button class="danger small" onclick="removeBL()">Rimuovi</button></td></tr></tbody></table>';
-    }
-
-    if (data.byType.length) {
-      const colors = ['#5865F2','#ed4245','#faa61a','#00FF00','#9B59B6','#1ABC9C'];
-      if (chartInstance) chartInstance.destroy();
-      chartInstance = new Chart(document.getElementById('user-chart'), {
-        type: 'doughnut',
-        data: { labels: data.byType.map(t => t.type), datasets: [{ data: data.byType.map(t => t.c), backgroundColor: colors }] },
-        options: { plugins: { legend: { labels: { color: '#eee' } } } }
-      });
-    } else {
-      document.getElementById('user-chart').parentElement.innerHTML = '<p class="loading">Nessuna azione.</p>';
-    }
-
-    const logsEl = document.getElementById('user-logs-content');
-    if (!data.logs.length) logsEl.innerHTML = '<p class="loading">Nessun log.</p>';
-    else logsEl.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
-      data.logs.map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td><td>' + esc(l.duration || '-') + '</td></tr>').join('') + '</tbody></table>';
-
-    const notesEl = document.getElementById('user-notes-content');
-    if (!data.notes.length) notesEl.innerHTML = '<p class="loading">Nessuna nota.</p>';
-    else notesEl.innerHTML = '<table><thead><tr><th>#</th><th>Autore</th><th>Contenuto</th><th>Data</th><th></th></tr></thead><tbody>' +
-      data.notes.map(n => '<tr><td>' + esc(n.id) + '</td><td>' + esc(n.author_tag) + '</td><td>' + esc(n.content) + '</td><td>' + esc(new Date(n.created_at).toLocaleString('it-IT')) + '</td><td><button class="danger small" onclick="deleteNote(' + esc(n.id) + ')">Elimina</button></td></tr>').join('') + '</tbody></table>';
-
-    const ticketsEl = document.getElementById('user-tickets-content');
-    if (!data.tickets.length) ticketsEl.innerHTML = '<p class="loading">Nessun ticket aperto.</p>';
-    else ticketsEl.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Claim</th><th>Priorità</th><th></th></tr></thead><tbody>' +
-      data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td><td>' + esc(t.claimedBy || '-') + '</td><td>' + esc(t.priority || '-') + '</td><td><button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button></td></tr>').join('') + '</tbody></table>';
-  }
-
-  async function removeBL() {
-    if (!confirm('Rimuovere ' + USER_ID + ' dalla blacklist? Verrà sbannato dove è bannato.')) return;
-    const res = await apiFetch('/api/blacklist/' + encodeURIComponent(USER_ID), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadUser();
-  }
-  async function deleteNote(id) {
-    if (!confirm('Eliminare la nota #' + id + '?')) return;
-    const res = await apiFetch('/api/notes/' + encodeURIComponent(id), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadUser();
-  }
-  async function closeTicket(channelId) {
-    if (!confirm('Chiudere questo ticket? Il canale verrà cancellato.')) return;
-    const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadUser();
-  }
-  loadUser();
-  </script>`;
-}
-
-// ---------- RICERCA ----------
-function renderSearchContent(q) {
-  return `
-  <div class="section">
-    <h2>🔍 Risultati per "${escapeHtml(q)}"</h2>
-    <div id="search-content" class="loading">Ricerca in corso...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  const QUERY = ${safeJson(q)};
-
-  async function doSearch() {
-    const el = document.getElementById('search-content');
-    if (!QUERY.trim()) { el.innerHTML = '<p class="loading">Inserisci un termine di ricerca.</p>'; return; }
-    const res = await apiFetch('/api/search?q=' + encodeURIComponent(QUERY));
-    const data = await res.json();
-    const total = data.blacklist.length + data.notes.length + data.logs.length + data.tickets.length;
-    if (!total) { el.innerHTML = '<p class="loading">Nessun risultato.</p>'; return; }
-
-    let html = '';
-    if (data.blacklist.length) {
-      html += '<h3 style="margin-top:20px;">🚫 Blacklist (' + data.blacklist.length + ')</h3>';
-      html += '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
-        data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    if (data.notes.length) {
-      html += '<h3 style="margin-top:20px;">📝 Note (' + data.notes.length + ')</h3>';
-      html += '<table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
-        data.notes.map(n => '<tr><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + esc(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.content) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    if (data.logs.length) {
-      html += '<h3 style="margin-top:20px;">📋 Logs (' + data.logs.length + ')</h3>';
-      html += '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
-        data.logs.slice(0, 50).map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + esc(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
-      if (data.logs.length > 50) html += '<p style="color:#888;font-size:12px;">...e altri ' + (data.logs.length - 50) + ' log</p>';
-    }
-    if (data.tickets.length) {
-      html += '<h3 style="margin-top:20px;">🎫 Ticket (' + data.tickets.length + ')</h3>';
-      html += '<table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
-        data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    el.innerHTML = html;
-  }
-  doSearch();
-  </script>`;
-}
-
-// ---------- ACCESS LOGS ----------
-function renderAccessLogsContent() {
-  return `
-  <div class="section">
-    <h2>🔐 Log Accessi Dashboard</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Ultimi 500 accessi alla dashboard.</p>
-    <div class="filter-bar">
-      <input type="text" id="al-filter" placeholder="Filtra per utente o azione..." oninput="renderAccess()" maxlength="100">
-    </div>
-    <div class="export-bar"><a href="/api/export/access-logs.csv">📥 Esporta CSV</a></div>
-    <div id="access-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let allAccess = [];
-  async function loadAccess() {
-    const res = await apiFetch('/api/access-logs');
-    if (!res.ok) {
-      document.getElementById('access-content').innerHTML = '<p class="loading">Gli IP sono visibili solo agli admin indicati in DASHBOARD_ADMIN_IDS.</p>';
-      return;
-    }
-    allAccess = await res.json();
-    renderAccess();
-  }
-  function renderAccess() {
-    const filter = (document.getElementById('al-filter').value || '').toLowerCase();
-    const logs = filter
-      ? allAccess.filter(l => (l.username || '').toLowerCase().includes(filter) || (l.user_id || '').includes(filter) || (l.user_agent || '').toLowerCase().includes(filter))
-      : allAccess;
-    const el = document.getElementById('access-content');
-    if (!logs.length) { el.innerHTML = '<p class="loading">Nessun accesso registrato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Utente</th><th>IP</th><th>User Agent</th></tr></thead><tbody>' +
-      logs.map(l => '<tr>' +
-        '<td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td>' +
-        '<td><a class="user-link" href="/user/' + esc(l.user_id) + '">' + esc(l.username) + '</a></td>' +
-        '<td><code>' + esc(l.ip || '-') + '</code></td>' +
-        '<td style="font-size:11px;color:#888;">' + esc((l.user_agent || '-').slice(0, 80)) + '</td>' +
-      '</tr>').join('') + '</tbody></table>';
-  }
-  loadAccess();
-  </script>`;
-}
-
-// ---------- MESSAGGI + MODERAZIONE CANALE ----------
-function renderMessagesContent() {
-  return `
-  <div class="section">
-    <h2>✉️ Invia Messaggio</h2>
-    <label style="font-size:13px;color:#888;">Canale</label>
-    <select id="msg-channel"></select>
-
-    <label style="font-size:13px;color:#888;">Testo (max 2000)</label>
-    <textarea id="msg-content" rows="3" placeholder="Ciao {user}..." maxlength="2000"></textarea>
-
-    <details style="margin:14px 0;">
-      <summary style="cursor:pointer;color:#5865F2;">➕ Aggiungi embed (opzionale)</summary>
-      <div style="margin-top:12px;">
-        <input id="emb-title" placeholder="Titolo" maxlength="256">
-        <textarea id="emb-desc" rows="3" placeholder="Descrizione" maxlength="4096"></textarea>
-        <input id="emb-color" placeholder="Colore (es. #5865F2)" maxlength="20">
-        <input id="emb-image" placeholder="URL immagine" maxlength="500">
-        <input id="emb-thumb" placeholder="URL thumbnail" maxlength="500">
-        <input id="emb-footer" placeholder="Footer" maxlength="2048">
-      </div>
-    </details>
-
-    <button onclick="sendMessage()">📤 Invia</button>
-    <div id="msg-result"></div>
-  </div>
-
-  <div class="section">
-    <h2>🧹 Moderazione canale</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:12px;">Agisce sul canale selezionato sopra.</p>
-    <div class="form-row">
-      <input id="mc-amount" type="number" min="1" max="100" value="10" style="max-width:120px;">
-      <button class="danger small" onclick="modClear()">🧹 Pulisci</button>
-      <button class="secondary small" onclick="modLock()">🔒 Blocca</button>
-      <button class="secondary small" onclick="modUnlock()">🔓 Sblocca</button>
-    </div>
-    <input id="mc-reason" placeholder="Motivo (opzionale, per il blocco)" maxlength="512">
-    <div id="mc-result"></div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let channelsCache = [];
-  async function loadChannels() {
-    const res = await apiFetch('/api/messages/channels');
-    channelsCache = await res.json();
-    const sel = document.getElementById('msg-channel');
-    sel.innerHTML = channelsCache.map(c =>
-      '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>'
-    ).join('') || '<option value="">Nessun canale</option>';
-  }
-
-  async function sendMessage() {
-    const channelId = document.getElementById('msg-channel').value;
-    const content = document.getElementById('msg-content').value.trim();
-    const embed = {
-      title: document.getElementById('emb-title').value.trim() || undefined,
-      description: document.getElementById('emb-desc').value.trim() || undefined,
-      color: document.getElementById('emb-color').value.trim() || undefined,
-      image: document.getElementById('emb-image').value.trim() || undefined,
-      thumbnail: document.getElementById('emb-thumb').value.trim() || undefined,
-      footer: document.getElementById('emb-footer').value.trim() || undefined
-    };
-    const result = document.getElementById('msg-result');
-    if (!channelId) { result.innerHTML = '<span class="error">❌ Seleziona un canale</span>'; return; }
-    if (!content && !embed.title && !embed.description) {
-      result.innerHTML = '<span class="error">❌ Testo o embed obbligatorio</span>'; return;
-    }
-    const btn = document.querySelector('button[onclick="sendMessage()"]');
-    btn.disabled = true; btn.textContent = '⏳ Invio...';
-    const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed }) });
-    const data = await res.json().catch(() => ({}));
-    btn.disabled = false; btn.textContent = '📤 Invia';
-    if (res.ok) {
-      result.innerHTML = '<span class="success">✅ Inviato! ID: ' + esc(data.messageId) + '</span>';
-      document.getElementById('msg-content').value = '';
-    } else {
-      result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
-    }
-  }
-
-  function currentChannel() {
-    const id = document.getElementById('msg-channel').value;
-    return channelsCache.find(c => c.channelId === id) || null;
-  }
-  function mcShow(html) { document.getElementById('mc-result').innerHTML = html; }
-  function mcReport(r, okText) {
-    if (r.ok) mcShow('<span class="success">✅ ' + esc(okText) + '</span>');
-    else mcShow('<span class="error">❌ [' + r.status + '] ' + esc((r.data && r.data.error) || 'Errore') + '</span>');
-  }
-  async function modClear() {
-    const ch = currentChannel();
-    if (!ch) return mcShow('<span class="error">❌ Seleziona un canale</span>');
-    const amount = parseInt(document.getElementById('mc-amount').value, 10);
-    if (!(amount >= 1 && amount <= 100)) return mcShow('<span class="error">❌ Inserisci un numero tra 1 e 100</span>');
-    if (!confirm('Cancellare fino a ' + amount + ' messaggi in #' + ch.channelName + '?')) return;
-    const r = await postJson('/api/mod/clear', { guildId: ch.guildId, channelId: ch.channelId, amount: amount });
-    mcReport(r, r.ok ? 'Cancellati ' + r.data.count + ' messaggi' : '');
-  }
-  async function modLock() {
-    const ch = currentChannel();
-    if (!ch) return mcShow('<span class="error">❌ Seleziona un canale</span>');
-    if (!confirm('Bloccare #' + ch.channelName + ' per tutti?')) return;
-    const reason = document.getElementById('mc-reason').value.trim();
-    const r = await postJson('/api/mod/lock', { guildId: ch.guildId, channelId: ch.channelId, reason: reason });
-    mcReport(r, 'Canale bloccato');
-  }
-  async function modUnlock() {
-    const ch = currentChannel();
-    if (!ch) return mcShow('<span class="error">❌ Seleziona un canale</span>');
-    const r = await postJson('/api/mod/unlock', { guildId: ch.guildId, channelId: ch.channelId });
-    mcReport(r, 'Canale sbloccato');
-  }
-  loadChannels();
-  </script>`;
-}
-
-// ---------- GESTIONE UTENTI ----------
-function renderUserActionsContent(userId = '') {
-  return `
-  <div class="section">
-    <h2>🛠️ Gestione Utenti</h2>
-    <div class="form-row">
-      <input id="ua-userid" placeholder="ID utente (17-20 cifre)" value="${escapeHtml(userId)}" maxlength="20">
-      <button onclick="lookupUser()">🔍 Cerca</button>
-    </div>
-    <div id="ua-userinfo"></div>
-  </div>
-
-  <div class="section" id="ua-actions" style="display:none;">
-    <h2>⚡ Azioni</h2>
-    <label style="font-size:13px;color:#888;">Server</label>
-    <select id="ua-guild" onchange="fillGuildOptions()"></select>
-    <label style="font-size:13px;color:#888;">Motivo (opzionale)</label>
-    <input id="ua-reason" placeholder="Motivo dell'azione" maxlength="512">
-    <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
-      <button class="secondary" onclick="doAction('kick')">👢 Kick</button>
-      <button class="danger" onclick="doAction('ban')">🔨 Ban</button>
-      <button class="secondary" onclick="doAction('unban')">🔓 Unban</button>
-      <button class="secondary" onclick="doWarn()">⚠️ Warn</button>
-    </div>
-    <div id="ua-result"></div>
-
-    <h3 style="margin-top:22px;font-size:15px;color:#bbb;">Altre azioni</h3>
-    <div class="form-row">
-      <input id="ua-timeout" type="number" min="1" max="40320" placeholder="Timeout (minuti, max 40320)">
-      <button class="secondary" onclick="doTimeout()">⏱️ Timeout</button>
-    </div>
-    <div class="form-row">
-      <select id="ua-role"></select>
-      <button class="secondary" onclick="doRole('add')">➕ Assegna ruolo</button>
-      <button class="secondary" onclick="doRole('remove')">➖ Rimuovi ruolo</button>
-    </div>
-    <div class="form-row">
-      <select id="ua-invite-channel"></select>
-      <button class="secondary" onclick="doInvite()">📨 Invita</button>
-    </div>
-    <textarea id="ua-note" rows="2" maxlength="1000" placeholder="Nota staff (2-1000 caratteri)"></textarea>
-    <button class="secondary" onclick="doNote()">📝 Aggiungi nota</button>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let currentUser = null;
-  let uaGuilds = [];
-
-  async function loadGuildsForUA() {
-    const res = await apiFetch('/api/guilds');
-    uaGuilds = await res.json().catch(() => []);
-    fillGuildOptions();
-  }
-
-  function fillGuildOptions() {
-    const guildId = document.getElementById('ua-guild').value;
-    const g = uaGuilds.find(x => x.id === guildId);
-    document.getElementById('ua-role').innerHTML = (g && g.roles.length)
-      ? g.roles.map(r => '<option value="' + esc(r.id) + '">' + esc(r.name) + '</option>').join('')
-      : '<option value="">Nessun ruolo</option>';
-    document.getElementById('ua-invite-channel').innerHTML = (g && g.channels.length)
-      ? g.channels.map(c => '<option value="' + esc(c.id) + '">#' + esc(c.name) + '</option>').join('')
-      : '<option value="">Nessun canale</option>';
-  }
-
-  async function lookupUser() {
-    const userId = document.getElementById('ua-userid').value.trim();
-    const info = document.getElementById('ua-userinfo');
-    const actions = document.getElementById('ua-actions');
-    if (!/^\\d{17,20}$/.test(userId)) { info.innerHTML = '<span class="error">❌ ID non valido</span>'; return; }
-    info.innerHTML = '<p class="loading">Ricerca...</p>';
-    const res = await apiFetch('/api/user-lookup/' + encodeURIComponent(userId));
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) { info.innerHTML = '<span class="error">❌ ' + esc(data.error || 'Errore') + '</span>'; actions.style.display = 'none'; return; }
-    currentUser = data;
-
-    info.innerHTML =
-      '<div style="display:flex;gap:14px;align-items:center;margin-top:12px;">' +
-      '<img src="' + esc(data.avatar) + '" style="width:64px;height:64px;border-radius:50%;">' +
-      '<div><b>' + esc(data.tag) + '</b><br><small style="color:#666;">' + esc(data.id) + (data.bot ? ' • BOT' : '') + '</small></div>' +
-      '</div>' +
-      '<p style="margin-top:12px;color:#888;font-size:13px;">Server in comune: ' + esc(data.memberships.length) + '</p>';
-
-    const sel = document.getElementById('ua-guild');
-    sel.innerHTML = data.memberships.map(m =>
-      '<option value="' + esc(m.guildId) + '">' + esc(m.guildName) + ' (ruoli: ' + esc(m.roles.join(', ')) + ')</option>'
-    ).join('') || '<option value="">Nessun server</option>';
-    fillGuildOptions();
-
-    actions.style.display = 'block';
-  }
-
-  function uaContext() {
-    if (!currentUser) return null;
-    const guildId = document.getElementById('ua-guild').value;
-    if (!guildId) return null;
-    return { guildId: guildId, userId: currentUser.id, tag: currentUser.tag };
-  }
-  function uaShow(html) { document.getElementById('ua-result').innerHTML = html; }
-  function uaReport(r, okText) {
-    if (r.ok) uaShow('<span class="success">✅ ' + esc(okText) + '</span>');
-    else uaShow('<span class="error">❌ [' + r.status + '] ' + esc((r.data && r.data.error) || 'Errore') + '</span>');
-  }
-  function needCtx() {
-    const c = uaContext();
-    if (!c) uaShow('<span class="error">❌ Seleziona un server</span>');
-    return c;
-  }
-
-  async function doAction(action) {
-    const c = needCtx(); if (!c) return;
-    if (!confirm('Confermi ' + action.toUpperCase() + ' di ' + c.tag + '?')) return;
-    const reason = document.getElementById('ua-reason').value.trim();
-    const r = await postJson('/api/user-action', { action: action, userId: c.userId, guildId: c.guildId, reason: reason });
-    uaReport(r, action.toUpperCase() + ' eseguito');
-  }
-
-  async function doWarn() {
-    const c = needCtx(); if (!c) return;
-    if (!confirm('Registrare un warn per ' + c.tag + '?')) return;
-    const reason = document.getElementById('ua-reason').value.trim();
-    const r = await postJson('/api/mod/warn', { guildId: c.guildId, userId: c.userId, reason: reason });
-    uaReport(r, 'Warn registrato');
-  }
-
-  async function doTimeout() {
-    const c = needCtx(); if (!c) return;
-    const minutes = parseInt(document.getElementById('ua-timeout').value, 10);
-    if (!(minutes >= 1 && minutes <= 40320)) return uaShow('<span class="error">❌ Inserisci minuti tra 1 e 40320</span>');
-    if (!confirm('Timeout di ' + minutes + ' minuti per ' + c.tag + '?')) return;
-    const reason = document.getElementById('ua-reason').value.trim();
-    const r = await postJson('/api/mod/timeout', { guildId: c.guildId, userId: c.userId, seconds: minutes * 60, reason: reason });
-    uaReport(r, 'Timeout applicato');
-  }
-
-  async function doRole(action) {
-    const c = needCtx(); if (!c) return;
-    const roleId = document.getElementById('ua-role').value;
-    if (!roleId) return uaShow('<span class="error">❌ Nessun ruolo selezionato</span>');
-    const r = await postJson('/api/mod/role', { guildId: c.guildId, userId: c.userId, roleId: roleId, action: action });
-    uaReport(r, action === 'add' ? 'Ruolo assegnato' : 'Ruolo rimosso');
-  }
-
-  async function doInvite() {
-    const c = needCtx(); if (!c) return;
-    const channelId = document.getElementById('ua-invite-channel').value;
-    if (!channelId) return uaShow('<span class="error">❌ Nessun canale selezionato</span>');
-    const r = await postJson('/api/mod/invite', { guildId: c.guildId, channelId: channelId, userId: c.userId });
-    if (!r.ok) return uaReport(r, '');
-    uaShow('<span class="success">✅ ' + esc(r.data.via === 'dm' ? 'Invito inviato in DM' : 'DM chiusi: invito postato nel canale') + '</span>');
-  }
-
-  async function doNote() {
-    const c = needCtx(); if (!c) return;
-    const content = document.getElementById('ua-note').value.trim();
-    if (content.length < 2) return uaShow('<span class="error">❌ La nota è troppo corta</span>');
-    const r = await postJson('/api/notes', { guildId: c.guildId, userId: c.userId, content: content });
-    uaReport(r, 'Nota aggiunta');
-    if (r.ok) document.getElementById('ua-note').value = '';
-  }
-
-  loadGuildsForUA();
-  ${userId ? 'lookupUser();' : ''}
-  </script>`;
-}
-
-// ---------- REMINDER ----------
-function renderRemindersContent() {
-  return `
-  <div class="section">
-    <h2>⏰ Nuovo Reminder</h2>
-    <div class="form-row">
-      <select id="rm-guild" onchange="loadChannels()"></select>
-      <select id="rm-channel"></select>
-    </div>
-    <input id="rm-content" placeholder="Cosa ricordare (max 500)" maxlength="500">
-    <div class="form-row">
-      <input id="rm-when" placeholder="Quando (es. 10m, 1h, 2d)" maxlength="20" style="max-width:180px;">
-      <button onclick="createReminder()">➕ Crea</button>
-    </div>
-    <div id="rm-result"></div>
-  </div>
-
-  <div class="section">
-    <h2>📋 Reminder Recenti</h2>
-    <div id="reminders-content" class="loading">Caricamento...</div>
-  </div>
-
-  <script>
-  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  let guildsData = [];
-  let channelsCache = [];
-
-  async function loadGuilds() {
-    const res = await apiFetch('/api/guilds');
-    guildsData = await res.json();
-    const sel = document.getElementById('rm-guild');
-    sel.innerHTML = guildsData.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join('');
-    if (!channelsCache.length) {
-      const cRes = await apiFetch('/api/messages/channels');
-      channelsCache = await cRes.json();
-    }
-    if (guildsData.length) loadChannels();
-  }
-  function loadChannels() {
-    const guildId = document.getElementById('rm-guild').value;
-    const filtered = channelsCache.filter(c => c.guildId === guildId);
-    document.getElementById('rm-channel').innerHTML = filtered.map(c => '<option value="' + esc(c.channelId) + '">#' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
-  }
-  async function createReminder() {
-    const guildId = document.getElementById('rm-guild').value;
-    const channelId = document.getElementById('rm-channel').value;
-    const content = document.getElementById('rm-content').value.trim();
-    const when = document.getElementById('rm-when').value.trim();
-    const result = document.getElementById('rm-result');
-    if (!guildId || !channelId || !content || !when) { result.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ guildId, channelId, content, when }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      result.innerHTML = '<span class="success">✅ Reminder #' + esc(data.id) + ' creato</span>';
-      document.getElementById('rm-content').value = '';
-      document.getElementById('rm-when').value = '';
-      loadReminders();
-    } else { result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
-  }
-  async function loadReminders() {
-    const res = await apiFetch('/api/reminders');
-    const rows = await res.json();
-    const el = document.getElementById('reminders-content');
-    if (!rows.length) { el.innerHTML = '<p class="loading">Nessun reminder.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>#</th><th>Utente</th><th>Server</th><th>Canale</th><th>Contenuto</th><th>Quando</th></tr></thead><tbody>' +
-      rows.map(r => '<tr>' +
-        '<td>' + esc(r.id) + '</td>' +
-        '<td><a class="user-link" href="/user/' + esc(r.user_id) + '">' + esc(r.user_id) + '</a></td>' +
-        '<td>' + esc(r.guild_id) + '</td>' +
-        '<td>' + esc(r.channel_id) + '</td>' +
-        '<td>' + esc(r.content) + '</td>' +
-        '<td>' + esc(new Date(r.remind_at).toLocaleString('it-IT')) + '</td>' +
-      '</tr>').join('') + '</tbody></table>';
-  }
-  loadGuilds();
-  loadReminders();
-  </script>`;
-}
-
-module.exports = { createWebServer };
+module.exports = StorageService;
