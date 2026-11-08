@@ -55,13 +55,38 @@ function formatDuration(seconds) {
 
 function parseDuration(input) {
   if (!input) return null;
-  const m = String(input).trim().match(/^(\d+)\s*(s|m|h|d)$/i);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  if (isNaN(n) || n <= 0) return null;
-  const unit = m[2].toLowerCase();
+  const str = String(input).trim().toLowerCase();
+  const clock = str.match(/^(\d{1,3}):(\d{1,2})$/);
+  if (clock) {
+    const hours = parseInt(clock[1], 10);
+    const minutes = parseInt(clock[2], 10);
+    if (minutes > 59 || (hours === 0 && minutes === 0)) return null;
+    return (hours * 3600 + minutes * 60) * 1000;
+  }
+  const matches = [...str.matchAll(/(\d+)\s*(s|m|h|d)/gi)];
+  if (!matches.length) return null;
+  const consumed = matches.map(m => m[0]).join('').replace(/\s+/g, '');
+  if (consumed !== str.replace(/\s+/g, '')) return null;
+  let ms = 0;
+  const seen = new Set();
   const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
-  return n * multipliers[unit];
+  for (const m of matches) {
+    const unit = m[2].toLowerCase();
+    if (seen.has(unit)) return null;
+    seen.add(unit);
+    const n = parseInt(m[1], 10);
+    if (!n || n <= 0) return null;
+    ms += n * multipliers[unit];
+  }
+  return ms || null;
+}
+
+function hoursAndMinutesToMs(hours, minutes) {
+  const h = Number(hours) || 0;
+  const m = Number(minutes) || 0;
+  if (!Number.isInteger(h) || !Number.isInteger(m)) return null;
+  if (h < 0 || m < 0 || m > 59 || (h === 0 && m === 0)) return null;
+  return (h * 3600 + m * 60) * 1000;
 }
 
 function getRoles(member, guild) {
@@ -1267,7 +1292,7 @@ function buildHelpEmbed() {
       { name: '👤 Utente', value: '`/userinfo` `/roles` `/stats` `/ping` `/uptime`', inline: true },
       { name: '📨 Inviti & Ruoli', value: '`/invite` `/giverole` `/removerole` `/deleterole`', inline: true },
       { name: '🔒 Canali', value: '`/lock` `/unlock`', inline: true },
-      { name: '⏰ Reminder', value: '`/remind`', inline: true },
+      { name: '⏰ Reminder', value: '`/remind` ore + minuti', inline: true },
       { name: '🔧 Custom', value: '`/addcmd` `/delcmd` `/listcmd`', inline: true }
     )
     .setFooter({ text: 'Usa /help per rivedere questo messaggio' });
@@ -1722,7 +1747,8 @@ const slashCommands = [
   new SlashCommandBuilder().setName('listcmd').setDescription('Mostra la lista dei comandi custom'),
 
   new SlashCommandBuilder().setName('remind').setDescription('Imposta un reminder')
-    .addStringOption(o => o.setName('tempo').setDescription('Es: 10m, 1h, 2d, 30s').setRequired(true))
+    .addIntegerOption(o => o.setName('ore').setDescription('Ore da aspettare (0-720)').setRequired(true).setMinValue(0).setMaxValue(720))
+    .addIntegerOption(o => o.setName('minuti').setDescription('Minuti da aspettare (0-59)').setRequired(true).setMinValue(0).setMaxValue(59))
     .addStringOption(o => o.setName('testo').setDescription('Cosa ricordare').setRequired(true)),
 
   new SlashCommandBuilder().setName('dashboard').setDescription('Mostra dashboard (crea lobby)'),
@@ -2003,15 +2029,21 @@ async function handlePrefixCommand(message) {
 
       case 'remind':
       case 'reminder': {
-        const timeArg = args[0];
-        const content = args.slice(1).join(' ');
-
-        if (!timeArg || !content) {
-          return message.reply('❌ Uso: `-remind <tempo> <testo>`\nEsempi: `10m`, `1h`, `2d`, `30s`');
+        let ms = null;
+        let content = '';
+        if (/^\d{1,3}$/.test(args[0] || '') && /^\d{1,2}$/.test(args[1] || '')) {
+          ms = hoursAndMinutesToMs(parseInt(args[0], 10), parseInt(args[1], 10));
+          content = args.slice(2).join(' ');
+        } else if (args[0]) {
+          ms = parseDuration(args[0]);
+          content = args.slice(1).join(' ');
         }
 
-        const ms = parseDuration(timeArg);
-        if (!ms) return message.reply('❌ Formato tempo non valido. Usa `10m`, `1h`, `2d`, `30s`.');
+        if (!args[0] || !content) {
+          return message.reply('❌ Uso: `-remind <ore> <minuti> <testo>`\nEsempi: `-remind 1 30 scrim`, `-remind 1h30m scrim`, `-remind 10m scrim`');
+        }
+
+        if (!ms) return message.reply('❌ Formato tempo non valido. Usa ore e minuti: `1 30`, `1h30m`, `1:30`.');
         if (ms < 5000) return message.reply('❌ Il tempo minimo è 5 secondi.');
         if (ms > 30 * 24 * 60 * 60 * 1000) return message.reply('❌ Il tempo massimo è 30 giorni.');
         if (content.length > 500) return message.reply('❌ Il testo è troppo lungo (max 500 caratteri).');
@@ -2655,11 +2687,12 @@ async function handleSlashCommand(interaction) {
     }
 
     case 'remind': {
-      const timeArg = interaction.options.getString('tempo');
+      const hours = interaction.options.getInteger('ore');
+      const minutes = interaction.options.getInteger('minuti');
       const content = interaction.options.getString('testo');
 
-      const ms = parseDuration(timeArg);
-      if (!ms) return safeReply(interaction, { embeds: [EmbedManager.error('Formato non valido', 'Usa `10m`, `1h`, `2d`, `30s`.')], ephemeral: true });
+      const ms = hoursAndMinutesToMs(hours, minutes);
+      if (!ms) return safeReply(interaction, { embeds: [EmbedManager.error('Durata non valida', 'Scegli ore e minuti. Almeno uno dei due deve essere maggiore di 0, e i minuti vanno da 0 a 59.')], ephemeral: true });
       if (ms < 5000) return safeReply(interaction, { embeds: [EmbedManager.error('Troppo corto', 'Minimo 5 secondi.')], ephemeral: true });
       if (ms > 30 * 24 * 60 * 60 * 1000) return safeReply(interaction, { embeds: [EmbedManager.error('Troppo lungo', 'Massimo 30 giorni.')], ephemeral: true });
       if (content.length > 500) return safeReply(interaction, { embeds: [EmbedManager.error('Testo troppo lungo', 'Max 500 caratteri.')], ephemeral: true });
@@ -2976,6 +3009,10 @@ async function registerSlashCommands(clientId, token) {
         { body: commandsData }
       );
       log.ok(`✅ ${commandsData.length} slash commands registrati globalmente (fino a 1h di propagazione)`);
+      for (const guild of client.guilds.cache.values()) {
+        await rest.put(Routes.applicationGuildCommands(clientId, guild.id), { body: commandsData });
+        log.ok(`✅ ${commandsData.length} slash commands registrati subito in ${guild.name}`);
+      }
     }
   } catch (err) {
     log.err('registerSlashCommands', err);

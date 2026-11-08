@@ -454,7 +454,8 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     guildId: guildIdSchema,
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().min(1).max(500),
-    when: z.string().min(1).max(20)
+    hours: z.number().int().min(0).max(720),
+    minutes: z.number().int().min(0).max(59)
   });
   const schemaModWarn = z.object({ guildId: guildIdSchema, userId: userIdSchema, reason: reasonSchema });
   const schemaModTimeout = z.object({ guildId: guildIdSchema, userId: userIdSchema, seconds: z.number().int().min(1).max(2419200), reason: reasonSchema });
@@ -1453,12 +1454,8 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     const guild = client.guilds.cache.get(data.guildId);
     if (!guild || !guild.channels.cache.has(data.channelId)) return res.status(400).json({ error: 'Server o canale non valido' });
     if (!(await canManageGuild(req.session.user.id, guild))) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
-    const m = data.when.trim().match(/^(\d+)\s*(s|m|h|d)$/i);
-    if (!m) return res.status(400).json({ error: 'Formato tempo non valido (es. 10m, 1h, 2d)' });
-    const n = parseInt(m[1], 10);
-    const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[m[2].toLowerCase()];
-    const ms = n * mult;
-    if (ms < 5000 || ms > 30 * 24 * 60 * 60 * 1000) return res.status(400).json({ error: 'Durata tra 5s e 30g' });
+    const ms = ((data.hours * 60) + data.minutes) * 60000;
+    if (ms < 60000 || ms > 30 * 24 * 60 * 60 * 1000) return res.status(400).json({ error: 'Scegli ore e minuti: minimo 1 minuto, massimo 30 giorni' });
     try {
       const id = storage.addReminder(req.session.user.id, data.guildId, data.channelId, data.content, new Date(Date.now() + ms));
       res.json({ ok: true, id });
@@ -2842,7 +2839,8 @@ function renderRemindersContent() {
     </div>
     <input id="rm-content" placeholder="Cosa ricordare (max 500)" maxlength="500">
     <div class="form-row">
-      <input id="rm-when" placeholder="Quando (es. 10m, 1h, 2d)" maxlength="20" style="max-width:180px;">
+      <input id="rm-hours" type="number" min="0" max="720" value="0" placeholder="Ore" style="max-width:120px;">
+      <input id="rm-minutes" type="number" min="0" max="59" value="30" placeholder="Minuti" style="max-width:120px;">
       <button onclick="createReminder()">➕ Crea</button>
     </div>
     <div id="rm-result"></div>
@@ -2878,15 +2876,17 @@ function renderRemindersContent() {
     const guildId = document.getElementById('rm-guild').value;
     const channelId = document.getElementById('rm-channel').value;
     const content = document.getElementById('rm-content').value.trim();
-    const when = document.getElementById('rm-when').value.trim();
+    const hours = parseInt(document.getElementById('rm-hours').value, 10);
+    const minutes = parseInt(document.getElementById('rm-minutes').value, 10);
     const result = document.getElementById('rm-result');
-    if (!guildId || !channelId || !content || !when) { result.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ guildId, channelId, content, when }) });
+    if (!guildId || !channelId || !content || Number.isNaN(hours) || Number.isNaN(minutes)) { result.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
+    const res = await apiFetch('/api/reminders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ guildId, channelId, content, hours, minutes }) });
     const data = await res.json().catch(() => ({}));
     if (res.ok) {
       result.innerHTML = '<span class="success">✅ Reminder #' + esc(data.id) + ' creato</span>';
       document.getElementById('rm-content').value = '';
-      document.getElementById('rm-when').value = '';
+      document.getElementById('rm-hours').value = '0';
+      document.getElementById('rm-minutes').value = '30';
       loadReminders();
     } else { result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
   }
