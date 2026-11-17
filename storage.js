@@ -167,6 +167,15 @@ class StorageService {
         timestamp TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS dashboard_role_permissions (
+        guild_id TEXT NOT NULL,
+        role_id TEXT NOT NULL,
+        permissions_json TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (guild_id, role_id)
+      );
+
       CREATE TABLE IF NOT EXISTS ticket_transcripts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
@@ -609,6 +618,30 @@ class StorageService {
     this._saveAccess.run(userId, username, ip || null, userAgent || null, new Date().toISOString());
   }
   getDashboardAccessLogs(limit = 500) { return this._getAccess.all(limit); }
+  getDashboardRolePermissions(guildId) {
+    return this.db.prepare(
+      'SELECT role_id, permissions_json FROM dashboard_role_permissions WHERE guild_id = ?'
+    ).all(guildId).map(row => ({
+      role_id: row.role_id,
+      permissions: JSON.parse(row.permissions_json)
+    }));
+  }
+  setDashboardRolePermissions(guildId, roleId, permissions, updatedBy) {
+    if (!permissions.length) {
+      return this.db.prepare(
+        'DELETE FROM dashboard_role_permissions WHERE guild_id = ? AND role_id = ?'
+      ).run(guildId, roleId).changes > 0;
+    }
+    this.db.prepare(`
+      INSERT INTO dashboard_role_permissions (guild_id, role_id, permissions_json, updated_by, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(guild_id, role_id) DO UPDATE SET
+        permissions_json = excluded.permissions_json,
+        updated_by = excluded.updated_by,
+        updated_at = excluded.updated_at
+    `).run(guildId, roleId, JSON.stringify(permissions), updatedBy, new Date().toISOString());
+    return true;
+  }
 
   // ==================== TICKET TRANSCRIPTS ====================
   saveTranscript(channelId, channelName, userId, claimedBy, priority, html, guildId = null) {
