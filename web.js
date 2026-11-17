@@ -6,6 +6,7 @@ const cookieParser = require('cookie-parser');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const {
   EmbedBuilder,
@@ -570,7 +571,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       ['analytics', ['/charts', '/top', '/api/charts', '/api/top']],
       ['communications', ['/messages', '/reminders', '/api/messages', '/api/reminders']],
       ['lobbies', ['/lobbies', '/api/lobbies']],
-      ['audit', ['/access-logs', '/api/access-logs', '/api/export/access-logs']]
+      ['audit', ['/access-logs', '/api/access-logs', '/api/export/access-logs', '/api/export/full-backup']]
     ];
     for (const [feature, prefixes] of routes) {
       if (prefixes.some(prefix => pathname === prefix || pathname.startsWith(`${prefix}/`) || pathname.startsWith(`${prefix}.`))) {
@@ -1345,6 +1346,37 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
+  app.get('/api/export/full-backup', requireAuth, async (req, res) => {
+    if (!isEnvAdmin(req.session.user.id)) {
+      return res.status(403).json({ error: 'Il backup completo è riservato agli admin configurati in DASHBOARD_ADMIN_IDS' });
+    }
+
+    let tempDir;
+    const cleanup = () => {
+      if (!tempDir) return;
+      fs.rm(tempDir, { recursive: true, force: true }, err => {
+        if (err) log.err('full database backup cleanup', err);
+      });
+    };
+
+    try {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tommy-utilities-backup-'));
+      const backupPath = path.join(tempDir, 'bot.sqlite');
+      await storage.db.backup(backupPath);
+      res.setHeader('Cache-Control', 'no-store');
+      res.download(backupPath, `tommy-utilities-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`, err => {
+        cleanup();
+        if (!err) return;
+        log.err('full database backup download', err);
+        if (!res.headersSent) return apiError(res, err, 'Errore invio backup');
+        res.destroy(err);
+      });
+    } catch (e) {
+      cleanup();
+      apiError(res, e, 'Impossibile creare il backup completo');
+    }
+  });
+
   app.get('/api/access-logs', requireAuth, (req, res) => {
     if (ENV_ADMIN_IDS.length && !isEnvAdmin(req.session.user.id)) return res.status(403).json({ error: 'Solo gli admin dashboard vedono gli IP' });
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
@@ -1717,6 +1749,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
         };
         if (page === 'dashboard') {
           security.canUseGlobalBlacklist = await canUseGlobalBlacklist(req.session.user.id);
+          security.canExportFullBackup = isEnvAdmin(req.session.user.id);
         }
         res.send(renderLayout(req.session.user, page, params, security));
       } catch (e) {
@@ -2262,6 +2295,7 @@ function renderDashboardContent(security = {}) {
     canModerate ? '<a class="hero-button hero-button-primary" href="/modlogs">Apri moderazione <span aria-hidden="true">→</span></a>' : '',
     permissions.has('tickets') ? '<a class="hero-button hero-button-secondary" href="/tickets">Gestisci ticket</a>' : '',
     permissions.has('settings') ? '<a class="hero-button hero-button-secondary" href="/config">Configurazione</a>' : '',
+    security.canExportFullBackup ? '<a class="hero-button hero-button-secondary" href="/api/export/full-backup" onclick="return confirm(&quot;Il backup include tutti i dati salvati, compresi log e dati di accesso. Continuare?&quot;)">Esporta backup completo</a>' : '',
     canManageGlobalBlacklist ? '<a class="hero-button hero-button-primary" href="#blacklist-content">Gestisci blacklist</a>' : '',
     canViewOverview ? '<a class="hero-button hero-button-quiet" href="#service-status">Stato servizi <span aria-hidden="true">↓</span></a>' : ''
   ].filter(Boolean).join('');
