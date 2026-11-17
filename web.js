@@ -503,6 +503,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
     allowMentions: z.boolean().optional().default(true),
+    allowMassMentions: z.boolean().optional().default(false),
     embed: z.object({
       title: z.string().max(256).optional(),
       description: z.string().max(4096).optional(),
@@ -1414,7 +1415,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const botMember = channel.guild?.members?.me;
       if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
 
-      const payload = { allowedMentions: { parse: data.allowMentions ? ['users', 'roles'] : [] } };
+      const payload = { allowedMentions: { parse: [
+        ...(data.allowMentions ? ['users', 'roles'] : []),
+        ...(data.allowMassMentions ? ['everyone'] : [])
+      ] } };
       if (data.content) payload.content = data.content;
       if (data.embed && (data.embed.title || data.embed.description)) {
         const e = new EmbedBuilder();
@@ -3277,7 +3281,7 @@ function renderCommandsContent() {
     const msg = document.getElementById('cmd-msg');
     if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
     if (!/^[a-z0-9_-]{1,50}$/i.test(name)) { msg.innerHTML = '<span class="error">❌ Usa solo lettere, numeri, trattini e underscore nel nome</span>'; return; }
-    if (/@(everyone|here)\b/i.test(response)) { msg.innerHTML = '<span class="error">❌ Le menzioni @everyone e @here non sono consentite nelle risposte custom</span>'; return; }
+    if (/@(everyone|here)\\b/i.test(response)) { msg.innerHTML = '<span class="error">❌ Le menzioni @everyone e @here non sono consentite nelle risposte custom</span>'; return; }
     try {
       const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
       const data = await res.json().catch(() => ({}));
@@ -3769,9 +3773,10 @@ function renderMessagesContent() {
         <div class="mention-help">
           Per menzionare davvero qualcuno usa la sintassi Discord con il suo ID:
           utente <code>&lt;@ID&gt;</code> (oppure <code>&lt;@!ID&gt;</code>), ruolo <code>&lt;@&amp;ID&gt;</code>.
-          Un testo come <code>@nome</code> non identifica da solo un account. <code>@everyone</code> e <code>@here</code> non generano ping.
+          Un testo come <code>@nome</code> non identifica da solo un account. I ping <code>@everyone</code>/<code>@here</code> richiedono l’opzione dedicata e una conferma.
         </div>
         <label class="inline-check"><input id="msg-allow-mentions" type="checkbox" checked onchange="updateMessagePreview()"> Attiva le menzioni esplicite di utenti e ruoli</label>
+        <label class="inline-check"><input id="msg-allow-mass-mentions" type="checkbox" onchange="updateMessagePreview()"> Consenti ping di massa con @everyone e @here</label>
 
         <details style="margin:14px 0;">
           <summary style="cursor:pointer;color:#b9a9ff;">➕ Aggiungi embed opzionale</summary>
@@ -3851,6 +3856,8 @@ function renderMessagesContent() {
     const description = document.getElementById('emb-desc').value.trim();
     const footer = document.getElementById('emb-footer').value.trim();
     const mentionEnabled = document.getElementById('msg-allow-mentions').checked;
+    const massMentionsEnabled = document.getElementById('msg-allow-mass-mentions').checked;
+    const hasMassMention = /@(everyone|here)\\b/i.test(content);
     document.getElementById('msg-preview-channel').textContent = channel ? channel.guildName + ' · #' + channel.channelName : 'Seleziona un canale';
     document.getElementById('msg-preview-content').textContent = content || 'Il testo del messaggio apparirà qui.';
     document.getElementById('msg-content-count').textContent = content.length.toLocaleString('it-IT') + ' / 2000';
@@ -3860,9 +3867,13 @@ function renderMessagesContent() {
     const embedPreview = document.getElementById('msg-preview-embed');
     embedPreview.style.display = title || description || footer ? 'block' : 'none';
     const mentionMatches = content.match(/<@!?\\d{17,20}>|<@&\\d{17,20}>/g) || [];
-    document.getElementById('msg-preview-hints').textContent = mentionMatches.length
-      ? (mentionEnabled ? mentionMatches.length + ' menzion' + (mentionMatches.length === 1 ? 'e' : 'i') + ' esplicite attive · @everyone/@here restano disattivati' : 'Menzioni disattivate: il testo verrà inviato senza ping')
-      : (mentionEnabled ? 'I tag Discord di utenti e ruoli verranno menzionati · ping di massa disattivati' : 'Menzioni disattivate');
+    const mentionHint = mentionMatches.length
+      ? (mentionEnabled ? mentionMatches.length + ' menzion' + (mentionMatches.length === 1 ? 'e' : 'i') + ' esplicite attive' : 'Menzioni di utenti e ruoli disattivate')
+      : (mentionEnabled ? 'I tag Discord di utenti e ruoli verranno menzionati' : 'Menzioni di utenti e ruoli disattivate');
+    const massMentionHint = hasMassMention
+      ? (massMentionsEnabled ? ' · Ping di massa attivo: verrà chiesta conferma prima dell’invio' : ' · @everyone/@here presenti ma senza notifiche')
+      : (massMentionsEnabled ? ' · Ping di massa consentito se inserisci @everyone o @here' : ' · Ping di massa disattivati');
+    document.getElementById('msg-preview-hints').textContent = mentionHint + massMentionHint;
   }
 
   async function sendMessage() {
@@ -3885,7 +3896,10 @@ function renderMessagesContent() {
     btn.disabled = true; btn.textContent = '⏳ Invio...';
     try {
       const allowMentions = document.getElementById('msg-allow-mentions').checked;
-      const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed, allowMentions }) });
+      const allowMassMentions = document.getElementById('msg-allow-mass-mentions').checked;
+      if (allowMassMentions && /@(everyone|here)\\b/i.test(content) &&
+          !confirm('Il messaggio notificherà @everyone o @here. Vuoi procedere?')) return;
+      const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed, allowMentions, allowMassMentions }) });
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         result.innerHTML = '<span class="success">✅ Inviato in #' + esc(currentChannel().channelName) + ' · ID: ' + esc(data.messageId) + '</span>';
