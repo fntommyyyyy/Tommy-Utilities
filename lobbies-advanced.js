@@ -1,6 +1,6 @@
 // lobbies-advanced.js — Sistema di lobby avanzate (stile Nova)
 const { ChannelType, PermissionsBitField, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { saveMeta } = require('./lobbies');
+const { saveMeta, embedTextPayload } = require('./lobbies');
 
 function slugify(name) {
   const slug = String(name || '')
@@ -103,12 +103,12 @@ async function createAdvancedLobby(guild, hostMember, lobbyName, log, db) {
   const unregRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`adv_unregister_${category.id}`).setLabel('Unregister').setStyle(ButtonStyle.Danger)
   );
-  await channels.unreg.send({ content: 'Clicca per disiscriverti.', components: [unregRow] });
+  await channels.unreg.send(embedTextPayload({ content: 'Clicca per disiscriverti.', components: [unregRow] }, 'Disiscrizione'));
 
   const fillRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`adv_fill_${category.id}`).setLabel('Offriti come rimpiazzo').setStyle(ButtonStyle.Primary)
   );
-  await channels.fills.send({ content: 'Clicca se vuoi essere un rimpiazzo.', components: [fillRow] });
+  await channels.fills.send(embedTextPayload({ content: 'Clicca se vuoi essere un rimpiazzo.', components: [fillRow] }, 'Rimpiazzi'));
 
   log.ok(`Lobby avanzata "${lobbyName}" creata con successo.`);
   return { category, channels };
@@ -131,53 +131,54 @@ async function handleAdvancedLobbyButton(interaction, db, log) {
   const categoryId = parts[2];
   const guild = interaction.guild;
   const member = interaction.member;
+  const reply = (payload) => interaction.reply(embedTextPayload(payload));
 
   const category = guild.channels.cache.get(categoryId);
-  if (!category) return interaction.reply({ content: '❌ Lobby non trovata.', ephemeral: true });
+  if (!category) return reply({ content: '❌ Lobby non trovata.', ephemeral: true });
 
   try {
     if (action === 'register') {
       if (db) {
         const already = db.prepare('SELECT 1 FROM lobby_registrations WHERE category_id = ? AND user_id = ?').get(categoryId, member.id);
-        if (already) return interaction.reply({ content: '❌ Sei già iscritto.', ephemeral: true });
+        if (already) return reply({ content: '❌ Sei già iscritto.', ephemeral: true });
         db.prepare('INSERT OR IGNORE INTO lobby_registrations (category_id, user_id, username, registered_at) VALUES (?, ?, ?, ?)')
           .run(categoryId, member.id, member.displayName, new Date().toISOString());
       }
       for (const ch of accessChannels(guild, category.id)) {
         await ch.permissionOverwrites.edit(member, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
       }
-      return interaction.reply({ content: '✅ Iscrizione avvenuta con successo!', ephemeral: true });
+      return reply({ content: '✅ Iscrizione avvenuta con successo!', ephemeral: true });
     }
 
     if (action === 'unregister') {
       if (db) {
         const removed = db.prepare('DELETE FROM lobby_registrations WHERE category_id = ? AND user_id = ?').run(categoryId, member.id).changes > 0;
-        if (!removed) return interaction.reply({ content: '❌ Non eri iscritto.', ephemeral: true });
+        if (!removed) return reply({ content: '❌ Non eri iscritto.', ephemeral: true });
       }
       for (const ch of accessChannels(guild, category.id)) {
         await ch.permissionOverwrites.delete(member.id).catch(() => {});
       }
-      return interaction.reply({ content: '✅ Disiscrizione avvenuta con successo!', ephemeral: true });
+      return reply({ content: '✅ Disiscrizione avvenuta con successo!', ephemeral: true });
     }
 
     if (action === 'host') {
       if (db) {
         const meta = db.prepare('SELECT host_id FROM lobby_meta WHERE category_id = ?').get(categoryId);
         if (meta?.host_id && meta.host_id !== member.id) {
-          return interaction.reply({ content: '❌ Solo l\'host può usare questo bottone.', ephemeral: true });
+          return reply({ content: '❌ Solo l\'host può usare questo bottone.', ephemeral: true });
         }
       }
-      return interaction.reply({ content: '✅ Host in game! La lobby è ora in corso.', ephemeral: true });
+      return reply({ content: '✅ Host in game! La lobby è ora in corso.', ephemeral: true });
     }
 
     if (action === 'fill') {
-      return interaction.reply({ content: '✅ Ti sei offerto come rimpiazzo!', ephemeral: true });
+      return reply({ content: '✅ Ti sei offerto come rimpiazzo!', ephemeral: true });
     }
 
     return false;
   } catch (err) {
     log.err('advanced lobby button', err);
-    return interaction.reply({ content: '❌ Errore durante l\'azione sulla lobby.', ephemeral: true });
+    return reply({ content: '❌ Errore durante l\'azione sulla lobby.', ephemeral: true });
   }
 }
 
