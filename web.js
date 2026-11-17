@@ -1539,6 +1539,24 @@ function renderLayout(user, page, params = {}, security = {}) {
   const avatar = user.avatar ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64` : `https://cdn.discordapp.com/embed/avatars/0.png`;
   const csrfToken = security.csrfToken || '';
   const safeQ = escapeHtml(params.q || '');
+  const pageTitles = {
+    dashboard: 'Dashboard',
+    modlogs: 'Mod Logs',
+    notes: 'Note',
+    tickets: 'Ticket',
+    commands: 'Comandi',
+    config: 'Configurazione',
+    charts: 'Grafici',
+    top: 'Classifiche',
+    user: 'Profilo utente',
+    search: 'Ricerca',
+    accesslogs: 'Log accessi',
+    messages: 'Messaggi',
+    userActions: 'Gestione utenti',
+    reminders: 'Reminder',
+    lobbies: 'Lobby'
+  };
+  const pageTitle = pageTitles[page] || 'Dashboard';
 
   // Ogni pagina viene generata solo quando è quella richiesta
   const renderers = {
@@ -1637,99 +1655,207 @@ function renderLayout(user, page, params = {}, security = {}) {
 </script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 <style>
+  :root { color-scheme: dark; --bg: #090a0f; --panel: #11131b; --panel-raised: #171a24; --border: #242735; --muted: #9298aa; --text: #f3f4fa; --accent: #8b75ff; --accent-bright: #a38fff; --danger: #f06478; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111214; color: #eee; padding: 28px 20px 48px; line-height: 1.45; }
-  header { display: flex; justify-content: space-between; align-items: center; margin: 0 auto 16px; padding-bottom: 18px; border-bottom: 1px solid #2b2d31; gap: 16px; flex-wrap: wrap; max-width: 1180px; }
-  h1 { font-size: 22px; letter-spacing: -0.02em; }
-  .user { display: flex; align-items: center; gap: 12px; }
-  .user img { width: 40px; height: 40px; border-radius: 50%; }
-  .search-box { flex: 1; max-width: 420px; min-width: 200px; }
+  body { min-height: 100vh; background: radial-gradient(ellipse at 70% -20%, rgba(84, 66, 163, .16), transparent 42%), var(--bg); color: var(--text); font: 14px/1.55 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  button, input, select, textarea { font: inherit; }
+  button { cursor: pointer; }
+  a { color: var(--accent-bright); text-decoration: none; }
+  .app-sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; display: flex; flex-direction: column; width: 252px; padding: 25px 16px 18px; background: rgba(13, 14, 20, .96); border-right: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 12px; padding: 0 10px 27px; color: var(--text); }
+  .brand-mark { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid rgba(163, 143, 255, .36); border-radius: 12px; background: linear-gradient(145deg, #32265f, #171827); color: #c8bbff; font-size: 18px; box-shadow: 0 6px 24px rgba(104, 79, 212, .2); }
+  .brand strong { display: block; font-size: 13px; letter-spacing: .11em; }
+  .brand small { display: block; margin-top: 2px; color: #7e8396; font-size: 10px; letter-spacing: .12em; }
+  .nav-label { padding: 12px 12px 8px; color: #71778a; font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .sidebar-nav { display: flex; flex: 1; flex-direction: column; gap: 4px; overflow-y: auto; }
+  .sidebar-nav a { display: flex; align-items: center; gap: 12px; min-height: 42px; padding: 9px 12px; border: 1px solid transparent; border-radius: 10px; color: #9da2b2; font-size: 13px; transition: background .18s ease, color .18s ease, border-color .18s ease, transform .18s ease; }
+  .sidebar-nav a:hover { transform: translateX(2px); background: #171923; color: #fff; }
+  .sidebar-nav a.active { border-color: rgba(139, 117, 255, .2); background: linear-gradient(90deg, rgba(116, 91, 234, .2), rgba(116, 91, 234, .06)); color: #c6baff; box-shadow: inset 2px 0 #9c87ff; }
+  .nav-icon { width: 19px; text-align: center; font-size: 15px; }
+  .sidebar-footer { margin-top: 16px; padding: 14px 12px 0; border-top: 1px solid var(--border); color: #777d90; font-size: 11px; }
+  .sidebar-overlay { display: none; }
+  .app-main { width: min(100% - 252px, 1700px); min-height: 100vh; margin-left: 252px; padding: 23px clamp(20px, 3.2vw, 52px) 48px; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 22px; min-height: 66px; margin-bottom: 29px; padding-bottom: 20px; border-bottom: 1px solid rgba(46, 49, 65, .75); }
+  .topbar-left, .topbar-actions, .user { display: flex; align-items: center; }
+  .topbar-left { gap: 14px; min-width: 0; }
+  .page-heading .eyebrow { color: #858ba0; font-size: 10px; font-weight: 700; letter-spacing: .14em; }
+  h1 { margin-top: 2px; font-size: clamp(20px, 2vw, 25px); font-weight: 650; letter-spacing: -.035em; }
+  .topbar-actions { justify-content: flex-end; gap: 20px; }
+  .search-box { width: min(320px, 28vw); }
   .search-box form { display: flex; gap: 8px; }
   .search-box input, .search-box button { margin: 0; }
-  nav { display: flex; gap: 8px; margin: 0 auto 24px; flex-wrap: wrap; max-width: 1180px; position: sticky; top: 0; z-index: 5; background: rgba(17,18,20,0.92); padding: 8px 0; }
-  nav a { padding: 8px 14px; background: #1e1f22; border: 1px solid #2b2d31; border-radius: 999px; color: #b5bac1; font-size: 13px; }
-  nav a:hover { background: #2b2d31; color: #fff; }
-  nav a.active { background: #5865F2; color: white; border-color: #5865F2; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 0 auto 28px; max-width: 1180px; }
-  .card { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 16px 18px; }
-  .card h2 { font-size: 11px; color: #949ba4; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-  .card .value { font-size: 28px; font-weight: 700; color: #5865F2; }
-  .section { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 20px; margin: 0 auto 16px; max-width: 1180px; overflow-x: auto; }
-  .section h2 { font-size: 18px; margin-bottom: 14px; }
-  table { width: 100%; border-collapse: collapse; min-width: 640px; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2b2d31; font-size: 14px; vertical-align: top; }
-  th { color: #949ba4; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-  tr:hover td { background: rgba(255,255,255,0.02); }
-  button { background: #5865F2; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #4752c4; }
-  button:disabled { opacity: 0.6; cursor: not-allowed; }
-  button.danger { background: #ed4245; }
-  button.danger:hover { background: #c93b3e; }
-  button.small { padding: 5px 10px; font-size: 12px; }
-  button.secondary { background: #444; }
-  button.secondary:hover { background: #555; }
-  input, select, textarea { background: #1a1a1a; border: 1px solid #444; color: #eee; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 10px; font-family: inherit; }
-  .form-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
-  .form-row input, .form-row select { flex: 1; min-width: 150px; }
-  .loading { color: #888; font-style: italic; }
-  a { color: #5865F2; text-decoration: none; }
-  a.user-link { color: #5865F2; text-decoration: none; border-bottom: 1px dashed #5865F2; }
-  a.user-link:hover { color: #4752c4; border-bottom-style: solid; }
-  .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .user { gap: 10px; white-space: nowrap; }
+  .user img { width: 36px; height: 36px; border: 1px solid #343747; border-radius: 50%; object-fit: cover; }
+  .user-name { max-width: 140px; overflow: hidden; color: #d7d9e3; font-size: 12px; text-overflow: ellipsis; }
+  .user-actions { display: flex; gap: 7px; }
+  .menu-toggle { display: none; width: 38px; height: 38px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); font-size: 18px; }
+  .content-area { width: 100%; min-width: 0; animation: enter .32s ease both; }
+  @keyframes enter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 14px; width: 100%; margin: 0 0 24px; }
+  .card, .section { border: 1px solid var(--border); background: linear-gradient(145deg, rgba(22, 24, 34, .96), rgba(15, 17, 24, .98)); box-shadow: 0 12px 35px rgba(0, 0, 0, .13); }
+  .card { position: relative; min-height: 112px; overflow: hidden; padding: 18px 19px; border-radius: 15px; transition: transform .2s ease, border-color .2s ease, background .2s ease; }
+  .card::after { position: absolute; right: -26px; bottom: -48px; width: 104px; height: 104px; border-radius: 50%; background: rgba(130, 105, 255, .07); content: ""; filter: blur(2px); }
+  .card:hover { transform: translateY(-2px); border-color: #39334f; }
+  .card h2 { position: relative; z-index: 1; margin-bottom: 12px; color: #969bad; font-size: 10px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
+  .card .value { position: relative; z-index: 1; color: #c8bbff; font-size: clamp(25px, 3vw, 32px); font-weight: 700; letter-spacing: -.04em; }
+  .section { width: 100%; margin: 0 0 17px; padding: clamp(16px, 2.2vw, 24px); overflow-x: auto; border-radius: 15px; }
+  .section h2 { margin-bottom: 15px; font-size: 16px; font-weight: 650; letter-spacing: -.015em; }
+  table { width: 100%; min-width: 640px; border-collapse: collapse; }
+  th, td { padding: 11px 10px; border-bottom: 1px solid #282b38; font-size: 13px; text-align: left; vertical-align: top; }
+  th { color: #898fa2; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+  tr:hover td { background: rgba(255, 255, 255, .025); }
+  button { padding: 9px 14px; border: 1px solid transparent; border-radius: 9px; background: linear-gradient(135deg, #8069ed, #624bcc); color: #fff; font-size: 12px; font-weight: 600; transition: filter .16s ease, transform .16s ease, border-color .16s ease; }
+  button:hover { filter: brightness(1.12); transform: translateY(-1px); }
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #aa98ff; outline-offset: 2px; }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  button.danger { background: #a83e55; }
+  button.danger:hover { background: #bf4962; }
+  button.small { padding: 6px 10px; font-size: 11px; }
+  button.secondary { border-color: #303342; background: #1c1e29; color: #c4c7d2; }
+  button.secondary:hover { border-color: #474b60; background: #252837; }
+  input, select, textarea { width: 100%; margin-bottom: 10px; padding: 10px 12px; border: 1px solid #303342; border-radius: 9px; background: #0e1017; color: var(--text); font-size: 13px; }
+  input::placeholder, textarea::placeholder { color: #747a8d; }
+  .form-row { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+  .form-row input, .form-row select { min-width: 150px; flex: 1; }
+  .loading { color: #8c91a2; font-style: italic; }
+  a.user-link { border-bottom: 1px dashed var(--accent); color: var(--accent-bright); }
+  a.user-link:hover { border-bottom-style: solid; color: #c4b8ff; }
+  .filter-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
   .filter-bar select, .filter-bar input { max-width: 250px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
-  .badge.kick, .badge.warn { background: #faa61a; color: #000; }
-  .badge.ban { background: #ed4245; color: #fff; }
-  .badge.timeout { background: #5865F2; color: #fff; }
-  .badge.default { background: #444; color: #eee; }
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } }
-  .chart-box { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
-  .config-block { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .config-block h3 { font-size: 16px; margin-bottom: 12px; color: #bbb; }
-  .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
-  .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
-  code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-  .export-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-  .export-bar a { padding: 6px 12px; background: #444; border-radius: 6px; font-size: 12px; color: #eee; }
-  .export-bar a:hover { background: #555; }
+  .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .badge.kick, .badge.warn { background: #9c6a23; color: #fff1d2; }
+  .badge.ban { background: #a83e55; color: #fff; }
+  .badge.timeout { background: #624bcc; color: #fff; }
+  .badge.default { background: #343747; color: #e2e4ec; }
+  .charts-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .chart-box, .config-block { padding: 17px; border: 1px solid #292c3a; border-radius: 12px; background: #0e1017; }
+  .config-block { margin-bottom: 16px; }
+  .config-block h3 { margin-bottom: 12px; color: #d4d6e0; font-size: 14px; }
+  .success { margin-top: 8px; color: #64d6a0; font-size: 13px; }
+  .error { color: var(--danger); font-size: 13px; }
+  code { padding: 2px 6px; border-radius: 5px; background: #0e1017; font-size: 12px; }
+  .export-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .export-bar a { padding: 7px 11px; border: 1px solid #303342; border-radius: 8px; background: #1b1d28; color: #c4c7d2; font-size: 11px; }
+  .export-bar a:hover { border-color: #514778; color: #ddd5ff; }
+  @media (max-width: 1050px) {
+    .app-main { width: calc(100% - 232px); margin-left: 232px; padding-right: 22px; padding-left: 22px; }
+    .app-sidebar { width: 232px; }
+    .topbar { gap: 14px; }
+    .topbar-actions { gap: 12px; }
+    .user-name { display: none; }
+  }
+  @media (max-width: 760px) {
+    .app-sidebar { width: min(290px, calc(100vw - 54px)); transform: translateX(-102%); transition: transform .24s ease; }
+    body.sidebar-open .app-sidebar { transform: translateX(0); }
+    .sidebar-overlay { position: fixed; z-index: 19; inset: 0; border: 0; border-radius: 0; background: rgba(3, 4, 8, .68); opacity: 0; pointer-events: none; transition: opacity .24s ease; }
+    body.sidebar-open .sidebar-overlay { display: block; opacity: 1; pointer-events: auto; }
+    .app-main { width: 100%; margin-left: 0; padding: 18px 16px 36px; }
+    .topbar { align-items: flex-start; flex-wrap: wrap; margin-bottom: 21px; padding-bottom: 16px; }
+    .menu-toggle { display: inline-grid; flex: 0 0 auto; place-items: center; }
+    .topbar-left { flex: 1; }
+    .topbar-actions { width: 100%; justify-content: space-between; }
+    .search-box { width: auto; min-width: 0; flex: 1; }
+    .user { gap: 8px; }
+    .user-actions { gap: 5px; }
+    .user-actions button { padding: 8px 9px; }
+    .charts-grid { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 480px) {
+    .app-main { padding-right: 12px; padding-left: 12px; }
+    .topbar-actions { align-items: flex-start; gap: 10px; }
+    .search-box form { gap: 5px; }
+    .search-box input { min-width: 0; padding: 9px; }
+    .search-box button { padding: 8px 10px; }
+    .user img { width: 32px; height: 32px; }
+    .user-actions { flex-direction: column; }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    .card { min-height: 100px; padding: 14px 12px; }
+    .card .value { font-size: 23px; }
+    .section { padding: 15px 12px; }
+    .form-row { display: grid; grid-template-columns: 1fr; }
+    .form-row input, .form-row select { min-width: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  }
 </style>
 </head>
 <body>
-  <header>
-    <h1>🤖 Dashboard Bot</h1>
-    <div class="search-box">
-      <form action="/search" method="get">
-        <input type="text" name="q" placeholder="Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
-        <button type="submit" class="secondary">Cerca</button>
-      </form>
-    </div>
-    <div class="user">
-      <img src="${avatar}" alt="">
-      <span>${name}</span>
-      <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
-      <a href="/auth/logout"><button class="danger">Logout</button></a>
-    </div>
-  </header>
-
-  <nav>
-    <a href="/dashboard" class="${page === 'dashboard' ? 'active' : ''}">📊 Dashboard</a>
-    <a href="/modlogs" class="${page === 'modlogs' ? 'active' : ''}">📋 Mod Logs</a>
-    <a href="/notes" class="${page === 'notes' ? 'active' : ''}">📝 Note</a>
-    <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
-    <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
-    <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
-    <a href="/reminders" class="${page === 'reminders' ? 'active' : ''}">⏰ Reminder</a>
-    <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
-    <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
-    <a href="/messages" class="${page === 'messages' ? 'active' : ''}">✉️ Messaggi</a>
-    <a href="/user-actions" class="${page === 'userActions' ? 'active' : ''}">🛠️ Gestione Utenti</a>
-    <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
-    <!-- VOCE LOBBY AGGIUNTA -->
-    <a href="/lobbies" class="${page === 'lobbies' ? 'active' : ''}">🗺️ Lobby</a>
-  </nav>
-
-  ${body}
+  <aside class="app-sidebar" id="app-sidebar">
+    <a class="brand" href="/dashboard" aria-label="Tommy Utilities, dashboard">
+      <span class="brand-mark" aria-hidden="true">T</span>
+      <span><strong>TOMMY UTILITIES</strong><small>BOT CONTROL CENTER</small></span>
+    </a>
+    <div class="nav-label">Workspace</div>
+    <nav class="sidebar-nav" id="sidebar-nav" aria-label="Navigazione dashboard">
+      <a href="/dashboard" class="${page === 'dashboard' ? 'active' : ''}"><span class="nav-icon">📊</span>Dashboard</a>
+      <a href="/charts" class="${page === 'charts' ? 'active' : ''}"><span class="nav-icon">📈</span>Grafici</a>
+      <a href="/top" class="${page === 'top' ? 'active' : ''}"><span class="nav-icon">🏆</span>Top</a>
+      <a href="/search" class="${page === 'search' ? 'active' : ''}"><span class="nav-icon">🔎</span>Ricerca</a>
+      <div class="nav-label">Moderazione</div>
+      <a href="/modlogs" class="${page === 'modlogs' ? 'active' : ''}"><span class="nav-icon">📋</span>Mod Logs</a>
+      <a href="/notes" class="${page === 'notes' ? 'active' : ''}"><span class="nav-icon">📝</span>Note</a>
+      <a href="/user-actions" class="${page === 'userActions' ? 'active' : ''}"><span class="nav-icon">🛠️</span>Gestione Utenti</a>
+      <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}"><span class="nav-icon">🔐</span>Accessi</a>
+      <div class="nav-label">Bot</div>
+      <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}"><span class="nav-icon">🎫</span>Ticket</a>
+      <a href="/commands" class="${page === 'commands' ? 'active' : ''}"><span class="nav-icon">🔧</span>Comandi</a>
+      <a href="/config" class="${page === 'config' ? 'active' : ''}"><span class="nav-icon">⚙️</span>Config</a>
+      <a href="/reminders" class="${page === 'reminders' ? 'active' : ''}"><span class="nav-icon">⏰</span>Reminder</a>
+      <a href="/messages" class="${page === 'messages' ? 'active' : ''}"><span class="nav-icon">✉️</span>Messaggi</a>
+      <a href="/lobbies" class="${page === 'lobbies' ? 'active' : ''}"><span class="nav-icon">🗺️</span>Lobby</a>
+    </nav>
+    <div class="sidebar-footer">Tommy Utilities <span aria-hidden="true">·</span> Discord bot</div>
+  </aside>
+  <button class="sidebar-overlay" id="sidebar-overlay" type="button" aria-label="Chiudi navigazione"></button>
+  <main class="app-main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button class="menu-toggle" id="menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar-nav" aria-label="Apri navigazione">☰</button>
+        <div class="page-heading"><p class="eyebrow">CONTROL PANEL</p><h1>${escapeHtml(pageTitle)}</h1></div>
+      </div>
+      <div class="topbar-actions">
+        <div class="search-box">
+          <form action="/search" method="get">
+            <input type="text" name="q" placeholder="Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
+            <button type="submit" class="secondary">Cerca</button>
+          </form>
+        </div>
+        <div class="user">
+          <img src="${avatar}" alt="">
+          <span class="user-name">${name}</span>
+          <div class="user-actions">
+            <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
+            <a href="/auth/logout"><button class="danger small">Logout</button></a>
+          </div>
+        </div>
+      </div>
+    </header>
+    <div class="content-area">${body}</div>
+  </main>
+  <script>
+    (function () {
+      const toggle = document.getElementById('menu-toggle');
+      const overlay = document.getElementById('sidebar-overlay');
+      const nav = document.getElementById('sidebar-nav');
+      function setSidebarOpen(open) {
+        document.body.classList.toggle('sidebar-open', open);
+        toggle.setAttribute('aria-expanded', String(open));
+        toggle.setAttribute('aria-label', open ? 'Chiudi navigazione' : 'Apri navigazione');
+      }
+      toggle.addEventListener('click', () => setSidebarOpen(toggle.getAttribute('aria-expanded') !== 'true'));
+      overlay.addEventListener('click', () => setSidebarOpen(false));
+      nav.addEventListener('click', event => {
+        if (event.target.closest('a')) setSidebarOpen(false);
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') setSidebarOpen(false);
+      });
+      window.addEventListener('resize', () => {
+        if (window.innerWidth > 760) setSidebarOpen(false);
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
