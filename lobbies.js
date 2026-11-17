@@ -2,6 +2,34 @@
 const { ChannelType, PermissionsBitField, EmbedBuilder, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { z } = require('zod');
 
+function embedTextPayload(payload, title = 'Risposta') {
+  const data = typeof payload === 'string' ? { content: payload } : payload;
+  if (!data || typeof data.content !== 'string' || data.embeds?.length) return data;
+
+  const { content, ...options } = data;
+  const failed = content.startsWith('❌');
+  const succeeded = content.startsWith('✅');
+  const canMentionUsers = !options.allowedMentions || options.allowedMentions.parse?.includes('users');
+  const canMentionRoles = !options.allowedMentions || options.allowedMentions.parse?.includes('roles');
+  const canMentionEveryone = !options.allowedMentions || options.allowedMentions.parse?.includes('everyone');
+  const mentions = content.match(/<@!?(\d{17,20})>|<@&\d{17,20}>|@everyone|@here/g) || [];
+  const mentionContent = mentions.filter(mention =>
+    mention.startsWith('@') ? canMentionEveryone
+      : mention.startsWith('<@&') ? canMentionRoles
+        : canMentionUsers
+  ).join(' ');
+
+  return {
+    ...options,
+    ...(mentionContent ? { content: mentionContent } : {}),
+    embeds: [new EmbedBuilder()
+      .setTitle(`${failed ? '❌' : succeeded ? '✅' : 'ℹ️'} ${title}`)
+      .setDescription(content.slice(0, 4096) || 'Operazione completata.')
+      .setColor(failed ? 0xFF0000 : succeeded ? 0x00FF00 : 0x0099FF)
+      .setTimestamp()]
+  };
+}
+
 const LOBBY_PREFIX = 'lobby-';
 const RECENT_CHAT_MS = 10 * 60 * 1000;
 const VOICE_LABEL = { free: 'Libera', live: 'In corso', full: 'Vocale pieno', chat: 'Chat attiva' };
@@ -328,14 +356,14 @@ async function runLobbyCommand({ guild, member, sub, name, targetUser, map, code
         new ButtonBuilder().setCustomId(`host_ingame_${category.id}`).setLabel('Host in game').setStyle(ButtonStyle.Secondary)
       )]
     });
-    await unregChannel.send({
+    await unregChannel.send(embedTextPayload({
       content: 'Clicca **Unregister** per disiscriverti dalla lobby.',
       components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`unregister_lobby_${category.id}`).setLabel('Unregister').setStyle(ButtonStyle.Danger))]
-    });
-    await fillsChannel.send({
+    }, 'Disiscrizione'));
+    await fillsChannel.send(embedTextPayload({
       content: 'Qui puoi offrirti come rimpiazzo per la lobby.',
       components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`fill_lobby_${category.id}`).setLabel('Offriti come rimpiazzo').setStyle(ButtonStyle.Primary))]
-    });
+    }, 'Rimpiazzi'));
 
     return reply({ content: `✅ Lobby **${clean}** creata.\nRegistrazione: <#${regChannel.id}>` });
   }
@@ -445,11 +473,11 @@ async function handleLobbyCommand(interaction, db, log) {
       code: interaction.options.getString('codice'),
       db,
       log,
-      reply: (payload) => interaction.editReply(payload)
+      reply: (payload) => interaction.editReply(embedTextPayload(payload))
     });
   } catch (e) {
     log.err('lobby command', e);
-    return interaction.editReply({ content: '❌ Errore durante l\'esecuzione del comando.' });
+    return interaction.editReply(embedTextPayload('❌ Errore durante l\'esecuzione del comando.'));
   }
 }
 
@@ -466,7 +494,7 @@ const LOBBY_HELP = [
 ].join('\n');
 
 async function handleLobbyPrefix(message, args, db, log) {
-  const reply = (payload) => message.channel.send(payload);
+  const reply = (payload) => message.channel.send(embedTextPayload(payload));
   const sub = (args.shift() || '').toLowerCase();
   if (!sub || sub === 'help') return reply({ content: LOBBY_HELP });
 
@@ -535,18 +563,19 @@ async function handleLobbyButton(interaction, db, log) {
 
   const guild = interaction.guild;
   const member = interaction.member;
+  const reply = (payload) => interaction.reply(embedTextPayload(payload));
 
   try {
     if (action === 'register') {
       const category = guild.channels.cache.get(lobbyId);
-      if (!category) return interaction.reply({ content: '❌ Lobby non trovata.', ephemeral: true });
+      if (!category) return reply({ content: '❌ Lobby non trovata.', ephemeral: true });
 
       const meta = readMeta(db, category.id);
       const count = listRegistrations(db, category.id).length;
 
-      if (!meta.regOpen) return interaction.reply({ content: '❌ Iscrizioni chiuse.', ephemeral: true });
-      if (meta.slots > 0 && count >= meta.slots) return interaction.reply({ content: '❌ Lobby piena.', ephemeral: true });
-      if (hasRegistration(db, category.id, member.id)) return interaction.reply({ content: '❌ Sei già iscritto.', ephemeral: true });
+      if (!meta.regOpen) return reply({ content: '❌ Iscrizioni chiuse.', ephemeral: true });
+      if (meta.slots > 0 && count >= meta.slots) return reply({ content: '❌ Lobby piena.', ephemeral: true });
+      if (hasRegistration(db, category.id, member.id)) return reply({ content: '❌ Sei già iscritto.', ephemeral: true });
 
       addRegistration(db, category.id, member.id, member.displayName);
 
@@ -557,14 +586,14 @@ async function handleLobbyButton(interaction, db, log) {
       ].filter(Boolean);
 
       await applyAccess(guild, category, member, accessLevel(meta, member.id, true), 'Iscrizione da bottone', log, channelsToGive);
-      return interaction.reply({ content: '✅ Iscrizione avvenuta con successo!', ephemeral: true });
+      return reply({ content: '✅ Iscrizione avvenuta con successo!', ephemeral: true });
     }
 
     if (action === 'unregister') {
       const category = guild.channels.cache.get(lobbyId);
-      if (!category) return interaction.reply({ content: '❌ Lobby non trovata.', ephemeral: true });
+      if (!category) return reply({ content: '❌ Lobby non trovata.', ephemeral: true });
 
-      if (!removeRegistration(db, category.id, member.id)) return interaction.reply({ content: '❌ Non eri iscritto.', ephemeral: true });
+      if (!removeRegistration(db, category.id, member.id)) return reply({ content: '❌ Non eri iscritto.', ephemeral: true });
 
       const meta = readMeta(db, category.id);
       const channelsToRemove = [
@@ -574,30 +603,30 @@ async function handleLobbyButton(interaction, db, log) {
       ].filter(Boolean);
 
       await applyAccess(guild, category, member, accessLevel(meta, member.id, false), 'Disiscrizione da bottone', log, channelsToRemove);
-      return interaction.reply({ content: '✅ Disiscrizione avvenuta con successo!', ephemeral: true });
+      return reply({ content: '✅ Disiscrizione avvenuta con successo!', ephemeral: true });
     }
 
     if (action === 'host') {
       const category = guild.channels.cache.get(lobbyId);
-      if (!category) return interaction.reply({ content: '❌ Lobby non trovata.', ephemeral: true });
+      if (!category) return reply({ content: '❌ Lobby non trovata.', ephemeral: true });
 
       const meta = readMeta(db, category.id);
-      if (meta.hostId !== member.id) return interaction.reply({ content: '❌ Solo l\'host può usare questo bottone.', ephemeral: true });
+      if (meta.hostId !== member.id) return reply({ content: '❌ Solo l\'host può usare questo bottone.', ephemeral: true });
 
-      return interaction.reply({ content: '✅ Host in game! La lobby è ora in corso.', ephemeral: true });
+      return reply({ content: '✅ Host in game! La lobby è ora in corso.', ephemeral: true });
     }
 
     if (action === 'fill') {
       const category = guild.channels.cache.get(lobbyId);
-      if (!category) return interaction.reply({ content: '❌ Lobby non trovata.', ephemeral: true });
+      if (!category) return reply({ content: '❌ Lobby non trovata.', ephemeral: true });
 
-      return interaction.reply({ content: '✅ Ti sei offerto come rimpiazzo!', ephemeral: true });
+      return reply({ content: '✅ Ti sei offerto come rimpiazzo!', ephemeral: true });
     }
 
     return false;
   } catch (e) {
     log.err('lobby button', e);
-    return interaction.reply({ content: '❌ Errore durante l\'esecuzione dell\'azione.', ephemeral: true });
+    return reply({ content: '❌ Errore durante l\'esecuzione dell\'azione.', ephemeral: true });
   }
 }
 
@@ -1175,5 +1204,6 @@ module.exports = {
   handleLobbyPrefix,
   lobbyCommandBuilder,
   handleLobbyButton,
-  saveMeta
+  saveMeta,
+  embedTextPayload
 };
