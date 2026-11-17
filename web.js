@@ -1179,6 +1179,25 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
+  app.get('/api/resources', requireAuth, async (req, res) => {
+    try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const resources = [...client.guilds.cache.values()]
+        .filter(guild => allowed.has(guild.id))
+        .map(guild => ({
+          id: guild.id,
+          name: guild.name,
+          iconUrl: guild.iconURL({ size: 96 }),
+          memberCount: guild.memberCount,
+          permissions: ENV_ADMIN_IDS.includes(req.session.user.id)
+            ? DASHBOARD_FEATURES
+            : [...(req.dashboardAccess.guildPermissions.get(guild.id) || [])]
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json(resources);
+    } catch (e) { apiError(res, e, 'Impossibile caricare le risorse'); }
+  });
+
   app.get('/api/dashboard/managed-guilds', requireAuth, async (req, res) => {
     const guilds = [];
     for (const guild of client.guilds.cache.values()) {
@@ -1708,6 +1727,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   };
 
   app.get('/dashboard', requireAuth, pageHandler('dashboard'));
+  app.get('/resources', requireAuth, pageHandler('resources'));
   app.get('/modlogs', requireAuth, pageHandler('modlogs'));
   app.get('/notes', requireAuth, pageHandler('notes'));
   app.get('/tickets', requireAuth, pageHandler('tickets'));
@@ -1765,6 +1785,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   const safeQ = escapeHtml(params.q || '');
   const permissions = new Set(security.permissions || []);
   const canViewDashboard = permissions.has('overview') || permissions.has('global_blacklist');
+  const canViewResources = permissions.size > 0;
   const pageTitles = {
     dashboard: 'Dashboard',
     modlogs: 'Mod Logs',
@@ -1781,14 +1802,16 @@ function renderLayout(user, page, params = {}, security = {}) {
     userActions: 'Gestione utenti',
     reminders: 'Reminder',
     lobbies: 'Lobby',
-    permissions: 'Permessi dashboard'
+    permissions: 'Permessi dashboard',
+    resources: 'Resources'
   };
   const pageTitle = pageTitles[page] || 'Dashboard';
   const navSections = [
     { label: 'Workspace', items: [
       { href: '/dashboard', page: 'dashboard', feature: 'dashboard', icon: '◈', label: 'Dashboard' },
       { href: '/charts', page: 'charts', feature: 'analytics', icon: '📈', label: 'Grafici' },
-      { href: '/top', page: 'top', feature: 'analytics', icon: '🏆', label: 'Top' }
+      { href: '/top', page: 'top', feature: 'analytics', icon: '🏆', label: 'Top' },
+      { href: '/resources', page: 'resources', feature: 'resources', icon: '🔗', label: 'Resources' }
     ] },
     { label: 'Moderazione', items: [
       { href: '/search', page: 'search', feature: 'moderation', icon: '🔎', label: 'Ricerca' },
@@ -1811,6 +1834,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   ];
   const navItems = navSections.flatMap(section => section.items).filter(item =>
     item.feature === 'manager' ? security.isDashboardManager :
+      item.feature === 'resources' ? canViewResources :
       item.feature === 'dashboard' ? canViewDashboard : permissions.has(item.feature)
   );
   const sidebarHome = navItems[0]?.href || '/dashboard';
@@ -1824,6 +1848,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   const sidebarNavigation = navSections.map(section => {
     const items = section.items.filter(item =>
       item.feature === 'manager' ? security.isDashboardManager :
+        item.feature === 'resources' ? canViewResources :
         item.feature === 'dashboard' ? canViewDashboard : permissions.has(item.feature)
     );
     if (!items.length) return '';
@@ -1835,6 +1860,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   // Ogni pagina viene generata solo quando è quella richiesta
   const renderers = {
     dashboard: () => renderDashboardContent(security),
+    resources: () => renderResourcesContent(),
     modlogs: () => renderModlogsContent(),
     notes: () => renderNotesContent(),
     tickets: () => renderTicketsContent(),
@@ -1967,6 +1993,30 @@ function renderLayout(user, page, params = {}, security = {}) {
   .content-area { width: 100%; min-width: 0; animation: enter .32s ease both; }
   @keyframes enter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 14px; width: 100%; margin: 0 0 24px; }
+  .resources-hero { margin-bottom: 30px; }
+  .resources-hero .eyebrow { color: var(--accent-bright); font-size: 10px; font-weight: 700; letter-spacing: .16em; }
+  .resources-hero h2 { margin: 4px 0 6px; font-size: clamp(32px, 5vw, 52px); line-height: 1.08; letter-spacing: -.045em; }
+  .resources-hero p:last-child { color: var(--muted); font-size: 14px; }
+  .resources-section-heading { margin: 0 0 16px; }
+  .resources-section-heading h2 { margin: 0 0 3px; font-size: 19px; }
+  .resources-section-heading p { color: var(--muted); font-size: 12px; }
+  .resources-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+  .resource-card { display: flex; min-height: 250px; flex-direction: column; padding: 21px; }
+  .resource-card-header { display: flex; align-items: center; gap: 13px; margin-bottom: 15px; }
+  .resource-card-icon { display: grid; width: 48px; height: 48px; flex: 0 0 48px; place-items: center; overflow: hidden; border: 1px solid #37333a; border-radius: 50%; background: #191a20; color: var(--accent-bright); font-size: 18px; font-weight: 700; }
+  .resource-card-icon img { width: 100%; height: 100%; object-fit: cover; }
+  .resource-card-type { color: #888b98; font-size: 9px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+  .resource-card h3 { margin-top: 2px; font-size: 17px; line-height: 1.3; overflow-wrap: anywhere; }
+  .resource-card-meta { display: flex; gap: 15px; margin: 0 0 12px; color: #b6b8c2; font-size: 11px; }
+  .resource-card-meta strong { color: #f0c66f; }
+  .resource-card-copy { min-height: 40px; margin-bottom: 14px; color: #999ca8; font-size: 12px; }
+  .resource-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 19px; }
+  .resource-tag { padding: 4px 9px; border: 1px solid #30313a; border-radius: 999px; color: #b5b7c1; font-size: 10px; }
+  .resource-card-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; }
+  .resource-card-actions .resource-server-link { padding: 7px 11px; border: 1px solid #343641; border-radius: 9px; background: #1c1e29; color: #d7d9e3; font-size: 11px; font-weight: 650; transition: background .16s ease, border-color .16s ease; }
+  .resource-card-actions .resource-server-link:hover { border-color: #51442e; background: #262630; }
+  .resource-card-actions .resource-link { color: #e6bf72; font-size: 11px; font-weight: 700; }
+  .resources-empty { color: var(--muted); text-align: center; }
   .card, .section { border: 1px solid var(--border); background: linear-gradient(145deg, rgba(22, 24, 34, .96), rgba(15, 17, 24, .98)); box-shadow: 0 12px 35px rgba(0, 0, 0, .13); }
   .card { position: relative; min-height: 112px; overflow: hidden; padding: 18px 19px; border-radius: 15px; transition: transform .2s ease, border-color .2s ease, background .2s ease; }
   .card::after { position: absolute; right: -26px; bottom: -48px; width: 104px; height: 104px; border-radius: 50%; background: rgba(210, 161, 73, .07); content: ""; filter: blur(2px); }
@@ -2381,6 +2431,89 @@ function renderDashboardContent(security = {}) {
     setInterval(loadStatus, 15000);
   }
   if (${canManageGlobalBlacklist}) loadBlacklist();
+  </script>`;
+}
+
+function renderResourcesContent() {
+  return `
+  <section class="resources-hero">
+    <p class="eyebrow">TOMMY UTILITIES · RISORSE</p>
+    <h2>Resources</h2>
+    <p>I server Discord collegati al bot e le aree a cui hai accesso.</p>
+  </section>
+  <section>
+    <div class="resources-section-heading">
+      <h2>Server Discord</h2>
+      <p>Server disponibili in base ai permessi assegnati.</p>
+    </div>
+    <div class="grid resources-grid" id="resources-list" aria-live="polite">
+      <div class="section resources-empty">Caricamento server...</div>
+    </div>
+  </section>
+  <script>
+  function resourceEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  const resourceLabels = {
+    overview: 'Dashboard', moderation: 'Moderazione', global_blacklist: 'Blacklist',
+    tickets: 'Ticket', settings: 'Configurazione', analytics: 'Analytics',
+    communications: 'Comunicazioni', lobbies: 'Lobby', audit: 'Log accessi'
+  };
+  const resourceRoutes = [
+    ['settings', '/config', 'Apri configurazione'],
+    ['tickets', '/tickets', 'Gestisci ticket'],
+    ['moderation', '/modlogs', 'Apri moderazione'],
+    ['analytics', '/charts', 'Apri analytics'],
+    ['communications', '/messages', 'Apri comunicazioni'],
+    ['lobbies', '/lobbies', 'Apri lobby'],
+    ['audit', '/access-logs', 'Apri log accessi'],
+    ['overview', '/dashboard', 'Apri dashboard'],
+    ['global_blacklist', '/dashboard', 'Apri blacklist']
+  ];
+  async function loadResources() {
+    const root = document.getElementById('resources-list');
+    try {
+      const response = await apiFetch('/api/resources');
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        root.innerHTML = '<div class="section resources-empty">' + resourceEsc(data.error || 'Impossibile caricare le risorse.') + '</div>';
+        return;
+      }
+      if (!data.length) {
+        root.innerHTML = '<div class="section resources-empty">Nessun server Discord visibile con i permessi attuali.</div>';
+        return;
+      }
+      root.innerHTML = data.map(guild => {
+        const permissions = Array.isArray(guild.permissions) ? guild.permissions : [];
+        const tags = permissions.map(permission => resourceLabels[permission]).filter(Boolean);
+        const destination = resourceRoutes.find(([feature]) => permissions.includes(feature));
+        const icon = guild.iconUrl
+          ? '<img src="' + resourceEsc(guild.iconUrl) + '" alt="" loading="lazy">'
+          : '<span aria-hidden="true">' + resourceEsc((guild.name || 'D').slice(0, 1).toUpperCase()) + '</span>';
+        const members = Number.isFinite(guild.memberCount)
+          ? '<span><strong>' + guild.memberCount.toLocaleString('it-IT') + '</strong> membri</span>'
+          : '';
+        const tagsMarkup = tags.length
+          ? tags.map(label => '<span class="resource-tag">' + resourceEsc(label) + '</span>').join('')
+          : '<span class="resource-tag">Resources</span>';
+        const dashboardLink = destination
+          ? '<a class="resource-link" href="' + destination[1] + '">' + destination[2] + ' →</a>'
+          : '';
+        return '<article class="card resource-card">' +
+          '<div class="resource-card-header"><div class="resource-card-icon">' + icon + '</div>' +
+          '<div><div class="resource-card-type">SERVER DISCORD</div><h3>' + resourceEsc(guild.name) + '</h3></div></div>' +
+          '<div class="resource-card-meta">' + members + '</div>' +
+          '<p class="resource-card-copy">Server collegato al bot. Le sezioni disponibili rispettano i permessi del tuo ruolo.</p>' +
+          '<div class="resource-tags">' + tagsMarkup + '</div>' +
+          '<div class="resource-card-actions"><a class="resource-server-link" href="https://discord.com/channels/' + encodeURIComponent(guild.id) + '" target="_blank" rel="noopener noreferrer">Apri server</a>' + dashboardLink + '</div>' +
+          '</article>';
+      }).join('');
+    } catch (error) {
+      console.error('[resources] caricamento non riuscito', error);
+      root.innerHTML = '<div class="section resources-empty">Errore durante il caricamento delle risorse.</div>';
+    }
+  }
+  loadResources();
   </script>`;
 }
 
