@@ -2141,6 +2141,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   .permission-count { color: #c4a968 !important; white-space: nowrap; }
   .permission-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 11px; }
   .permission-toolbar button { padding: 7px 10px; }
+  .permission-toolbar .permission-reload { margin-left: auto; }
   .permission-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
   .permission-option { display: flex; align-items: flex-start; gap: 11px; min-height: 76px; padding: 13px; border: 1px solid #2a2d37; border-radius: 10px; background: #101117; color: #d5d7df; cursor: pointer; transition: background .16s ease, border-color .16s ease, transform .16s ease; }
   .permission-option:hover { transform: translateY(-1px); border-color: #51442e; background: #15161d; }
@@ -2178,7 +2179,6 @@ function renderLayout(user, page, params = {}, security = {}) {
     .charts-grid { grid-template-columns: 1fr; }
     .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .permissions-controls { grid-template-columns: 1fr 1fr; }
-    .permissions-controls button { grid-column: 1 / -1; }
   }
   @media (max-width: 480px) {
     .app-main { padding-right: 12px; padding-left: 12px; }
@@ -2201,7 +2201,12 @@ function renderLayout(user, page, params = {}, security = {}) {
     .dashboard-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .status-panel-heading { align-items: flex-start; flex-direction: column; }
     .status-grid, .permission-list, .permissions-controls { grid-template-columns: 1fr; }
-    .permissions-controls button { grid-column: auto; }
+    .permissions-hero { flex-direction: column; }
+    .permissions-badge { align-self: flex-start; }
+    .permissions-savebar { align-items: stretch; flex-direction: column; }
+    .permissions-save { width: 100%; }
+    .permissions-editor-heading { align-items: flex-start; flex-direction: column; }
+    .permission-toolbar .permission-reload { margin-left: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
@@ -2584,7 +2589,7 @@ function renderPermissionsContent() {
     ['audit', 'Log degli accessi', 'Cronologia degli accessi alla dashboard e relativi dettagli.']
   ];
   const options = features.map(([key, label, description]) =>
-    `<label class="permission-option"><input class="dashboard-permission" type="checkbox" value="${key}" aria-describedby="permission-description-${key}"><span><strong>${label}</strong><small id="permission-description-${key}">${description}</small></span></label>`
+    `<label class="permission-option"><input class="dashboard-permission" type="checkbox" value="${key}" aria-describedby="permission-description-${key}" disabled><span><strong>${label}</strong><small id="permission-description-${key}">${description}</small></span></label>`
   ).join('');
   return `
   <section class="section">
@@ -2607,6 +2612,8 @@ function renderPermissionsContent() {
       <div class="permission-toolbar">
         <button class="secondary small" id="permission-select-all" type="button" disabled>Seleziona tutte</button>
         <button class="secondary small" id="permission-clear-all" type="button" disabled>Rimuovi tutte</button>
+        <button class="secondary small" id="permission-reset" type="button" disabled>Ripristina</button>
+        <button class="secondary small permission-reload" id="permission-reload" type="button" disabled>Ricarica dati</button>
       </div>
       <div id="permission-list" class="permission-list">${options}</div>
     </div>
@@ -2625,6 +2632,9 @@ function renderPermissionsContent() {
   let activeGuildId = '';
   let activeRoleId = '';
   let permissionSaveInProgress = false;
+  let permissionLoadInProgress = false;
+  let permissionLoadSequence = 0;
+  const permissionFeatureCount = ${features.length};
   const permissionInputs = () => Array.from(document.querySelectorAll('.dashboard-permission'));
   function selectedPermissionValues() {
     return permissionInputs().filter(input => input.checked).map(input => input.value).sort();
@@ -2639,15 +2649,18 @@ function renderPermissionsContent() {
   }
   function updatePermissionEditor() {
     const count = permissionInputs().filter(input => input.checked).length;
-    document.getElementById('permission-count').textContent = count + ' di ${features.length} aree selezionate';
-    const canEdit = permissionRoles.length > 0;
-    document.getElementById('permission-guild').disabled = permissionSaveInProgress || !permissionGuilds.length;
-    document.getElementById('permission-role').disabled = permissionSaveInProgress || !canEdit;
-    permissionInputs().forEach(input => { input.disabled = permissionSaveInProgress || !canEdit; });
-    document.getElementById('permission-select-all').disabled = !canEdit || permissionSaveInProgress;
-    document.getElementById('permission-clear-all').disabled = !canEdit || permissionSaveInProgress;
-    document.getElementById('permission-save').disabled = !canEdit || permissionSaveInProgress || !permissionIsDirty();
+    const canEdit = permissionRoles.length > 0 && !permissionLoadInProgress;
+    const locked = permissionSaveInProgress || permissionLoadInProgress;
     const message = document.getElementById('permission-message');
+    document.getElementById('permission-count').textContent = count + ' di ' + permissionFeatureCount + ' aree selezionate';
+    document.getElementById('permission-guild').disabled = locked || !permissionGuilds.length;
+    document.getElementById('permission-role').disabled = locked || !permissionRoles.length;
+    permissionInputs().forEach(input => { input.disabled = !canEdit || permissionSaveInProgress; });
+    document.getElementById('permission-select-all').disabled = !canEdit || count === permissionFeatureCount || permissionSaveInProgress;
+    document.getElementById('permission-clear-all').disabled = !canEdit || count === 0 || permissionSaveInProgress;
+    document.getElementById('permission-reset').disabled = !canEdit || !permissionIsDirty() || permissionSaveInProgress;
+    document.getElementById('permission-reload').disabled = locked || (!permissionGuilds.length && !message.classList.contains('error'));
+    document.getElementById('permission-save').disabled = !canEdit || !permissionIsDirty() || permissionSaveInProgress;
     if (!permissionSaveInProgress && permissionIsDirty() && !message.classList.contains('error')) {
       permissionMessage('Modifiche non salvate', 'pending');
     }
@@ -2659,6 +2672,9 @@ function renderPermissionsContent() {
   }
   async function loadPermissionGuilds() {
     const select = document.getElementById('permission-guild');
+    let guildListLoaded = false;
+    permissionLoadInProgress = true;
+    updatePermissionEditor();
     try {
       const res = await apiFetch('/api/dashboard/managed-guilds');
       const data = await res.json().catch(() => []);
@@ -2673,18 +2689,26 @@ function renderPermissionsContent() {
         permissionMessage('Non hai accesso amministrativo a nessun server.', 'error');
         return;
       }
-      select.disabled = false;
-      await loadPermissionRoles();
+      guildListLoaded = true;
     } catch (error) {
       console.error('[permissions] caricamento server non riuscito', error);
       permissionMessage('Errore durante il caricamento dei server.', 'error');
+    } finally {
+      permissionLoadInProgress = false;
+      updatePermissionEditor();
+    }
+    if (guildListLoaded) {
+      const guildSelect = document.getElementById('permission-guild');
+      guildSelect.value = permissionGuilds.some(guild => guild.id === activeGuildId) ? activeGuildId : permissionGuilds[0].id;
+      await loadPermissionRoles(activeRoleId);
     }
   }
-  async function loadPermissionRoles() {
+  async function loadPermissionRoles(preferredRoleId) {
     const guildId = document.getElementById('permission-guild').value;
     const roleSelect = document.getElementById('permission-role');
+    const requestId = ++permissionLoadSequence;
+    permissionLoadInProgress = true;
     permissionMessage('Caricamento ruoli...', 'pending');
-    roleSelect.disabled = true;
     permissionRoles = [];
     activeGuildId = guildId;
     activeRoleId = '';
@@ -2695,17 +2719,19 @@ function renderPermissionsContent() {
     try {
       const res = await apiFetch('/api/dashboard/role-permissions/' + encodeURIComponent(guildId));
       const data = await res.json().catch(() => []);
+      if (requestId !== permissionLoadSequence) return;
       if (!res.ok) {
         roleSelect.innerHTML = '<option value="">Ruoli non disponibili</option>';
         permissionMessage(data.error || 'Impossibile caricare i ruoli.', 'error');
-        updatePermissionEditor();
         return;
       }
+      if (!Array.isArray(data)) throw new Error('Risposta ruoli non valida');
       permissionRoles = data;
       roleSelect.innerHTML = permissionRoles.map(role => '<option value="' + permissionEsc(role.id) + '">' + permissionEsc(role.name) + '</option>').join('');
-      roleSelect.disabled = !permissionRoles.length;
       if (permissionRoles.length) {
-        activeRoleId = permissionRoles[0].id;
+        const selectedRole = permissionRoles.some(role => role.id === preferredRoleId) ? preferredRoleId : permissionRoles[0].id;
+        roleSelect.value = selectedRole;
+        activeRoleId = selectedRole;
         showRolePermissions();
       } else {
         roleSelect.innerHTML = '<option value="">Nessun ruolo configurabile</option>';
@@ -2715,9 +2741,15 @@ function renderPermissionsContent() {
         permissionMessage('Nessun ruolo configurabile in questo server.', '');
       }
     } catch (error) {
+      if (requestId !== permissionLoadSequence) return;
       console.error('[permissions] caricamento ruoli non riuscito', error);
       roleSelect.innerHTML = '<option value="">Errore caricamento ruoli</option>';
       permissionMessage('Errore durante il caricamento dei ruoli.', 'error');
+    } finally {
+      if (requestId === permissionLoadSequence) {
+        permissionLoadInProgress = false;
+        updatePermissionEditor();
+      }
     }
   }
   function showRolePermissions() {
@@ -2746,10 +2778,23 @@ function renderPermissionsContent() {
     }
     await loadPermissionRoles();
   }
+  function resetPermissionChanges() {
+    const saved = new Set(JSON.parse(savedPermissionValues));
+    permissionInputs().forEach(input => { input.checked = saved.has(input.value); });
+    permissionMessage('Modifiche ripristinate.', 'success');
+    updatePermissionEditor();
+  }
+  async function reloadPermissionData() {
+    if (!canDiscardPermissionChanges()) return;
+    await loadPermissionGuilds();
+  }
   async function saveRolePermissions() {
+    if (permissionSaveInProgress || permissionLoadInProgress || !permissionIsDirty() || !permissionRoles.length) return;
     const guildId = document.getElementById('permission-guild').value;
     const roleId = document.getElementById('permission-role').value;
     const permissions = selectedPermissionValues();
+    if (!roleId) return;
+    if (!permissions.length && !confirm('Rimuovere tutti i permessi di questo ruolo? Il ruolo perderà l’accesso alla dashboard.')) return;
     const button = document.getElementById('permission-save');
     permissionSaveInProgress = true;
     button.textContent = 'Salvataggio...';
@@ -2787,6 +2832,8 @@ function renderPermissionsContent() {
     permissionInputs().forEach(input => { input.checked = false; });
     updatePermissionEditor();
   });
+  document.getElementById('permission-reset').addEventListener('click', resetPermissionChanges);
+  document.getElementById('permission-reload').addEventListener('click', reloadPermissionData);
   permissionInputs().forEach(input => input.addEventListener('change', () => {
     if (document.getElementById('permission-message').classList.contains('error')) {
       permissionMessage('Modifiche non salvate', 'pending');
