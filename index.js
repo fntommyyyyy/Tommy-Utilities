@@ -1533,12 +1533,28 @@ const CommandLogic = {
         reason: `Invite da ${executor.user ? executor.user.tag : executor.username} per ${targetUser.username}`
       });
       const executorName = executor.user ? executor.user.tag : executor.username;
-      const dmMessage = `${executorName} ti ha inviato un invito per il server **${guild.name}**\n${invite.url}\nValido per 1 utilizzo, scade tra 60 minuti.`;
+      const inviteMessage = {
+        embeds: [EmbedManager.createEmbed({
+          title: 'Invito al server',
+          description: `**${executorName}** ti ha invitato a **${guild.name}**.\n\nValido per 1 utilizzo e in scadenza tra 60 minuti.`,
+          color: 0x5865F2,
+          fields: [{ name: 'Link invito', value: `[Apri invito](${invite.url})` }],
+          timestamp: true
+        })],
+        components: [
+          new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setLabel('Entra nel server')
+              .setStyle(ButtonStyle.Link)
+              .setURL(invite.url)
+          )
+        ]
+      };
       try {
-        await targetUser.send(dmMessage);
+        await targetUser.send(inviteMessage);
         return replyMethod({ success: true, message: `✅ Invito inviato a ${targetUser.username}!` });
       } catch {
-        await channel.send(`${targetUser}\n${executorName} ti ha inviato un invito per il server ${guild.name}\n${invite.url}\nValido per 1 utilizzo, scade tra 60 minuti.`);
+        await channel.send({ content: `${targetUser}`, ...inviteMessage });
         return replyMethod({ success: true, message: `⚠️ DM chiusi, invito postato in ${channel}` });
       }
     } catch (error) {
