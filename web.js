@@ -6,6 +6,7 @@ const cookieParser = require('cookie-parser');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const {
   EmbedBuilder,
@@ -46,55 +47,119 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     .filter(Boolean);
   const BLACKLIST_ADMIN_SERVERS = (process.env.BLACKLIST_ADMIN_SERVERS || '').split(',').map(s => s.trim()).filter(Boolean);
   const DASHBOARD_ROLES = ['Senior Admin'];
+  const DASHBOARD_FEATURES = [
+    'overview', 'moderation', 'global_blacklist', 'tickets', 'settings',
+    'analytics', 'communications', 'lobbies', 'audit'
+  ];
 
   const AUTH_CACHE_TTL = 60 * 1000;
   const authCache = new Map();
 
-  async function isAuthorizedByRole(userId) {
+  async function getDashboardAccess(userId) {
     const now = Date.now();
     const cached = authCache.get(userId);
-    if (cached && cached.expires > now) return cached.authorized;
+    if (cached && cached.expires > now) return cached;
 
-    let authorized = ENV_ADMIN_IDS.includes(userId);
-    if (!authorized) {
-      try {
-        for (const guild of client.guilds.cache.values()) {
-          const member = await guild.members.fetch(userId).catch(() => null);
-          if (!member) continue;
-          if (member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name))) { authorized = true; break; }
-        }
-      } catch (err) { log.err('isAuthorizedByRole', err); }
+    const isEnvAdministrator = ENV_ADMIN_IDS.includes(userId);
+    const permissions = new Set(isEnvAdministrator ? DASHBOARD_FEATURES : []);
+    const guildPermissions = new Map();
+    let manager = isEnvAdministrator;
+    if (isEnvAdministrator) {
+      const access = { authorized: true, manager: true, permissions, guildPermissions, expires: now + AUTH_CACHE_TTL };
+      authCache.set(userId, access);
+      return access;
     }
-    authCache.set(userId, { authorized, expires: now + AUTH_CACHE_TTL });
-    return authorized;
+
+    for (const guild of client.guilds.cache.values()) {
+      const member = await guild.members.fetch(userId).catch(err => {
+        log.err('dashboard access member lookup', err);
+        return null;
+      });
+      if (!member) continue;
+
+      const granted = new Set();
+      if (member.roles.cache.some(role => DASHBOARD_ROLES.includes(role.name))) {
+        manager = true;
+        DASHBOARD_FEATURES.forEach(feature => granted.add(feature));
+      } else {
+        for (const grant of storage.getDashboardRolePermissions(guild.id)) {
+          if (!member.roles.cache.has(grant.role_id)) continue;
+          for (const feature of grant.permissions) {
+            if (DASHBOARD_FEATURES.includes(feature)) granted.add(feature);
+          }
+        }
+      }
+
+      if (granted.size) {
+        guildPermissions.set(guild.id, granted);
+        granted.forEach(feature => permissions.add(feature));
+      }
+    }
+
+    const access = {
+      authorized: isEnvAdministrator || permissions.size > 0,
+      manager,
+      permissions,
+      guildPermissions,
+      expires: now + AUTH_CACHE_TTL
+    };
+    authCache.set(userId, access);
+    return access;
   }
 
   // ==================== AUTORIZZAZIONE PER SERVER ====================
-  const guildAccessCache = new Map();
-
-  async function canManageGuild(userId, guild) {
+  async function canManageGuild(userId, guild, feature) {
     if (ENV_ADMIN_IDS.includes(userId)) return true;
-    const key = `${userId}:${guild.id}`;
-    const cached = guildAccessCache.get(key);
-    if (cached && cached.expires > Date.now()) return cached.ok;
-    const member = await guild.members.fetch(userId).catch(() => null);
-    const ok = !!member && member.roles.cache.some(r => DASHBOARD_ROLES.includes(r.name));
-    guildAccessCache.set(key, { ok, expires: Date.now() + AUTH_CACHE_TTL });
-    return ok;
+    const access = await getDashboardAccess(userId);
+    const granted = access.guildPermissions.get(guild.id);
+    return !!feature && !!granted && granted.has(feature);
   }
 
-  async function allowedGuildIds(userId) {
+  async function canManageDashboardRolesInGuild(userId, guild) {
+    if (ENV_ADMIN_IDS.includes(userId)) return true;
+    const member = await guild.members.fetch(userId).catch(err => {
+      log.err('dashboard role manager lookup', err);
+      return null;
+    });
+    return !!member && member.roles.cache.some(role => DASHBOARD_ROLES.includes(role.name));
+  }
+
+  async function allowedGuildIds(userId, feature) {
     const ids = new Set();
+    if (ENV_ADMIN_IDS.includes(userId)) {
+      for (const guild of client.guilds.cache.values()) ids.add(guild.id);
+      return ids;
+    }
+    const access = await getDashboardAccess(userId);
     for (const g of client.guilds.cache.values()) {
-      if (await canManageGuild(userId, g)) ids.add(g.id);
+      const granted = access.guildPermissions.get(g.id);
+      if (granted && (feature ? granted.has(feature) : granted.size > 0)) ids.add(g.id);
     }
     return ids;
+  }
+
+  function dashboardLandingPath(access) {
+    const routes = [
+      ['overview', '/dashboard'],
+      ['moderation', '/modlogs'],
+      ['tickets', '/tickets'],
+      ['settings', '/config'],
+      ['analytics', '/charts'],
+      ['communications', '/messages'],
+      ['lobbies', '/lobbies'],
+      ['audit', '/access-logs'],
+      ['global_blacklist', '/dashboard']
+    ];
+    const first = routes.find(([feature]) => access.permissions.has(feature));
+    return first ? first[1] : '/dashboard';
   }
 
   async function assertGuildAccess(req, res, guildId) {
     const guild = client.guilds.cache.get(guildId);
     if (!guild) { res.status(404).json({ error: 'Server non trovato' }); return false; }
-    if (!(await canManageGuild(req.session.user.id, guild))) {
+    const feature = requiredDashboardAccess(req.path);
+    if (!feature || feature === 'dashboard' || feature === 'manager' ||
+        !(await canManageGuild(req.session.user.id, guild, feature))) {
       res.status(403).json({ error: 'Non hai i permessi su questo server' });
       return false;
     }
@@ -214,10 +279,12 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   async function canUseGlobalBlacklist(userId) {
     if (ENV_ADMIN_IDS.includes(userId)) return true;
+    const access = await getDashboardAccess(userId);
+    if (!access.manager && !access.permissions.has('global_blacklist')) return false;
     if (!BLACKLIST_ADMIN_SERVERS.length) return true;
     for (const id of BLACKLIST_ADMIN_SERVERS) {
       const guild = client.guilds.cache.get(id);
-      if (guild && await canManageGuild(userId, guild)) return true;
+      if (guild && await canManageGuild(userId, guild, 'global_blacklist')) return true;
     }
     return false;
   }
@@ -306,7 +373,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     const ch = await client.channels.fetch(channelId).catch(() => null);
     if (!ch || !ch.guild) { res.status(404).json({ error: 'Canale non trovato' }); return null; }
     if (!ch.name?.startsWith('ticket-')) { res.status(400).json({ error: 'Non è un canale ticket' }); return null; }
-    if (!(await canManageGuild(req.session.user.id, ch.guild))) {
+    if (!(await canManageGuild(req.session.user.id, ch.guild, 'tickets'))) {
       res.status(403).json({ error: 'Non hai i permessi su questo server' });
       return null;
     }
@@ -435,6 +502,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   const schemaMessagesSend = z.object({
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
+    allowMentions: z.boolean().optional().default(true),
     embed: z.object({
       title: z.string().max(256).optional(),
       description: z.string().max(4096).optional(),
@@ -466,6 +534,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   const schemaModRole = z.object({ guildId: guildIdSchema, userId: userIdSchema, roleId: roleIdSchema, action: z.enum(['add', 'remove']) });
   const schemaNoteAdd = z.object({ guildId: guildIdSchema, userId: userIdSchema, content: z.string().min(2).max(1000) });
   const schemaTicketPriority = z.object({ priority: z.enum(['low', 'med', 'high', 'urgent']) });
+  const schemaDashboardRolePermissions = z.object({
+    permissions: z.array(z.enum(DASHBOARD_FEATURES)).max(DASHBOARD_FEATURES.length)
+  });
 
   function parseOrFail(schema, data, res) {
     const r = schema.safeParse(data);
@@ -483,6 +554,34 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     res.status(500).json(IS_PROD ? { error: msg } : { error: msg, detail: e?.message });
   }
 
+  function requiredDashboardAccess(pathname) {
+    if (pathname === '/dashboard') return 'dashboard';
+    if (pathname === '/permissions' || pathname === '/api/dashboard/managed-guilds' ||
+        pathname.startsWith('/api/dashboard/role-permissions/')) return 'manager';
+    const routes = [
+      ['overview', ['/api/stats', '/api/status']],
+      ['moderation', [
+        '/modlogs', '/notes', '/search', '/user', '/user-actions',
+        '/api/logs', '/api/notes', '/api/user',
+        '/api/user-lookup', '/api/user-action', '/api/mod', '/api/search',
+        '/api/export/notes', '/api/export/logs'
+      ]],
+      ['global_blacklist', ['/api/blacklist', '/api/export/blacklist']],
+      ['tickets', ['/tickets', '/api/tickets', '/api/ticketpanel']],
+      ['settings', ['/commands', '/config', '/api/commands', '/api/config', '/api/welcome']],
+      ['analytics', ['/charts', '/top', '/api/charts', '/api/top']],
+      ['communications', ['/messages', '/reminders', '/api/messages', '/api/reminders']],
+      ['lobbies', ['/lobbies', '/api/lobbies']],
+      ['audit', ['/access-logs', '/api/access-logs', '/api/export/access-logs', '/api/export/full-backup']]
+    ];
+    for (const [feature, prefixes] of routes) {
+      if (prefixes.some(prefix => pathname === prefix || pathname.startsWith(`${prefix}/`) || pathname.startsWith(`${prefix}.`))) {
+        return feature;
+      }
+    }
+    return null;
+  }
+
   async function requireAuth(req, res, next) {
     if (!req.session.user) {
       if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Non autenticato' });
@@ -492,21 +591,40 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Non autorizzato' });
       return res.status(403).send('Accesso negato.');
     }
+    let access;
     try {
-      const ok = await isAuthorizedByRole(req.session.user.id);
-      if (!ok) {
-        req.session.user.dashboardAuthorized = false;
-        if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Ruolo non più valido' });
-        return res.status(403).send('Accesso negato.');
-      }
-    } catch (e) { log.err('requireAuth recheck', e); }
+      access = await getDashboardAccess(req.session.user.id);
+    } catch (e) {
+      log.err('requireAuth permission lookup', e);
+      if (req.path.startsWith('/api/')) return res.status(503).json({ error: 'Permessi temporaneamente non disponibili' });
+      return res.status(503).send('Permessi temporaneamente non disponibili.');
+    }
+    if (!access.authorized) {
+      if (req.path.startsWith('/api/')) return res.status(403).json({ error: 'Ruolo non più valido' });
+      return res.status(403).send('Accesso negato.');
+    }
+    req.dashboardAccess = access;
+    const required = requiredDashboardAccess(req.path);
+    if (required === 'manager' && !access.manager) {
+      return req.path.startsWith('/api/')
+        ? res.status(403).json({ error: 'Solo gli amministratori dashboard possono gestire i permessi' })
+        : res.status(403).send('Solo gli amministratori dashboard possono gestire i permessi.');
+    }
+    const hasFeature = required === 'dashboard'
+      ? access.permissions.has('overview') || access.permissions.has('global_blacklist')
+      : access.permissions.has(required);
+    if (required && required !== 'manager' && !hasFeature) {
+      return req.path.startsWith('/api/')
+        ? res.status(403).json({ error: 'Non hai il permesso per questa sezione' })
+        : res.status(403).send('Non hai il permesso per questa sezione.');
+    }
     next();
   }
 
   // ==================== LOBBY (API) ====================
   mountLobbies(app, {
     client, storage, log, requireAuth, actionLimiter, parseOrFail, apiError,
-    assertGuildAccess, canManageGuild, logMod, dashMod
+    assertGuildAccess, canManageGuild: (userId, guild) => canManageGuild(userId, guild, 'lobbies'), logMod, dashMod
   });
 
   // ==================== PUBBLICI ====================
@@ -550,7 +668,8 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const userRes = await axios.get('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${tokenRes.data.access_token}` }, timeout: 10000 });
       const user = userRes.data;
 
-      if (!(await isAuthorizedByRole(user.id))) {
+      const dashboardAccess = await getDashboardAccess(user.id);
+      if (!dashboardAccess.authorized) {
         return res.status(403).send('Accesso negato.');
       }
       log.ok(`OAuth login: ${user.username} (${user.id})`);
@@ -563,7 +682,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       req.session.regenerate((err) => {
         if (err) return res.status(500).send('Errore login');
         req.session.user = { id: user.id, username: user.username, global_name: user.global_name || user.username, avatar: user.avatar, dashboardAuthorized: true };
-        req.session.save(() => res.redirect('/dashboard'));
+        req.session.save(() => res.redirect(dashboardLandingPath(dashboardAccess)));
       });
     } catch (err) {
       log.err('OAuth', err.response?.data || err.message);
@@ -591,13 +710,42 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   });
 
   // ==================== API ====================
+  app.get('/api/status', requireAuth, (req, res) => {
+    let databaseReady = false;
+    try {
+      databaseReady = storage.db.prepare('SELECT 1 AS ok').get()?.ok === 1;
+    } catch (err) {
+      log.err('api/status database check', err);
+    }
+    const botOnline = typeof client.isReady === 'function' && client.isReady();
+    const ping = Number.isFinite(client.ws?.ping) ? client.ws.ping : null;
+    const uptime = Math.max(0, Math.floor((Date.now() - botStartTime) / 1000));
+    res.json({
+      status: botOnline && databaseReady ? 'operational' : 'degraded',
+      api: true,
+      botOnline,
+      ping,
+      uptime,
+      databaseReady,
+      checkedAt: new Date().toISOString()
+    });
+  });
+
   app.get('/api/stats', requireAuth, async (req, res) => {
     try {
       const s = storage.getStats();
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const userId = req.session.user.id;
+      const canViewGlobalBlacklist = await canUseGlobalBlacklist(userId);
+      const hasModeration = req.dashboardAccess.permissions.has('moderation');
+      const hasTickets = req.dashboardAccess.permissions.has('tickets');
+      const hasCommunications = req.dashboardAccess.permissions.has('communications');
+      const moderationGuilds = hasModeration ? await allowedGuildIds(userId, 'moderation') : new Set();
+      const ticketGuilds = hasTickets ? await allowedGuildIds(userId, 'tickets') : new Set();
+      const communicationGuilds = hasCommunications ? await allowedGuildIds(userId, 'communications') : new Set();
+      const overviewGuilds = await allowedGuildIds(userId, 'overview');
       let ticketsCount = 0;
       for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
+        if (!ticketGuilds.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-')) ticketsCount++;
         }
@@ -605,15 +753,30 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       let notesCount = 0, transcriptsCount = 0, remindersCount = 0;
       try {
         const perGuild = storage.db.prepare('SELECT guild_id, COUNT(*) AS c FROM member_notes GROUP BY guild_id').all();
-        notesCount = perGuild.filter(r => allowed.has(r.guild_id)).reduce((sum, r) => sum + r.c, 0);
+        notesCount = perGuild.filter(r => moderationGuilds.has(r.guild_id)).reduce((sum, r) => sum + r.c, 0);
       } catch {}
-      try { transcriptsCount = countWhereGuilds('ticket_transcripts', allowed, req.session.user.id); } catch {}
-      try { remindersCount = countWhereGuilds('reminders', allowed, req.session.user.id); } catch {}
-      const logCount = isEnvAdmin(req.session.user.id) ? s.total : countWhereGuilds('mod_logs', allowed, req.session.user.id);
+      try { transcriptsCount = countWhereGuilds('ticket_transcripts', ticketGuilds, userId); } catch {}
+      try { remindersCount = countWhereGuilds('reminders', communicationGuilds, userId); } catch {}
+      const logCount = hasModeration
+        ? (isEnvAdmin(userId) ? s.total : countWhereGuilds('mod_logs', moderationGuilds, userId))
+        : null;
+      const byType = hasModeration
+        ? (isEnvAdmin(userId)
+          ? s.byType
+          : (() => {
+            const scope = logScope(userId, moderationGuilds);
+            return storage.db.prepare(`SELECT type, COUNT(*) AS c FROM mod_logs WHERE 1=1${scope.sql} GROUP BY type`).all(...scope.params);
+          })())
+        : [];
       res.json({
-        logs: logCount, blacklist: s.blacklist, guilds: allowed.size, ping: client.ws.ping,
-        uptime: Math.floor((Date.now() - botStartTime) / 1000), byType: s.byType,
-        tickets: ticketsCount, notes: notesCount, transcripts: transcriptsCount, reminders: remindersCount
+        logs: logCount,
+        blacklist: canViewGlobalBlacklist ? s.blacklist : null,
+        guilds: overviewGuilds.size, ping: client.ws.ping,
+        uptime: Math.floor((Date.now() - botStartTime) / 1000), byType,
+        tickets: hasTickets ? ticketsCount : null,
+        notes: hasModeration ? notesCount : null,
+        transcripts: hasTickets ? transcriptsCount : null,
+        reminders: hasCommunications ? remindersCount : null
       });
     } catch (e) { apiError(res, e, 'Errore statistiche'); }
   });
@@ -664,21 +827,21 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/logs/all', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       res.json(logsForViewer(req.session.user.id, allowed, 500));
     } catch (e) { res.json([]); }
   });
   app.get('/api/logs/:userId', requireAuth, async (req, res) => {
     if (!/^\d{17,20}$/.test(req.params.userId)) return res.status(400).json({ error: 'ID non valido' });
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       res.json(logsForUserViewer(req.session.user.id, req.params.userId, allowed));
     } catch (e) { apiError(res, e); }
   });
 
   app.get('/api/notes/all', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       res.json(notesForGuilds(allowed));
     } catch (e) { apiError(res, e); }
   });
@@ -706,7 +869,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const note = storage.db.prepare('SELECT id, guild_id FROM member_notes WHERE id = ?').get(id);
       if (!note) return res.status(404).json({ error: 'Nota non trovata' });
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       if (!allowed.has(note.guild_id)) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
       res.json({ ok: storage.deleteNoteById(id) });
     } catch (e) { apiError(res, e); }
@@ -715,7 +878,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     const data = parseOrFail(schemaBulkDelete, req.body || {}, res);
     if (!data) return;
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       const lookup = storage.db.prepare('SELECT id, guild_id FROM member_notes WHERE id = ?');
       let count = 0;
       for (const raw of data.ids) {
@@ -817,7 +980,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/tickets', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'tickets');
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
         if (!allowed.has(guild.id)) continue;
@@ -896,7 +1059,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const channel = await client.channels.fetch(data.channelId).catch(() => null);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
-      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
+      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild, 'tickets'))) {
         return res.status(403).json({ error: 'Non hai i permessi su questo server' });
       }
       const panelActor = await channel.guild.members.fetch(req.session.user.id).catch(() => null);
@@ -915,7 +1078,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/tickets/transcripts', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'tickets');
       res.json(transcriptsForViewer(req.session.user.id, allowed));
     } catch (e) { apiError(res, e); }
   });
@@ -974,7 +1137,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/charts', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'analytics');
       const scope = logScope(req.session.user.id, allowed);
       const where = scope.sql ? `WHERE 1=1${scope.sql}` : '';
       const byType = storage.db.prepare(`SELECT type, COUNT(*) as c FROM mod_logs ${where} GROUP BY type`).all(...scope.params);
@@ -985,7 +1148,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/top', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'analytics');
       const scope = logScope(req.session.user.id, allowed);
       const moderators = storage.db.prepare(`SELECT moderator, COUNT(*) as c FROM mod_logs WHERE moderator IS NOT NULL AND moderator != 'Sistema Automatico'${scope.sql} GROUP BY moderator ORDER BY c DESC LIMIT 10`).all(...scope.params);
       const targets = storage.db.prepare(`SELECT target_id, target, COUNT(*) as c FROM mod_logs WHERE target_id IS NOT NULL${scope.sql} GROUP BY target_id ORDER BY c DESC LIMIT 10`).all(...scope.params);
@@ -1000,20 +1163,92 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const allowed = await allowedGuildIds(req.session.user.id);
       const guilds = [...client.guilds.cache.values()]
         .filter(g => allowed.has(g.id))
-        .map(g => ({
-          id: g.id, name: g.name,
-          roles: g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name })),
-          channels: g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
-        }));
+        .map(g => {
+          const permissions = ENV_ADMIN_IDS.includes(req.session.user.id)
+            ? new Set(DASHBOARD_FEATURES)
+            : req.dashboardAccess.guildPermissions.get(g.id) || new Set();
+          return {
+            id: g.id, name: g.name,
+            roles: ['moderation', 'settings', 'tickets', 'communications', 'lobbies'].some(feature => permissions.has(feature))
+              ? g.roles.cache.filter(r => r.name !== '@everyone').map(r => ({ id: r.id, name: r.name }))
+              : [],
+            channels: ['settings', 'tickets', 'communications', 'lobbies'].some(feature => permissions.has(feature))
+              ? g.channels.cache.filter(c => c.type === 0).map(c => ({ id: c.id, name: c.name }))
+              : []
+          };
+        });
       res.json(guilds);
     } catch (e) { apiError(res, e); }
+  });
+
+  app.get('/api/resources', requireAuth, async (req, res) => {
+    try {
+      const allowed = await allowedGuildIds(req.session.user.id);
+      const resources = [...client.guilds.cache.values()]
+        .filter(guild => allowed.has(guild.id))
+        .map(guild => ({
+          id: guild.id,
+          name: guild.name,
+          iconUrl: guild.iconURL({ size: 96 }),
+          memberCount: guild.memberCount,
+          permissions: ENV_ADMIN_IDS.includes(req.session.user.id)
+            ? DASHBOARD_FEATURES
+            : [...(req.dashboardAccess.guildPermissions.get(guild.id) || [])]
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      res.json(resources);
+    } catch (e) { apiError(res, e, 'Impossibile caricare le risorse'); }
+  });
+
+  app.get('/api/dashboard/managed-guilds', requireAuth, async (req, res) => {
+    const guilds = [];
+    for (const guild of client.guilds.cache.values()) {
+      if (await canManageDashboardRolesInGuild(req.session.user.id, guild)) {
+        guilds.push({ id: guild.id, name: guild.name });
+      }
+    }
+    res.json(guilds);
+  });
+
+  app.get('/api/dashboard/role-permissions/:guildId', requireAuth, async (req, res) => {
+    const guild = client.guilds.cache.get(req.params.guildId);
+    if (!guild) return res.status(404).json({ error: 'Server non trovato' });
+    if (!(await canManageDashboardRolesInGuild(req.session.user.id, guild))) {
+      return res.status(403).json({ error: 'Puoi gestire i permessi solo nei server dove sei Senior Admin' });
+    }
+    try {
+      const saved = new Map(storage.getDashboardRolePermissions(guild.id).map(item => [item.role_id, item.permissions]));
+      const roles = guild.roles.cache
+        .filter(role => role.id !== guild.id && !role.managed)
+        .map(role => ({ id: role.id, name: role.name, permissions: saved.get(role.id) || [] }));
+      res.json(roles);
+    } catch (e) { apiError(res, e, 'Impossibile caricare i permessi dei ruoli'); }
+  });
+
+  app.put('/api/dashboard/role-permissions/:guildId/:roleId', requireAuth, async (req, res) => {
+    const data = parseOrFail(schemaDashboardRolePermissions, req.body || {}, res);
+    if (!data) return;
+    const guild = client.guilds.cache.get(req.params.guildId);
+    if (!guild) return res.status(404).json({ error: 'Server non trovato' });
+    if (!(await canManageDashboardRolesInGuild(req.session.user.id, guild))) {
+      return res.status(403).json({ error: 'Puoi gestire i permessi solo nei server dove sei Senior Admin' });
+    }
+    const role = guild.roles.cache.get(req.params.roleId);
+    if (!role || role.id === guild.id || role.managed) return res.status(404).json({ error: 'Ruolo non valido' });
+    try {
+      const permissions = [...new Set(data.permissions)];
+      storage.setDashboardRolePermissions(guild.id, role.id, permissions, req.session.user.id);
+      authCache.clear();
+      res.json({ ok: true, permissions });
+    } catch (e) { apiError(res, e, 'Impossibile salvare i permessi del ruolo'); }
   });
 
   app.get('/api/user/:userId', requireAuth, async (req, res) => {
     const userId = req.params.userId;
     if (!/^\d{17,20}$/.test(userId)) return res.status(400).json({ error: 'ID non valido' });
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
+      const ticketGuilds = await allowedGuildIds(req.session.user.id, 'tickets');
       const logs = logsForUserViewer(req.session.user.id, userId, allowed);
       const notes = storage.db.prepare('SELECT * FROM member_notes WHERE user_id = ? ORDER BY id DESC LIMIT 1000').all(userId)
         .filter(n => allowed.has(n.guild_id))
@@ -1021,7 +1256,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const blacklistEntry = (await canUseGlobalBlacklist(req.session.user.id)) ? storage.getBlacklistEntry(userId) : null;
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
+        if (!ticketGuilds.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name === `ticket-${userId}`) {
             const meta = storage.getTicketMeta ? (storage.getTicketMeta(ch.id) || {}) : {};
@@ -1038,7 +1273,8 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     const q = (req.query.q || '').toString().trim().toLowerCase().slice(0, 100);
     if (!q) return res.json({ blacklist: [], notes: [], logs: [], tickets: [] });
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
+      const ticketGuilds = await allowedGuildIds(req.session.user.id, 'tickets');
       const blacklist = (await canUseGlobalBlacklist(req.session.user.id))
         ? storage.getAllBlacklist().filter(e => (e.user_id || '').toLowerCase().includes(q) || (e.username || '').toLowerCase().includes(q) || (e.reason || '').toLowerCase().includes(q))
         : [];
@@ -1046,7 +1282,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const logs = logsForViewer(req.session.user.id, allowed, 500).filter(l => (l.target_id || '').toLowerCase().includes(q) || (l.target || '').toLowerCase().includes(q) || (l.moderator || '').toLowerCase().includes(q) || (l.reason || '').toLowerCase().includes(q));
       const tickets = [];
       for (const guild of client.guilds.cache.values()) {
-        if (!allowed.has(guild.id)) continue;
+        if (!ticketGuilds.has(guild.id)) continue;
         for (const ch of guild.channels.cache.values()) {
           if (ch.name && ch.name.startsWith('ticket-') && ch.name.toLowerCase().includes(q)) {
             tickets.push({ guild: guild.name, channel: ch.name, channelId: ch.id, userId: ch.name.replace('ticket-', '') });
@@ -1082,7 +1318,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   });
   app.get('/api/export/notes.csv', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       const csv = toCsv(
         notesForGuilds(allowed, 100000),
         ['id', 'guild_id', 'user_id', 'author_tag', 'content', 'created_at']
@@ -1094,7 +1330,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   });
   app.get('/api/export/logs.csv', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       const csv = toCsv(logsForViewer(req.session.user.id, allowed, 5000), ['id', 'type', 'target_id', 'target', 'moderator', 'reason', 'duration', 'channel', 'guild_id', 'timestamp']);
       res.setHeader('Content-Type', 'text/csv; charset=utf-8');
       res.setHeader('Content-Disposition', 'attachment; filename="modlogs.csv"');
@@ -1111,6 +1347,37 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
+  app.get('/api/export/full-backup', requireAuth, async (req, res) => {
+    if (!isEnvAdmin(req.session.user.id)) {
+      return res.status(403).json({ error: 'Il backup completo è riservato agli admin configurati in DASHBOARD_ADMIN_IDS' });
+    }
+
+    let tempDir;
+    const cleanup = () => {
+      if (!tempDir) return;
+      fs.rm(tempDir, { recursive: true, force: true }, err => {
+        if (err) log.err('full database backup cleanup', err);
+      });
+    };
+
+    try {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tommy-utilities-backup-'));
+      const backupPath = path.join(tempDir, 'bot.sqlite');
+      await storage.db.backup(backupPath);
+      res.setHeader('Cache-Control', 'no-store');
+      res.download(backupPath, `tommy-utilities-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`, err => {
+        cleanup();
+        if (!err) return;
+        log.err('full database backup download', err);
+        if (!res.headersSent) return apiError(res, err, 'Errore invio backup');
+        res.destroy(err);
+      });
+    } catch (e) {
+      cleanup();
+      apiError(res, e, 'Impossibile creare il backup completo');
+    }
+  });
+
   app.get('/api/access-logs', requireAuth, (req, res) => {
     if (ENV_ADMIN_IDS.length && !isEnvAdmin(req.session.user.id)) return res.status(403).json({ error: 'Solo gli admin dashboard vedono gli IP' });
     try { res.json(storage.getDashboardAccessLogs()); } catch (e) { res.json([]); }
@@ -1118,7 +1385,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/messages/channels', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'communications');
       const out = [];
       for (const guild of client.guilds.cache.values()) {
         if (!allowed.has(guild.id)) continue;
@@ -1137,7 +1404,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const channel = await client.channels.fetch(data.channelId).catch(() => null);
       if (!channel || !channel.isTextBased()) return res.status(404).json({ error: 'Canale non valido' });
-      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild))) {
+      if (!channel.guild || !(await canManageGuild(req.session.user.id, channel.guild, 'communications'))) {
         return res.status(403).json({ error: 'Non hai i permessi su questo server' });
       }
       const sender = await channel.guild.members.fetch(req.session.user.id).catch(() => null);
@@ -1147,7 +1414,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const botMember = channel.guild?.members?.me;
       if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
 
-      const payload = { allowedMentions: { parse: ['users'] } };
+      const payload = { allowedMentions: { parse: data.allowMentions ? ['users', 'roles'] : [] } };
       if (data.content) payload.content = data.content;
       if (data.embed && (data.embed.title || data.embed.description)) {
         const e = new EmbedBuilder();
@@ -1365,7 +1632,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const user = await client.users.fetch(userId).catch(() => null);
       if (!user) return res.status(404).json({ error: 'Utente non trovato' });
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'moderation');
       const memberships = [];
       for (const guild of client.guilds.cache.values()) {
         if (!allowed.has(guild.id)) continue;
@@ -1440,7 +1707,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 
   app.get('/api/reminders', requireAuth, async (req, res) => {
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
+      const allowed = await allowedGuildIds(req.session.user.id, 'communications');
       const rows = storage.getAllReminders
         ? storage.getAllReminders(200)
         : storage.db.prepare('SELECT * FROM reminders ORDER BY remind_at DESC LIMIT 200').all();
@@ -1453,7 +1720,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!data) return;
     const guild = client.guilds.cache.get(data.guildId);
     if (!guild || !guild.channels.cache.has(data.channelId)) return res.status(400).json({ error: 'Server o canale non valido' });
-    if (!(await canManageGuild(req.session.user.id, guild))) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
+    if (!(await canManageGuild(req.session.user.id, guild, 'communications'))) return res.status(403).json({ error: 'Non hai i permessi su questo server' });
     const ms = ((data.hours * 60) + data.minutes) * 60000;
     if (ms < 60000 || ms > 30 * 24 * 60 * 60 * 1000) return res.status(400).json({ error: 'Scegli ore e minuti: minimo 1 minuto, massimo 30 giorni' });
     try {
@@ -1467,7 +1734,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     if (!req.sessionID) {
       return res.status(500).send('Errore: sessione non inizializzata');
     }
-    req.session.save((saveErr) => {
+    req.session.save(async (saveErr) => {
       if (saveErr) { log.err('session save', saveErr); return res.status(500).send('Errore sessione'); }
       try {
         const params = paramsFn ? paramsFn(req) : {};
@@ -1476,7 +1743,16 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
           token = generateCsrfToken(req, res);
           if (!token) log.warn(`csrf token vuoto per ${page} (sessione: ${req.sessionID})`);
         } catch (e) { log.err(`csrf gen ${page}`, e); }
-        res.send(renderLayout(req.session.user, page, params, { csrfToken: token }));
+        const security = {
+          csrfToken: token,
+          permissions: [...req.dashboardAccess.permissions],
+          isDashboardManager: req.dashboardAccess.manager
+        };
+        if (page === 'dashboard') {
+          security.canUseGlobalBlacklist = await canUseGlobalBlacklist(req.session.user.id);
+          security.canExportFullBackup = isEnvAdmin(req.session.user.id);
+        }
+        res.send(renderLayout(req.session.user, page, params, security));
       } catch (e) {
         log.err(`page ${page}`, e);
         res.status(500).send('Errore rendering');
@@ -1485,6 +1761,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   };
 
   app.get('/dashboard', requireAuth, pageHandler('dashboard'));
+  app.get('/resources', requireAuth, pageHandler('resources'));
   app.get('/modlogs', requireAuth, pageHandler('modlogs'));
   app.get('/notes', requireAuth, pageHandler('notes'));
   app.get('/tickets', requireAuth, pageHandler('tickets'));
@@ -1505,6 +1782,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     pageHandler('userActions', r => ({ userId: r.params.userId }))(req, res, next);
   });
   app.get('/reminders', requireAuth, pageHandler('reminders'));
+  app.get('/permissions', requireAuth, pageHandler('permissions'));
   
   // ROTTA LOBBY (HTML)
   app.get('/lobbies', requireAuth, pageHandler('lobbies'));
@@ -1539,10 +1817,84 @@ function renderLayout(user, page, params = {}, security = {}) {
   const avatar = user.avatar ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64` : `https://cdn.discordapp.com/embed/avatars/0.png`;
   const csrfToken = security.csrfToken || '';
   const safeQ = escapeHtml(params.q || '');
+  const permissions = new Set(security.permissions || []);
+  const canViewDashboard = permissions.has('overview') || permissions.has('global_blacklist');
+  const canViewResources = permissions.size > 0;
+  const pageTitles = {
+    dashboard: 'Dashboard',
+    modlogs: 'Mod Logs',
+    notes: 'Note',
+    tickets: 'Ticket',
+    commands: 'Comandi',
+    config: 'Configurazione',
+    charts: 'Grafici',
+    top: 'Classifiche',
+    user: 'Profilo utente',
+    search: 'Ricerca',
+    accesslogs: 'Log accessi',
+    messages: 'Messaggi',
+    userActions: 'Gestione utenti',
+    reminders: 'Reminder',
+    lobbies: 'Lobby',
+    permissions: 'Permessi dashboard',
+    resources: 'Resources'
+  };
+  const pageTitle = pageTitles[page] || 'Dashboard';
+  const navSections = [
+    { label: 'Workspace', items: [
+      { href: '/dashboard', page: 'dashboard', feature: 'dashboard', icon: '◈', label: 'Dashboard' },
+      { href: '/charts', page: 'charts', feature: 'analytics', icon: '📈', label: 'Grafici' },
+      { href: '/top', page: 'top', feature: 'analytics', icon: '🏆', label: 'Top' },
+      { href: '/resources', page: 'resources', feature: 'resources', icon: '🔗', label: 'Resources' }
+    ] },
+    { label: 'Moderazione', items: [
+      { href: '/search', page: 'search', feature: 'moderation', icon: '🔎', label: 'Ricerca' },
+      { href: '/modlogs', page: 'modlogs', feature: 'moderation', icon: '📋', label: 'Mod Logs' },
+      { href: '/notes', page: 'notes', feature: 'moderation', icon: '📝', label: 'Note' },
+      { href: '/user-actions', page: 'userActions', feature: 'moderation', icon: '🛠️', label: 'Gestione Utenti' },
+      { href: '/access-logs', page: 'accesslogs', feature: 'audit', icon: '🔐', label: 'Accessi' }
+    ] },
+    { label: 'Bot', items: [
+      { href: '/tickets', page: 'tickets', feature: 'tickets', icon: '🎫', label: 'Ticket' },
+      { href: '/commands', page: 'commands', feature: 'settings', icon: '🔧', label: 'Comandi' },
+      { href: '/config', page: 'config', feature: 'settings', icon: '⚙️', label: 'Config' },
+      { href: '/reminders', page: 'reminders', feature: 'communications', icon: '⏰', label: 'Reminder' },
+      { href: '/messages', page: 'messages', feature: 'communications', icon: '✉️', label: 'Messaggi' },
+      { href: '/lobbies', page: 'lobbies', feature: 'lobbies', icon: '🗺️', label: 'Lobby' }
+    ] },
+    { label: 'Amministrazione', items: [
+      { href: '/permissions', page: 'permissions', feature: 'manager', icon: '🔑', label: 'Permessi' }
+    ] }
+  ];
+  const navItems = navSections.flatMap(section => section.items).filter(item =>
+    item.feature === 'manager' ? security.isDashboardManager :
+      item.feature === 'resources' ? canViewResources :
+      item.feature === 'dashboard' ? canViewDashboard : permissions.has(item.feature)
+  );
+  const sidebarHome = navItems[0]?.href || '/dashboard';
+  const searchControl = permissions.has('moderation') ? `
+    <div class="search-box">
+      <form action="/search" method="get">
+        <input type="text" name="q" placeholder="Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
+        <button type="submit" class="secondary">Cerca</button>
+      </form>
+    </div>` : '';
+  const sidebarNavigation = navSections.map(section => {
+    const items = section.items.filter(item =>
+      item.feature === 'manager' ? security.isDashboardManager :
+        item.feature === 'resources' ? canViewResources :
+        item.feature === 'dashboard' ? canViewDashboard : permissions.has(item.feature)
+    );
+    if (!items.length) return '';
+    return `<div class="nav-label">${section.label}</div>${items.map(item =>
+      `<a href="${item.href}" class="${page === item.page ? 'active' : ''}"><span class="nav-icon">${item.icon}</span>${item.label}</a>`
+    ).join('')}`;
+  }).join('');
 
   // Ogni pagina viene generata solo quando è quella richiesta
   const renderers = {
-    dashboard: () => renderDashboardContent(),
+    dashboard: () => renderDashboardContent(security),
+    resources: () => renderResourcesContent(),
     modlogs: () => renderModlogsContent(),
     notes: () => renderNotesContent(),
     tickets: () => renderTicketsContent(),
@@ -1556,7 +1908,8 @@ function renderLayout(user, page, params = {}, security = {}) {
     messages: () => renderMessagesContent(),
     userActions: () => renderUserActionsContent(params.userId || ''),
     reminders: () => renderRemindersContent(),
-    lobbies: () => renderLobbiesContent() // <-- RENDERER LOBBY
+    lobbies: () => renderLobbiesContent(),
+    permissions: () => renderPermissionsContent()
   };
   const body = renderers[page] ? renderers[page]() : '<p>Pagina non trovata</p>';
 
@@ -1637,99 +1990,309 @@ function renderLayout(user, page, params = {}, security = {}) {
 </script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 <style>
+  :root { color-scheme: dark; --bg: #090a0f; --panel: #11131b; --panel-raised: #171a24; --border: #242735; --muted: #9298aa; --text: #f3f4fa; --accent: #c7973f; --accent-bright: #f0c66f; --danger: #f06478; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111214; color: #eee; padding: 28px 20px 48px; line-height: 1.45; }
-  header { display: flex; justify-content: space-between; align-items: center; margin: 0 auto 16px; padding-bottom: 18px; border-bottom: 1px solid #2b2d31; gap: 16px; flex-wrap: wrap; max-width: 1180px; }
-  h1 { font-size: 22px; letter-spacing: -0.02em; }
-  .user { display: flex; align-items: center; gap: 12px; }
-  .user img { width: 40px; height: 40px; border-radius: 50%; }
-  .search-box { flex: 1; max-width: 420px; min-width: 200px; }
+  body { min-height: 100vh; background: radial-gradient(ellipse at 70% -20%, rgba(184, 132, 47, .12), transparent 42%), var(--bg); color: var(--text); font: 14px/1.55 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  button, input, select, textarea { font: inherit; }
+  button { cursor: pointer; }
+  a { color: var(--accent-bright); text-decoration: none; }
+  .app-sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; display: flex; flex-direction: column; width: 252px; padding: 25px 16px 18px; background: rgba(13, 14, 20, .96); border-right: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 12px; padding: 0 10px 27px; color: var(--text); }
+  .brand-mark { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid rgba(238, 191, 99, .42); border-radius: 12px; background: linear-gradient(145deg, #4a3618, #171715); color: #f4d18c; font-size: 18px; box-shadow: 0 6px 24px rgba(181, 130, 43, .16); }
+  .brand strong { display: block; font-size: 13px; letter-spacing: .11em; }
+  .brand small { display: block; margin-top: 2px; color: #7e8396; font-size: 10px; letter-spacing: .12em; }
+  .nav-label { padding: 12px 12px 8px; color: #71778a; font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .sidebar-nav { display: flex; flex: 1; flex-direction: column; gap: 4px; overflow-y: auto; }
+  .sidebar-nav a { display: flex; align-items: center; gap: 12px; min-height: 42px; padding: 9px 12px; border: 1px solid transparent; border-radius: 10px; color: #9da2b2; font-size: 13px; transition: background .18s ease, color .18s ease, border-color .18s ease, transform .18s ease; }
+  .sidebar-nav a:hover { transform: translateX(2px); background: #171923; color: #fff; }
+  .sidebar-nav a.active { border-color: rgba(238, 191, 99, .2); background: linear-gradient(90deg, rgba(194, 143, 54, .18), rgba(194, 143, 54, .04)); color: #f1d49a; box-shadow: inset 2px 0 #e3b65e; }
+  .nav-icon { width: 19px; text-align: center; font-size: 15px; }
+  .sidebar-footer { margin-top: 16px; padding: 14px 12px 0; border-top: 1px solid var(--border); color: #777d90; font-size: 11px; }
+  .sidebar-overlay { display: none; }
+  .app-main { width: min(100% - 252px, 1700px); min-height: 100vh; margin-left: 252px; padding: 23px clamp(20px, 3.2vw, 52px) 48px; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 22px; min-height: 66px; margin-bottom: 29px; padding-bottom: 20px; border-bottom: 1px solid rgba(46, 49, 65, .75); }
+  .topbar-left, .topbar-actions, .user { display: flex; align-items: center; }
+  .topbar-left { gap: 14px; min-width: 0; }
+  .page-heading .eyebrow { color: #858ba0; font-size: 10px; font-weight: 700; letter-spacing: .14em; }
+  h1 { margin-top: 2px; font-size: clamp(20px, 2vw, 25px); font-weight: 650; letter-spacing: -.035em; }
+  .topbar-actions { justify-content: flex-end; gap: 20px; }
+  .search-box { width: min(320px, 28vw); }
   .search-box form { display: flex; gap: 8px; }
   .search-box input, .search-box button { margin: 0; }
-  nav { display: flex; gap: 8px; margin: 0 auto 24px; flex-wrap: wrap; max-width: 1180px; position: sticky; top: 0; z-index: 5; background: rgba(17,18,20,0.92); padding: 8px 0; }
-  nav a { padding: 8px 14px; background: #1e1f22; border: 1px solid #2b2d31; border-radius: 999px; color: #b5bac1; font-size: 13px; }
-  nav a:hover { background: #2b2d31; color: #fff; }
-  nav a.active { background: #5865F2; color: white; border-color: #5865F2; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 0 auto 28px; max-width: 1180px; }
-  .card { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 16px 18px; }
-  .card h2 { font-size: 11px; color: #949ba4; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-  .card .value { font-size: 28px; font-weight: 700; color: #5865F2; }
-  .section { background: #1e1f22; border: 1px solid #2b2d31; border-radius: 12px; padding: 20px; margin: 0 auto 16px; max-width: 1180px; overflow-x: auto; }
-  .section h2 { font-size: 18px; margin-bottom: 14px; }
-  table { width: 100%; border-collapse: collapse; min-width: 640px; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2b2d31; font-size: 14px; vertical-align: top; }
-  th { color: #949ba4; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-  tr:hover td { background: rgba(255,255,255,0.02); }
-  button { background: #5865F2; color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #4752c4; }
-  button:disabled { opacity: 0.6; cursor: not-allowed; }
-  button.danger { background: #ed4245; }
-  button.danger:hover { background: #c93b3e; }
-  button.small { padding: 5px 10px; font-size: 12px; }
-  button.secondary { background: #444; }
-  button.secondary:hover { background: #555; }
-  input, select, textarea { background: #1a1a1a; border: 1px solid #444; color: #eee; padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; margin-bottom: 10px; font-family: inherit; }
-  .form-row { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
-  .form-row input, .form-row select { flex: 1; min-width: 150px; }
-  .loading { color: #888; font-style: italic; }
-  a { color: #5865F2; text-decoration: none; }
-  a.user-link { color: #5865F2; text-decoration: none; border-bottom: 1px dashed #5865F2; }
-  a.user-link:hover { color: #4752c4; border-bottom-style: solid; }
-  .filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  .user { gap: 10px; white-space: nowrap; }
+  .user img { width: 36px; height: 36px; border: 1px solid #343747; border-radius: 50%; object-fit: cover; }
+  .user-name { max-width: 140px; overflow: hidden; color: #d7d9e3; font-size: 12px; text-overflow: ellipsis; }
+  .user-actions { display: flex; gap: 7px; }
+  .menu-toggle { display: none; width: 38px; height: 38px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); font-size: 18px; }
+  .content-area { width: 100%; min-width: 0; animation: enter .32s ease both; }
+  @keyframes enter { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 14px; width: 100%; margin: 0 0 24px; }
+  .resources-hero { margin-bottom: 30px; }
+  .resources-hero .eyebrow { color: var(--accent-bright); font-size: 10px; font-weight: 700; letter-spacing: .16em; }
+  .resources-hero h2 { margin: 4px 0 6px; font-size: clamp(32px, 5vw, 52px); line-height: 1.08; letter-spacing: -.045em; }
+  .resources-hero p:last-child { color: var(--muted); font-size: 14px; }
+  .resources-section-heading { margin: 0 0 16px; }
+  .resources-section-heading h2 { margin: 0 0 3px; font-size: 19px; }
+  .resources-section-heading p { color: var(--muted); font-size: 12px; }
+  .resources-grid { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+  .resource-card { display: flex; min-height: 250px; flex-direction: column; padding: 21px; }
+  .resource-card-header { display: flex; align-items: center; gap: 13px; margin-bottom: 15px; }
+  .resource-card-icon { display: grid; width: 48px; height: 48px; flex: 0 0 48px; place-items: center; overflow: hidden; border: 1px solid #37333a; border-radius: 50%; background: #191a20; color: var(--accent-bright); font-size: 18px; font-weight: 700; }
+  .resource-card-icon img { width: 100%; height: 100%; object-fit: cover; }
+  .resource-card-type { color: #888b98; font-size: 9px; font-weight: 700; letter-spacing: .15em; text-transform: uppercase; }
+  .resource-card h3 { margin-top: 2px; font-size: 17px; line-height: 1.3; overflow-wrap: anywhere; }
+  .resource-card-meta { display: flex; gap: 15px; margin: 0 0 12px; color: #b6b8c2; font-size: 11px; }
+  .resource-card-meta strong { color: #f0c66f; }
+  .resource-card-copy { min-height: 40px; margin-bottom: 14px; color: #999ca8; font-size: 12px; }
+  .resource-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 19px; }
+  .resource-tag { padding: 4px 9px; border: 1px solid #30313a; border-radius: 999px; color: #b5b7c1; font-size: 10px; }
+  .resource-card-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: auto; }
+  .resource-card-actions .resource-server-link { padding: 7px 11px; border: 1px solid #343641; border-radius: 9px; background: #1c1e29; color: #d7d9e3; font-size: 11px; font-weight: 650; transition: background .16s ease, border-color .16s ease; }
+  .resource-card-actions .resource-server-link:hover { border-color: #51442e; background: #262630; }
+  .resource-card-actions .resource-link { color: #e6bf72; font-size: 11px; font-weight: 700; }
+  .resources-empty { color: var(--muted); text-align: center; }
+  .card, .section { border: 1px solid var(--border); background: linear-gradient(145deg, rgba(22, 24, 34, .96), rgba(15, 17, 24, .98)); box-shadow: 0 12px 35px rgba(0, 0, 0, .13); }
+  .card { position: relative; min-height: 112px; overflow: hidden; padding: 18px 19px; border-radius: 15px; transition: transform .2s ease, border-color .2s ease, background .2s ease; }
+  .card::after { position: absolute; right: -26px; bottom: -48px; width: 104px; height: 104px; border-radius: 50%; background: rgba(210, 161, 73, .07); content: ""; filter: blur(2px); }
+  .card:hover { transform: translateY(-2px); border-color: #4a3c25; }
+  .card h2 { position: relative; z-index: 1; margin-bottom: 12px; color: #969bad; font-size: 10px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
+  .card .value { position: relative; z-index: 1; color: #edc46f; font-size: clamp(25px, 3vw, 32px); font-weight: 700; letter-spacing: -.04em; }
+  .section { width: 100%; margin: 0 0 17px; padding: clamp(16px, 2.2vw, 24px); overflow-x: auto; border-radius: 15px; }
+  .section h2 { margin-bottom: 15px; font-size: 16px; font-weight: 650; letter-spacing: -.015em; }
+  table { width: 100%; min-width: 640px; border-collapse: collapse; }
+  th, td { padding: 11px 10px; border-bottom: 1px solid #282b38; font-size: 13px; text-align: left; vertical-align: top; }
+  th { color: #898fa2; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+  tr:hover td { background: rgba(255, 255, 255, .025); }
+  button { padding: 9px 14px; border: 1px solid transparent; border-radius: 9px; background: linear-gradient(135deg, #d6aa59, #a87326); color: #17120a; font-size: 12px; font-weight: 700; transition: filter .16s ease, transform .16s ease, border-color .16s ease; }
+  button:hover { filter: brightness(1.12); transform: translateY(-1px); }
+  button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #f0c66f; outline-offset: 2px; }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  button.danger { background: #a83e55; }
+  button.danger:hover { background: #bf4962; }
+  button.small { padding: 6px 10px; font-size: 11px; }
+  button.secondary { border-color: #303342; background: #1c1e29; color: #c4c7d2; }
+  button.secondary:hover { border-color: #474b60; background: #252837; }
+  input, select, textarea { width: 100%; margin-bottom: 10px; padding: 10px 12px; border: 1px solid #303342; border-radius: 9px; background: #0e1017; color: var(--text); font-size: 13px; }
+  input::placeholder, textarea::placeholder { color: #747a8d; }
+  .form-row { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 10px; }
+  .form-row input, .form-row select { min-width: 150px; flex: 1; }
+  .loading { color: #8c91a2; font-style: italic; }
+  a.user-link { border-bottom: 1px dashed var(--accent); color: var(--accent-bright); }
+  a.user-link:hover { border-bottom-style: solid; color: #c4b8ff; }
+  .filter-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
   .filter-bar select, .filter-bar input { max-width: 250px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; text-transform: uppercase; }
-  .badge.kick, .badge.warn { background: #faa61a; color: #000; }
-  .badge.ban { background: #ed4245; color: #fff; }
-  .badge.timeout { background: #5865F2; color: #fff; }
-  .badge.default { background: #444; color: #eee; }
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 768px) { .charts-grid { grid-template-columns: 1fr; } }
-  .chart-box { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; }
-  .config-block { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .config-block h3 { font-size: 16px; margin-bottom: 12px; color: #bbb; }
-  .success { color: #00FF00; font-size: 13px; margin-top: 8px; }
-  .error { color: #ed4245; font-size: 13px; margin-top: 8px; }
-  code { background: #1a1a1a; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-  .export-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-  .export-bar a { padding: 6px 12px; background: #444; border-radius: 6px; font-size: 12px; color: #eee; }
-  .export-bar a:hover { background: #555; }
+  .tool-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:16px; }
+  .tool-heading h2 { margin-bottom:5px; }
+  .tool-subtitle { margin:0; color:#8c91a2; font-size:12px; line-height:1.6; }
+  .tool-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin:14px 0; }
+  .tool-stat { padding:13px 15px; border:1px solid #292c3a; border-radius:11px; background:linear-gradient(145deg,#151722,#101117); }
+  .tool-stat strong { display:block; color:#e7e8ef; font-size:20px; }
+  .tool-stat span { display:block; margin-top:3px; color:#8c91a2; font-size:10px; text-transform:uppercase; letter-spacing:.08em; }
+  .tool-controls { display:flex; align-items:center; flex-wrap:wrap; gap:9px; margin:14px 0; }
+  .tool-controls input,.tool-controls select { flex:1 1 190px; width:auto; max-width:330px; margin:0; }
+  .tool-empty { padding:24px; border:1px dashed #343746; border-radius:11px; color:#9297a8; text-align:center; }
+  .tool-preview { padding:14px; border:1px solid #292c3a; border-radius:10px; background:#0e1017; color:#d5d7e0; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .tool-table-wrap { overflow-x:auto; }
+  .mention-help { margin:7px 0 12px; padding:10px 12px; border-left:2px solid #8068ed; border-radius:0 8px 8px 0; background:#151621; color:#aeb2c1; font-size:12px; line-height:1.6; }
+  .mention-help code { color:#d2c8ff; }
+  .inline-check { display:flex; align-items:center; gap:9px; margin:2px 0 14px; color:#c4c7d2; font-size:12px; }
+  .inline-check input { width:auto; margin:0; accent-color:#8068ed; }
+  .field-meta { display:flex; justify-content:space-between; gap:10px; margin:-5px 0 10px; color:#858a9b; font-size:11px; }
+  .ticket-actions { display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-width:245px; }
+  .ticket-actions select { width:auto; min-width:105px; margin:0; padding:6px 8px; }
+  @media(max-width:600px) {
+    .tool-heading { flex-direction:column; }
+    .tool-controls input,.tool-controls select { flex-basis:100%; max-width:none; }
+    .ticket-actions { min-width:220px; }
+  }
+  .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .badge.kick, .badge.warn { background: #9c6a23; color: #fff1d2; }
+  .badge.ban { background: #a83e55; color: #fff; }
+  .badge.timeout { background: #624bcc; color: #fff; }
+  .badge.default { background: #343747; color: #e2e4ec; }
+  .charts-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .chart-box, .config-block { padding: 17px; border: 1px solid #292c3a; border-radius: 12px; background: #0e1017; }
+  .config-block { margin-bottom: 16px; }
+  .config-block h3 { margin-bottom: 12px; color: #d4d6e0; font-size: 14px; }
+  .success { margin-top: 8px; color: #64d6a0; font-size: 13px; }
+  .error { color: var(--danger); font-size: 13px; }
+  code { padding: 2px 6px; border-radius: 5px; background: #0e1017; font-size: 12px; }
+  .export-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .export-bar a { padding: 7px 11px; border: 1px solid #303342; border-radius: 8px; background: #1b1d28; color: #c4c7d2; font-size: 11px; }
+  .export-bar a:hover { border-color: #514778; color: #ddd5ff; }
+  .dashboard-hero { position: relative; display: flex; min-height: 355px; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; padding: 24px 18px 30px; text-align: center; }
+  .hero-mark { display: grid; width: 76px; height: 76px; margin-bottom: 20px; place-items: center; border: 1px solid rgba(232, 183, 85, .72); border-radius: 50%; background: radial-gradient(circle at 35% 25%, #4b3b20, #101014 72%); color: #f1ce84; font-size: 34px; font-weight: 700; box-shadow: 0 0 42px rgba(199, 151, 63, .14), inset 0 0 20px rgba(213, 173, 100, .08); }
+  .hero-eyebrow { color: #a2a3a8; font-size: 9px; font-weight: 700; letter-spacing: .22em; }
+  .dashboard-hero h2 { margin-top: 12px; font-size: clamp(34px, 5vw, 57px); font-weight: 750; line-height: 1.03; letter-spacing: -.055em; }
+  .dashboard-hero h2 span { color: #898b94; }
+  .hero-description { max-width: 520px; margin-top: 15px; color: #a0a2aa; font-size: 13px; }
+  .hero-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 9px; margin-top: 21px; }
+  .hero-button { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 9px; padding: 9px 14px; border: 1px solid #34353a; border-radius: 9px; color: #e7e7e9; font-size: 11px; font-weight: 650; transition: transform .18s ease, border-color .18s ease, background .18s ease; }
+  .hero-button:hover { transform: translateY(-2px); border-color: #74603b; color: #fff; }
+  .hero-button-primary { border-color: #d3a650; background: linear-gradient(135deg, #e1bc6c, #bd8732); color: #17120a; }
+  .hero-button-primary:hover { color: #17120a; }
+  .hero-button-secondary { background: #17181d; }
+  .hero-button-quiet { border-color: transparent; color: #aaaab0; }
+  .hero-status { display: inline-flex; align-items: center; gap: 8px; margin-top: 17px; padding: 6px 12px; border: 1px solid #292a30; border-radius: 999px; background: rgba(17, 18, 22, .78); color: #b7b8be; font-size: 10px; }
+  .status-led { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #85858b; }
+  .status-led.online { background: #54d89a; box-shadow: 0 0 9px rgba(84, 216, 154, .7); }
+  .status-led.offline { background: #f06478; box-shadow: 0 0 9px rgba(240, 100, 120, .5); }
+  .status-led.checking { background: #d2a24a; animation: pulse 1.1s ease-in-out infinite alternate; }
+  @keyframes pulse { to { opacity: .35; } }
+  .status-panel { padding: 19px 21px; }
+  .status-panel-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 17px; }
+  .status-panel-heading h2 { margin: 4px 0 0; }
+  .status-updated { color: #777b87; font-size: 10px; }
+  .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+  .status-item { display: flex; min-height: 72px; flex-direction: column; justify-content: space-between; gap: 8px; padding: 12px 13px; border: 1px solid #292b34; border-radius: 10px; background: rgba(9, 10, 15, .55); }
+  .status-item-label { color: #8c909b; font-size: 10px; }
+  .status-value { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 650; }
+  .status-value::before { width: 6px; height: 6px; border-radius: 50%; background: currentColor; content: ""; }
+  .status-value.online { color: #72d6a5; }
+  .status-value.offline { color: #f17886; }
+  .status-value.checking { color: #d4ae63; }
+  .dashboard-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 16px; }
+  .permissions-hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 22px; }
+  .permissions-hero h2 { margin: 0 0 5px; font-size: 20px; }
+  .permissions-help { max-width: 760px; color: #9da2b2; font-size: 12px; }
+  .permissions-badge { flex: 0 0 auto; padding: 7px 10px; border: 1px solid rgba(238, 191, 99, .22); border-radius: 999px; background: rgba(194, 143, 54, .08); color: #e8c779; font-size: 10px; font-weight: 700; }
+  .permissions-controls { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr); gap: 12px; padding: 16px; border: 1px solid #292c38; border-radius: 12px; background: rgba(9, 10, 15, .55); }
+  .permissions-controls label { display: block; color: #9da2b2; font-size: 11px; }
+  .permissions-controls select { margin: 5px 0 0; }
+  .permissions-editor { margin-top: 21px; }
+  .permissions-editor-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 15px; margin-bottom: 12px; }
+  .permissions-editor-heading h3 { font-size: 14px; }
+  .permissions-editor-heading p { margin-top: 3px; color: #818697; font-size: 11px; }
+  .permission-count { color: #c4a968 !important; white-space: nowrap; }
+  .permission-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 11px; }
+  .permission-toolbar button { padding: 7px 10px; }
+  .permission-toolbar .permission-reload { margin-left: auto; }
+  .permission-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .permission-option { display: flex; align-items: flex-start; gap: 11px; min-height: 76px; padding: 13px; border: 1px solid #2a2d37; border-radius: 10px; background: #101117; color: #d5d7df; cursor: pointer; transition: background .16s ease, border-color .16s ease, transform .16s ease; }
+  .permission-option:hover { transform: translateY(-1px); border-color: #51442e; background: #15161d; }
+  .permission-option:has(input:checked) { border-color: rgba(225, 180, 91, .48); background: linear-gradient(120deg, rgba(194, 143, 54, .12), rgba(16, 17, 23, .95) 65%); }
+  .permission-option input { width: 17px; height: 17px; flex: 0 0 auto; margin: 1px 0 0; accent-color: #d3a650; }
+  .permission-option strong { display: block; font-size: 12px; font-weight: 650; }
+  .permission-option small { display: block; margin-top: 4px; color: #8d91a0; font-size: 10px; line-height: 1.45; }
+  .permissions-savebar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 18px; padding-top: 15px; border-top: 1px solid #292c38; }
+  .permission-message { min-height: 20px; font-size: 11px; }
+  .permission-message.error { color: #f17886; }
+  .permission-message.success { color: #72d6a5; }
+  .permission-message.pending { color: #d4ae63; }
+  .permissions-save { min-width: 155px; }
+  @media (max-width: 1050px) {
+    .app-main { width: calc(100% - 232px); margin-left: 232px; padding-right: 22px; padding-left: 22px; }
+    .app-sidebar { width: 232px; }
+    .topbar { gap: 14px; }
+    .topbar-actions { gap: 12px; }
+    .user-name { display: none; }
+  }
+  @media (max-width: 760px) {
+    .app-sidebar { width: min(290px, calc(100vw - 54px)); transform: translateX(-102%); transition: transform .24s ease; }
+    body.sidebar-open .app-sidebar { transform: translateX(0); }
+    .sidebar-overlay { position: fixed; z-index: 19; inset: 0; border: 0; border-radius: 0; background: rgba(3, 4, 8, .68); opacity: 0; pointer-events: none; transition: opacity .24s ease; }
+    body.sidebar-open .sidebar-overlay { display: block; opacity: 1; pointer-events: auto; }
+    .app-main { width: 100%; margin-left: 0; padding: 18px 16px 36px; }
+    .topbar { align-items: flex-start; flex-wrap: wrap; margin-bottom: 21px; padding-bottom: 16px; }
+    .menu-toggle { display: inline-grid; flex: 0 0 auto; place-items: center; }
+    .topbar-left { flex: 1; }
+    .topbar-actions { width: 100%; justify-content: space-between; }
+    .search-box { width: auto; min-width: 0; flex: 1; }
+    .user { gap: 8px; }
+    .user-actions { gap: 5px; }
+    .user-actions button { padding: 8px 9px; }
+    .charts-grid { grid-template-columns: 1fr; }
+    .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .permissions-controls { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 480px) {
+    .app-main { padding-right: 12px; padding-left: 12px; }
+    .topbar-actions { align-items: flex-start; gap: 10px; }
+    .search-box form { gap: 5px; }
+    .search-box input { min-width: 0; padding: 9px; }
+    .search-box button { padding: 8px 10px; }
+    .user img { width: 32px; height: 32px; }
+    .user-actions { flex-direction: column; }
+    .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+    .card { min-height: 100px; padding: 14px 12px; }
+    .card .value { font-size: 23px; }
+    .section { padding: 15px 12px; }
+    .form-row { display: grid; grid-template-columns: 1fr; }
+    .form-row input, .form-row select { min-width: 0; }
+    .dashboard-hero { min-height: 315px; padding-right: 4px; padding-left: 4px; }
+    .hero-mark { width: 62px; height: 62px; font-size: 28px; }
+    .hero-actions { gap: 5px; }
+    .hero-button { padding: 8px 10px; font-size: 10px; }
+    .dashboard-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .status-panel-heading { align-items: flex-start; flex-direction: column; }
+    .status-grid, .permission-list, .permissions-controls { grid-template-columns: 1fr; }
+    .permissions-hero { flex-direction: column; }
+    .permissions-badge { align-self: flex-start; }
+    .permissions-savebar { align-items: stretch; flex-direction: column; }
+    .permissions-save { width: 100%; }
+    .permissions-editor-heading { align-items: flex-start; flex-direction: column; }
+    .permission-toolbar .permission-reload { margin-left: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  }
 </style>
 </head>
 <body>
-  <header>
-    <h1>🤖 Dashboard Bot</h1>
-    <div class="search-box">
-      <form action="/search" method="get">
-        <input type="text" name="q" placeholder="Cerca utente, motivo, moderatore..." value="${safeQ}" maxlength="100">
-        <button type="submit" class="secondary">Cerca</button>
-      </form>
-    </div>
-    <div class="user">
-      <img src="${avatar}" alt="">
-      <span>${name}</span>
-      <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
-      <a href="/auth/logout"><button class="danger">Logout</button></a>
-    </div>
-  </header>
-
-  <nav>
-    <a href="/dashboard" class="${page === 'dashboard' ? 'active' : ''}">📊 Dashboard</a>
-    <a href="/modlogs" class="${page === 'modlogs' ? 'active' : ''}">📋 Mod Logs</a>
-    <a href="/notes" class="${page === 'notes' ? 'active' : ''}">📝 Note</a>
-    <a href="/tickets" class="${page === 'tickets' ? 'active' : ''}">🎫 Ticket</a>
-    <a href="/commands" class="${page === 'commands' ? 'active' : ''}">🔧 Comandi</a>
-    <a href="/config" class="${page === 'config' ? 'active' : ''}">⚙️ Config</a>
-    <a href="/reminders" class="${page === 'reminders' ? 'active' : ''}">⏰ Reminder</a>
-    <a href="/charts" class="${page === 'charts' ? 'active' : ''}">📊 Grafici</a>
-    <a href="/top" class="${page === 'top' ? 'active' : ''}">🏆 Top</a>
-    <a href="/messages" class="${page === 'messages' ? 'active' : ''}">✉️ Messaggi</a>
-    <a href="/user-actions" class="${page === 'userActions' ? 'active' : ''}">🛠️ Gestione Utenti</a>
-    <a href="/access-logs" class="${page === 'accesslogs' ? 'active' : ''}">🔐 Accessi</a>
-    <!-- VOCE LOBBY AGGIUNTA -->
-    <a href="/lobbies" class="${page === 'lobbies' ? 'active' : ''}">🗺️ Lobby</a>
-  </nav>
-
-  ${body}
+  <aside class="app-sidebar" id="app-sidebar">
+    <a class="brand" href="${sidebarHome}" aria-label="Tommy Utilities, dashboard">
+      <span class="brand-mark" aria-hidden="true">T</span>
+      <span><strong>TOMMY UTILITIES</strong><small>BOT CONTROL CENTER</small></span>
+    </a>
+    <nav class="sidebar-nav" id="sidebar-nav" aria-label="Navigazione dashboard">
+      ${sidebarNavigation}
+    </nav>
+    <div class="sidebar-footer">Tommy Utilities <span aria-hidden="true">·</span> Discord bot</div>
+  </aside>
+  <button class="sidebar-overlay" id="sidebar-overlay" type="button" aria-label="Chiudi navigazione"></button>
+  <main class="app-main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button class="menu-toggle" id="menu-toggle" type="button" aria-expanded="false" aria-controls="sidebar-nav" aria-label="Apri navigazione">☰</button>
+        <div class="page-heading"><p class="eyebrow">CONTROL PANEL</p><h1>${escapeHtml(pageTitle)}</h1></div>
+      </div>
+      <div class="topbar-actions">
+        ${searchControl}
+        <div class="user">
+          <img src="${avatar}" alt="">
+          <span class="user-name">${name}</span>
+          <div class="user-actions">
+            <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
+            <a href="/auth/logout"><button class="danger small">Logout</button></a>
+          </div>
+        </div>
+      </div>
+    </header>
+    <div class="content-area">${body}</div>
+  </main>
+  <script>
+    (function () {
+      const toggle = document.getElementById('menu-toggle');
+      const overlay = document.getElementById('sidebar-overlay');
+      const nav = document.getElementById('sidebar-nav');
+      function setSidebarOpen(open) {
+        document.body.classList.toggle('sidebar-open', open);
+        toggle.setAttribute('aria-expanded', String(open));
+        toggle.setAttribute('aria-label', open ? 'Chiudi navigazione' : 'Apri navigazione');
+      }
+      toggle.addEventListener('click', () => setSidebarOpen(toggle.getAttribute('aria-expanded') !== 'true'));
+      overlay.addEventListener('click', () => setSidebarOpen(false));
+      nav.addEventListener('click', event => {
+        if (event.target.closest('a')) setSidebarOpen(false);
+      });
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') setSidebarOpen(false);
+      });
+      window.addEventListener('resize', () => {
+        if (window.innerWidth > 760) setSidebarOpen(false);
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -1770,56 +2333,135 @@ function formatDuration(seconds) {
 }
 
 // ---------- DASHBOARD ----------
-function renderDashboardContent() {
+function renderDashboardContent(security = {}) {
+  const permissions = new Set(security.permissions || []);
+  const canViewOverview = permissions.has('overview');
+  const canModerate = permissions.has('moderation');
+  const canManageTickets = permissions.has('tickets');
+  const canManageCommunications = permissions.has('communications');
+  const canManageGlobalBlacklist = security.canUseGlobalBlacklist === true;
+  const quickLinks = [
+    canModerate ? '<a class="hero-button hero-button-primary" href="/modlogs">Apri moderazione <span aria-hidden="true">→</span></a>' : '',
+    permissions.has('tickets') ? '<a class="hero-button hero-button-secondary" href="/tickets">Gestisci ticket</a>' : '',
+    permissions.has('settings') ? '<a class="hero-button hero-button-secondary" href="/config">Configurazione</a>' : '',
+    security.canExportFullBackup ? '<a class="hero-button hero-button-secondary" href="/api/export/full-backup" onclick="return confirm(&quot;Il backup include tutti i dati salvati, compresi log e dati di accesso. Continuare?&quot;)">Esporta backup completo</a>' : '',
+    canManageGlobalBlacklist ? '<a class="hero-button hero-button-primary" href="#blacklist-content">Gestisci blacklist</a>' : '',
+    canViewOverview ? '<a class="hero-button hero-button-quiet" href="#service-status">Stato servizi <span aria-hidden="true">↓</span></a>' : ''
+  ].filter(Boolean).join('');
+  const blacklistStat = canManageGlobalBlacklist
+    ? '<div class="card"><h2>Blacklist</h2><div class="value" id="stat-bl">...</div></div>'
+    : '';
+  const moderationPanels = canManageGlobalBlacklist ? `
+    <div class="section">
+      <h2>➕ Aggiungi alla Blacklist</h2>
+      <p style="color:#888;font-size:13px;margin-bottom:12px;">Bannerà l'utente in tutti i server dove il bot è presente e gli invierà un DM.</p>
+      <div class="form-row">
+        <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)" maxlength="20">
+        <input type="text" id="bl-username" placeholder="Username" maxlength="64">
+        <input type="text" id="bl-reason" placeholder="Motivo" maxlength="500">
+        <button onclick="addBL()">Aggiungi</button>
+      </div>
+      <div id="bl-msg"></div>
+    </div>
+    <div class="section">
+      <h2>🚫 Blacklist Globale</h2>
+      <div class="export-bar">
+        <a href="/api/export/blacklist.csv">📥 Esporta CSV</a>
+        <a href="#" onclick="bulkDeleteBL();return false;">🗑️ Elimina selezionati</a>
+      </div>
+      <div id="blacklist-content" class="loading">Caricamento...</div>
+    </div>` : '';
+  const statusPanel = canViewOverview ? `
+    <section class="section status-panel" id="service-status">
+      <div class="status-panel-heading">
+        <div><p class="hero-eyebrow">MONITORAGGIO LIVE</p><h2>Stato dei servizi</h2></div>
+        <span class="status-updated" id="status-updated">In attesa di aggiornamento</span>
+      </div>
+      <div class="status-grid">
+        <div class="status-item"><span class="status-item-label">Dashboard API</span><strong class="status-value checking" id="status-api">Controllo...</strong></div>
+        <div class="status-item"><span class="status-item-label">Gateway Discord</span><strong class="status-value checking" id="status-bot">Controllo...</strong></div>
+        <div class="status-item"><span class="status-item-label">Database</span><strong class="status-value checking" id="status-database">Controllo...</strong></div>
+        <div class="status-item"><span class="status-item-label">Ping gateway</span><strong class="status-value checking" id="status-ping">—</strong></div>
+      </div>
+    </section>` : '';
+  const statsGrid = canViewOverview ? `
+    <div class="grid dashboard-stats">
+      ${canModerate ? '<div class="card"><h2>Log Totali</h2><div class="value" id="stat-logs">...</div></div>' : ''}
+      ${blacklistStat}
+      <div class="card"><h2>Server gestiti</h2><div class="value" id="stat-guilds">...</div></div>
+      <div class="card"><h2>Ping</h2><div class="value" id="stat-ping">...</div></div>
+      <div class="card"><h2>Uptime</h2><div class="value" id="stat-uptime">...</div></div>
+      ${canManageTickets ? '<div class="card"><h2>Ticket Aperti</h2><div class="value" id="stat-tickets">...</div></div><div class="card"><h2>Transcripts</h2><div class="value" id="stat-transcripts">...</div></div>' : ''}
+      ${canModerate ? '<div class="card"><h2>Note</h2><div class="value" id="stat-notes">...</div></div>' : ''}
+      ${canManageCommunications ? '<div class="card"><h2>Reminder</h2><div class="value" id="stat-reminders">...</div></div>' : ''}
+    </div>` : '';
   return `
-  <div class="grid">
-    <div class="card"><h2>Log Totali</h2><div class="value" id="stat-logs">...</div></div>
-    <div class="card"><h2>Blacklist</h2><div class="value" id="stat-bl">...</div></div>
-    <div class="card"><h2>Server</h2><div class="value" id="stat-guilds">...</div></div>
-    <div class="card"><h2>Ping</h2><div class="value" id="stat-ping">...</div></div>
-    <div class="card"><h2>Uptime</h2><div class="value" id="stat-uptime">...</div></div>
-    <div class="card"><h2>Ticket Aperti</h2><div class="value" id="stat-tickets">...</div></div>
-    <div class="card"><h2>Note</h2><div class="value" id="stat-notes">...</div></div>
-    <div class="card"><h2>Transcripts</h2><div class="value" id="stat-transcripts">...</div></div>
-    <div class="card"><h2>Reminder</h2><div class="value" id="stat-reminders">...</div></div>
-  </div>
+  <section class="dashboard-hero">
+    <div class="hero-mark" aria-hidden="true">T</div>
+    <p class="hero-eyebrow">TOMMY UTILITIES · BOT CONTROL CENTER</p>
+    <h2>Il tuo bot.<br><span>Sempre sotto controllo.</span></h2>
+    <p class="hero-description">${canViewOverview ? 'Monitora l\'operatività e gestisci le attività del tuo server da un unico pannello.' : 'Gestisci la blacklist globale autorizzata per i tuoi ruoli.'}</p>
+    <div class="hero-actions">${quickLinks}</div>
+    ${canViewOverview ? '<div class="hero-status"><span class="status-led checking" id="status-led"></span><span id="status-summary" aria-live="polite">Verifica stato servizi...</span></div>' : ''}
+  </section>
 
-  <div class="section">
-    <h2>➕ Aggiungi alla Blacklist</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:12px;">Bannerà l'utente in tutti i server dove il bot è presente e gli invierà un DM.</p>
-    <div class="form-row">
-      <input type="text" id="bl-userId" placeholder="ID utente (17-20 cifre)" maxlength="20">
-      <input type="text" id="bl-username" placeholder="Username" maxlength="64">
-      <input type="text" id="bl-reason" placeholder="Motivo" maxlength="500">
-      <button onclick="addBL()">Aggiungi</button>
-    </div>
-    <div id="bl-msg"></div>
-  </div>
+  ${statusPanel}
+  ${statsGrid}
 
-  <div class="section">
-    <h2>🚫 Blacklist Globale</h2>
-    <div class="export-bar">
-      <a href="/api/export/blacklist.csv">📥 Esporta CSV</a>
-      <a href="#" onclick="bulkDeleteBL();return false;">🗑️ Elimina selezionati</a>
-    </div>
-    <div id="blacklist-content" class="loading">Caricamento...</div>
-  </div>
-
+  ${moderationPanels}
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  const canRefreshStats = ${canViewOverview};
+  function refreshStatsAfterBlacklist() { if (canRefreshStats) loadStats(); }
+  function setStat(id, value) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  }
   async function loadStats() {
     const res = await apiFetch('/api/stats'); if (!res.ok) return;
     const s = await res.json();
-    document.getElementById('stat-logs').textContent = s.logs;
-    document.getElementById('stat-bl').textContent = s.blacklist;
-    document.getElementById('stat-guilds').textContent = s.guilds;
-    document.getElementById('stat-ping').textContent = s.ping + 'ms';
+    setStat('stat-logs', s.logs);
+    const blacklist = document.getElementById('stat-bl');
+    if (blacklist) blacklist.textContent = s.blacklist ?? '—';
+    setStat('stat-guilds', s.guilds);
+    setStat('stat-ping', s.ping == null ? 'N/D' : s.ping + 'ms');
     const h = Math.floor(s.uptime/3600), m = Math.floor((s.uptime%3600)/60);
-    document.getElementById('stat-uptime').textContent = h + 'h ' + m + 'm';
-    document.getElementById('stat-tickets').textContent = s.tickets || 0;
-    document.getElementById('stat-notes').textContent = s.notes || 0;
-    document.getElementById('stat-transcripts').textContent = s.transcripts || 0;
-    document.getElementById('stat-reminders').textContent = s.reminders || 0;
+    setStat('stat-uptime', h + 'h ' + m + 'm');
+    setStat('stat-tickets', s.tickets);
+    setStat('stat-notes', s.notes);
+    setStat('stat-transcripts', s.transcripts);
+    setStat('stat-reminders', s.reminders);
+  }
+  function setStatus(id, state, label) {
+    const el = document.getElementById(id);
+    el.textContent = label;
+    el.className = 'status-value ' + state;
+  }
+  function markStatusUnavailable() {
+    document.getElementById('status-led').className = 'status-led offline';
+    document.getElementById('status-summary').textContent = 'Stato non disponibile';
+    setStatus('status-api', 'offline', 'Non disponibile');
+    setStatus('status-bot', 'offline', 'Non disponibile');
+    setStatus('status-database', 'offline', 'Non disponibile');
+    setStatus('status-ping', 'offline', 'N/D');
+  }
+  async function loadStatus() {
+    try {
+      const res = await apiFetch('/api/status');
+      if (!res.ok) { markStatusUnavailable(); return; }
+      const status = await res.json();
+      const servicesOnline = status.status === 'operational';
+      document.getElementById('status-led').className = 'status-led ' + (servicesOnline ? 'online' : 'offline');
+      document.getElementById('status-summary').textContent = servicesOnline ? 'Tutti i servizi operativi' : 'Servizi con problemi';
+      setStatus('status-api', 'online', 'Online');
+      setStatus('status-bot', status.botOnline ? 'online' : 'offline', status.botOnline ? 'Connesso' : 'Disconnesso');
+      setStatus('status-database', status.databaseReady ? 'online' : 'offline', status.databaseReady ? 'Operativo' : 'Non disponibile');
+      setStatus('status-ping', status.ping == null ? 'offline' : 'online', status.ping == null ? 'N/D' : status.ping + ' ms');
+      document.getElementById('status-updated').textContent = 'Aggiornato alle ' + new Date(status.checkedAt).toLocaleTimeString('it-IT');
+    } catch (error) {
+      console.error('[status] aggiornamento non riuscito', error);
+      markStatusUnavailable();
+    }
   }
   async function loadBlacklist() {
     const res = await apiFetch('/api/blacklist');
@@ -1841,7 +2483,7 @@ function renderDashboardContent() {
     if (!confirm('Rimuovere ' + ids.length + ' utenti dalla blacklist? Verranno sbannati in tutti i server.')) return;
     const res = await apiFetch('/api/blacklist/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) });
     const data = await res.json().catch(() => ({}));
-    if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); loadStats(); }
+    if (res.ok) { alert('✅ Rimossi ' + data.count + ' utenti'); loadBlacklist(); refreshStatsAfterBlacklist(); }
     else alert('❌ ' + (data.error || 'Errore'));
   }
   async function addBL() {
@@ -1857,17 +2499,374 @@ function renderDashboardContent() {
       document.getElementById('bl-userId').value = '';
       document.getElementById('bl-username').value = '';
       document.getElementById('bl-reason').value = '';
-      loadBlacklist(); loadStats();
+      loadBlacklist(); refreshStatsAfterBlacklist();
     } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
   }
   async function removeBL(userId) {
     if (!confirm('Rimuovere ' + userId + ' dalla blacklist? Verrà sbannato dove è bannato.')) return;
     const res = await apiFetch('/api/blacklist/' + encodeURIComponent(userId), { method: 'DELETE' });
     if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadBlacklist(); loadStats();
+    loadBlacklist(); refreshStatsAfterBlacklist();
   }
-  loadStats(); loadBlacklist();
-  setInterval(loadStats, 10000);
+  if (${canViewOverview}) {
+    loadStats(); loadStatus();
+    setInterval(loadStats, 10000);
+    setInterval(loadStatus, 15000);
+  }
+  if (${canManageGlobalBlacklist}) loadBlacklist();
+  </script>`;
+}
+
+function renderResourcesContent() {
+  return `
+  <section class="resources-hero">
+    <p class="eyebrow">TOMMY UTILITIES · RISORSE</p>
+    <h2>Resources</h2>
+    <p>I server Discord collegati al bot e le aree a cui hai accesso.</p>
+  </section>
+  <section>
+    <div class="resources-section-heading">
+      <h2>Server Discord</h2>
+      <p>Server disponibili in base ai permessi assegnati.</p>
+    </div>
+    <div class="grid resources-grid" id="resources-list" aria-live="polite">
+      <div class="section resources-empty">Caricamento server...</div>
+    </div>
+  </section>
+  <script>
+  function resourceEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  const resourceLabels = {
+    overview: 'Dashboard', moderation: 'Moderazione', global_blacklist: 'Blacklist',
+    tickets: 'Ticket', settings: 'Configurazione', analytics: 'Analytics',
+    communications: 'Comunicazioni', lobbies: 'Lobby', audit: 'Log accessi'
+  };
+  const resourceRoutes = [
+    ['settings', '/config', 'Apri configurazione'],
+    ['tickets', '/tickets', 'Gestisci ticket'],
+    ['moderation', '/modlogs', 'Apri moderazione'],
+    ['analytics', '/charts', 'Apri analytics'],
+    ['communications', '/messages', 'Apri comunicazioni'],
+    ['lobbies', '/lobbies', 'Apri lobby'],
+    ['audit', '/access-logs', 'Apri log accessi'],
+    ['overview', '/dashboard', 'Apri dashboard'],
+    ['global_blacklist', '/dashboard', 'Apri blacklist']
+  ];
+  async function loadResources() {
+    const root = document.getElementById('resources-list');
+    try {
+      const response = await apiFetch('/api/resources');
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        root.innerHTML = '<div class="section resources-empty">' + resourceEsc(data.error || 'Impossibile caricare le risorse.') + '</div>';
+        return;
+      }
+      if (!data.length) {
+        root.innerHTML = '<div class="section resources-empty">Nessun server Discord visibile con i permessi attuali.</div>';
+        return;
+      }
+      root.innerHTML = data.map(guild => {
+        const permissions = Array.isArray(guild.permissions) ? guild.permissions : [];
+        const tags = permissions.map(permission => resourceLabels[permission]).filter(Boolean);
+        const destination = resourceRoutes.find(([feature]) => permissions.includes(feature));
+        const icon = guild.iconUrl
+          ? '<img src="' + resourceEsc(guild.iconUrl) + '" alt="" loading="lazy">'
+          : '<span aria-hidden="true">' + resourceEsc((guild.name || 'D').slice(0, 1).toUpperCase()) + '</span>';
+        const members = Number.isFinite(guild.memberCount)
+          ? '<span><strong>' + guild.memberCount.toLocaleString('it-IT') + '</strong> membri</span>'
+          : '';
+        const tagsMarkup = tags.length
+          ? tags.map(label => '<span class="resource-tag">' + resourceEsc(label) + '</span>').join('')
+          : '<span class="resource-tag">Resources</span>';
+        const dashboardLink = destination
+          ? '<a class="resource-link" href="' + destination[1] + '">' + destination[2] + ' →</a>'
+          : '';
+        return '<article class="card resource-card">' +
+          '<div class="resource-card-header"><div class="resource-card-icon">' + icon + '</div>' +
+          '<div><div class="resource-card-type">SERVER DISCORD</div><h3>' + resourceEsc(guild.name) + '</h3></div></div>' +
+          '<div class="resource-card-meta">' + members + '</div>' +
+          '<p class="resource-card-copy">Server collegato al bot. Le sezioni disponibili rispettano i permessi del tuo ruolo.</p>' +
+          '<div class="resource-tags">' + tagsMarkup + '</div>' +
+          '<div class="resource-card-actions"><a class="resource-server-link" href="https://discord.com/channels/' + encodeURIComponent(guild.id) + '" target="_blank" rel="noopener noreferrer">Apri server</a>' + dashboardLink + '</div>' +
+          '</article>';
+      }).join('');
+    } catch (error) {
+      console.error('[resources] caricamento non riuscito', error);
+      root.innerHTML = '<div class="section resources-empty">Errore durante il caricamento delle risorse.</div>';
+    }
+  }
+  loadResources();
+  </script>`;
+}
+
+// ---------- PERMESSI DASHBOARD ----------
+function renderPermissionsContent() {
+  const features = [
+    ['overview', 'Dashboard e stato servizi', 'Panoramica, statistiche e stato live del bot.'],
+    ['moderation', 'Moderazione, log e note', 'Ricerca utenti, azioni, note staff e registri di moderazione.'],
+    ['global_blacklist', 'Blacklist globale', 'Visualizzazione e gestione della blacklist condivisa.'],
+    ['tickets', 'Ticket e transcript', 'Gestione ticket, priorità, assegnazioni e transcript.'],
+    ['settings', 'Configurazione e comandi', 'Impostazioni del server, welcome e comandi personalizzati.'],
+    ['analytics', 'Grafici e classifiche', 'Statistiche aggregate, grafici e classifiche di attività.'],
+    ['communications', 'Messaggi e reminder', 'Invio di messaggi e gestione dei promemoria.'],
+    ['lobbies', 'Lobby', 'Configurazione e gestione delle lobby del server.'],
+    ['audit', 'Log degli accessi', 'Cronologia degli accessi alla dashboard e relativi dettagli.']
+  ];
+  const options = features.map(([key, label, description]) =>
+    `<label class="permission-option"><input class="dashboard-permission" type="checkbox" value="${key}" aria-describedby="permission-description-${key}" disabled><span><strong>${label}</strong><small id="permission-description-${key}">${description}</small></span></label>`
+  ).join('');
+  return `
+  <section class="section">
+    <div class="permissions-hero">
+      <div>
+        <h2>Permessi dashboard</h2>
+        <p class="permissions-help">Scegli cosa può gestire ogni ruolo, separatamente per server. Le modifiche si applicano subito dopo il salvataggio. Senior Admin e gli admin in <code>DASHBOARD_ADMIN_IDS</code> mantengono accesso completo.</p>
+      </div>
+      <span class="permissions-badge">ACCESSO PER RUOLO</span>
+    </div>
+    <div class="permissions-controls">
+      <label for="permission-guild">Server Discord<select id="permission-guild" disabled><option>Caricamento server...</option></select></label>
+      <label for="permission-role">Ruolo da configurare<select id="permission-role" disabled><option>Seleziona un server</option></select></label>
+    </div>
+    <div class="permissions-editor">
+      <div class="permissions-editor-heading">
+        <div><h3>Aree accessibili</h3><p>Seleziona una o più aree da assegnare al ruolo.</p></div>
+        <p class="permission-count" id="permission-count" aria-live="polite">0 di ${features.length} aree</p>
+      </div>
+      <div class="permission-toolbar">
+        <button class="secondary small" id="permission-select-all" type="button" disabled>Seleziona tutte</button>
+        <button class="secondary small" id="permission-clear-all" type="button" disabled>Rimuovi tutte</button>
+        <button class="secondary small" id="permission-reset" type="button" disabled>Ripristina</button>
+        <button class="secondary small permission-reload" id="permission-reload" type="button" disabled>Ricarica dati</button>
+      </div>
+      <div id="permission-list" class="permission-list">${options}</div>
+    </div>
+    <div class="permissions-savebar">
+      <div id="permission-message" class="permission-message" role="status" aria-live="polite">Caricamento server autorizzati...</div>
+      <button class="permissions-save" id="permission-save" type="button" disabled>Salva modifiche</button>
+    </div>
+  </section>
+  <script>
+  function permissionEsc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  let permissionGuilds = [];
+  let permissionRoles = [];
+  let savedPermissionValues = '[]';
+  let activeGuildId = '';
+  let activeRoleId = '';
+  let permissionSaveInProgress = false;
+  let permissionLoadInProgress = false;
+  let permissionLoadSequence = 0;
+  const permissionFeatureCount = ${features.length};
+  const permissionInputs = () => Array.from(document.querySelectorAll('.dashboard-permission'));
+  function selectedPermissionValues() {
+    return permissionInputs().filter(input => input.checked).map(input => input.value).sort();
+  }
+  function permissionIsDirty() {
+    return JSON.stringify(selectedPermissionValues()) !== savedPermissionValues;
+  }
+  function permissionMessage(text, type) {
+    const el = document.getElementById('permission-message');
+    el.textContent = text;
+    el.className = 'permission-message ' + (type || '');
+  }
+  function updatePermissionEditor() {
+    const count = permissionInputs().filter(input => input.checked).length;
+    const canEdit = permissionRoles.length > 0 && !permissionLoadInProgress;
+    const locked = permissionSaveInProgress || permissionLoadInProgress;
+    const message = document.getElementById('permission-message');
+    document.getElementById('permission-count').textContent = count + ' di ' + permissionFeatureCount + ' aree selezionate';
+    document.getElementById('permission-guild').disabled = locked || !permissionGuilds.length;
+    document.getElementById('permission-role').disabled = locked || !permissionRoles.length;
+    permissionInputs().forEach(input => { input.disabled = !canEdit || permissionSaveInProgress; });
+    document.getElementById('permission-select-all').disabled = !canEdit || count === permissionFeatureCount || permissionSaveInProgress;
+    document.getElementById('permission-clear-all').disabled = !canEdit || count === 0 || permissionSaveInProgress;
+    document.getElementById('permission-reset').disabled = !canEdit || !permissionIsDirty() || permissionSaveInProgress;
+    document.getElementById('permission-reload').disabled = locked || (!permissionGuilds.length && !message.classList.contains('error'));
+    document.getElementById('permission-save').disabled = !canEdit || !permissionIsDirty() || permissionSaveInProgress;
+    if (!permissionSaveInProgress && permissionIsDirty() && !message.classList.contains('error')) {
+      permissionMessage('Modifiche non salvate', 'pending');
+    }
+  }
+  function canDiscardPermissionChanges() {
+    if (permissionSaveInProgress) return false;
+    if (!permissionIsDirty()) return true;
+    return confirm('Ci sono modifiche non salvate. Vuoi scartarle?');
+  }
+  async function loadPermissionGuilds() {
+    const select = document.getElementById('permission-guild');
+    let guildListLoaded = false;
+    permissionLoadInProgress = true;
+    updatePermissionEditor();
+    try {
+      const res = await apiFetch('/api/dashboard/managed-guilds');
+      const data = await res.json().catch(() => []);
+      if (!res.ok) {
+        permissionMessage(data.error || 'Impossibile caricare i server autorizzati.', 'error');
+        return;
+      }
+      permissionGuilds = data;
+      select.innerHTML = permissionGuilds.map(g => '<option value="' + permissionEsc(g.id) + '">' + permissionEsc(g.name) + '</option>').join('');
+      if (!permissionGuilds.length) {
+        select.innerHTML = '<option value="">Nessun server disponibile</option>';
+        permissionMessage('Non hai accesso amministrativo a nessun server.', 'error');
+        return;
+      }
+      guildListLoaded = true;
+    } catch (error) {
+      console.error('[permissions] caricamento server non riuscito', error);
+      permissionMessage('Errore durante il caricamento dei server.', 'error');
+    } finally {
+      permissionLoadInProgress = false;
+      updatePermissionEditor();
+    }
+    if (guildListLoaded) {
+      const guildSelect = document.getElementById('permission-guild');
+      guildSelect.value = permissionGuilds.some(guild => guild.id === activeGuildId) ? activeGuildId : permissionGuilds[0].id;
+      await loadPermissionRoles(activeRoleId);
+    }
+  }
+  async function loadPermissionRoles(preferredRoleId) {
+    const guildId = document.getElementById('permission-guild').value;
+    const roleSelect = document.getElementById('permission-role');
+    const requestId = ++permissionLoadSequence;
+    permissionLoadInProgress = true;
+    permissionMessage('Caricamento ruoli...', 'pending');
+    permissionRoles = [];
+    activeGuildId = guildId;
+    activeRoleId = '';
+    permissionInputs().forEach(input => { input.checked = false; });
+    savedPermissionValues = '[]';
+    updatePermissionEditor();
+    permissionMessage('Caricamento ruoli...', 'pending');
+    try {
+      const res = await apiFetch('/api/dashboard/role-permissions/' + encodeURIComponent(guildId));
+      const data = await res.json().catch(() => []);
+      if (requestId !== permissionLoadSequence) return;
+      if (!res.ok) {
+        roleSelect.innerHTML = '<option value="">Ruoli non disponibili</option>';
+        permissionMessage(data.error || 'Impossibile caricare i ruoli.', 'error');
+        return;
+      }
+      if (!Array.isArray(data)) throw new Error('Risposta ruoli non valida');
+      permissionRoles = data;
+      roleSelect.innerHTML = permissionRoles.map(role => '<option value="' + permissionEsc(role.id) + '">' + permissionEsc(role.name) + '</option>').join('');
+      if (permissionRoles.length) {
+        const selectedRole = permissionRoles.some(role => role.id === preferredRoleId) ? preferredRoleId : permissionRoles[0].id;
+        roleSelect.value = selectedRole;
+        activeRoleId = selectedRole;
+        showRolePermissions();
+      } else {
+        roleSelect.innerHTML = '<option value="">Nessun ruolo configurabile</option>';
+        permissionInputs().forEach(input => { input.checked = false; });
+        savedPermissionValues = '[]';
+        updatePermissionEditor();
+        permissionMessage('Nessun ruolo configurabile in questo server.', '');
+      }
+    } catch (error) {
+      if (requestId !== permissionLoadSequence) return;
+      console.error('[permissions] caricamento ruoli non riuscito', error);
+      roleSelect.innerHTML = '<option value="">Errore caricamento ruoli</option>';
+      permissionMessage('Errore durante il caricamento dei ruoli.', 'error');
+    } finally {
+      if (requestId === permissionLoadSequence) {
+        permissionLoadInProgress = false;
+        updatePermissionEditor();
+      }
+    }
+  }
+  function showRolePermissions() {
+    const roleSelect = document.getElementById('permission-role');
+    const role = permissionRoles.find(item => item.id === roleSelect.value);
+    activeRoleId = roleSelect.value;
+    const selected = new Set(role ? role.permissions : []);
+    permissionInputs().forEach(input => { input.checked = selected.has(input.value); });
+    savedPermissionValues = JSON.stringify([...selected].sort());
+    permissionMessage('Permessi aggiornati', 'success');
+    updatePermissionEditor();
+  }
+  function handlePermissionRoleChange() {
+    const roleSelect = document.getElementById('permission-role');
+    if (!canDiscardPermissionChanges()) {
+      roleSelect.value = activeRoleId;
+      return;
+    }
+    showRolePermissions();
+  }
+  async function handlePermissionGuildChange() {
+    const guildSelect = document.getElementById('permission-guild');
+    if (!canDiscardPermissionChanges()) {
+      guildSelect.value = activeGuildId;
+      return;
+    }
+    await loadPermissionRoles();
+  }
+  function resetPermissionChanges() {
+    const saved = new Set(JSON.parse(savedPermissionValues));
+    permissionInputs().forEach(input => { input.checked = saved.has(input.value); });
+    permissionMessage('Modifiche ripristinate.', 'success');
+    updatePermissionEditor();
+  }
+  async function reloadPermissionData() {
+    if (!canDiscardPermissionChanges()) return;
+    await loadPermissionGuilds();
+  }
+  async function saveRolePermissions() {
+    if (permissionSaveInProgress || permissionLoadInProgress || !permissionIsDirty() || !permissionRoles.length) return;
+    const guildId = document.getElementById('permission-guild').value;
+    const roleId = document.getElementById('permission-role').value;
+    const permissions = selectedPermissionValues();
+    if (!roleId) return;
+    if (!permissions.length && !confirm('Rimuovere tutti i permessi di questo ruolo? Il ruolo perderà l’accesso alla dashboard.')) return;
+    const button = document.getElementById('permission-save');
+    permissionSaveInProgress = true;
+    button.textContent = 'Salvataggio...';
+    updatePermissionEditor();
+    try {
+      const res = await apiFetch('/api/dashboard/role-permissions/' + encodeURIComponent(guildId) + '/' + encodeURIComponent(roleId), {
+        method: 'PUT',
+        body: JSON.stringify({ permissions })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        permissionMessage(data.error || 'Salvataggio non riuscito.', 'error');
+        return;
+      }
+      const role = permissionRoles.find(item => item.id === roleId);
+      if (role) role.permissions = permissions;
+      savedPermissionValues = JSON.stringify(permissions);
+      permissionMessage(permissions.length ? 'Permessi salvati e applicati.' : 'Accesso dashboard rimosso per questo ruolo.', 'success');
+    } catch (error) {
+      console.error('[permissions] salvataggio non riuscito', error);
+      permissionMessage('Errore durante il salvataggio. Riprova.', 'error');
+    } finally {
+      permissionSaveInProgress = false;
+      button.textContent = 'Salva modifiche';
+      updatePermissionEditor();
+    }
+  }
+  document.getElementById('permission-guild').addEventListener('change', handlePermissionGuildChange);
+  document.getElementById('permission-role').addEventListener('change', handlePermissionRoleChange);
+  document.getElementById('permission-select-all').addEventListener('click', () => {
+    permissionInputs().forEach(input => { input.checked = true; });
+    updatePermissionEditor();
+  });
+  document.getElementById('permission-clear-all').addEventListener('click', () => {
+    permissionInputs().forEach(input => { input.checked = false; });
+    updatePermissionEditor();
+  });
+  document.getElementById('permission-reset').addEventListener('click', resetPermissionChanges);
+  document.getElementById('permission-reload').addEventListener('click', reloadPermissionData);
+  permissionInputs().forEach(input => input.addEventListener('change', () => {
+    if (document.getElementById('permission-message').classList.contains('error')) {
+      permissionMessage('Modifiche non salvate', 'pending');
+    }
+    updatePermissionEditor();
+  }));
+  document.getElementById('permission-save').addEventListener('click', saveRolePermissions);
+  loadPermissionGuilds();
   </script>`;
 }
 
@@ -1875,10 +2874,16 @@ function renderDashboardContent() {
 function renderModlogsContent() {
   return `
   <div class="section">
-    <h2>📋 Mod Logs</h2>
-    <div class="export-bar"><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
-    <div class="filter-bar">
-      <select id="filter-type" onchange="loadLogs()">
+    <div class="tool-heading">
+      <div><h2>📋 Mod Logs</h2><p class="tool-subtitle">Registro delle azioni di moderazione, con filtri rapidi e ricerca nei dettagli.</p></div>
+      <div class="export-bar"><button class="secondary small" onclick="loadLogs(true)">↻ Aggiorna</button><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
+    </div>
+    <div class="tool-stats">
+      <div class="tool-stat"><strong id="logs-total">—</strong><span>Log disponibili</span></div>
+      <div class="tool-stat"><strong id="logs-visible">—</strong><span>Risultati filtrati</span></div>
+    </div>
+    <div class="tool-controls">
+      <select id="filter-type" onchange="renderLogs()">
         <option value="">Tutti i tipi</option>
         <option value="Kick">Kick</option>
         <option value="Ban">Ban</option>
@@ -1891,7 +2896,8 @@ function renderModlogsContent() {
         <option value="Ticket Claim">Ticket Claim</option>
         <option value="Ticket Priorità">Ticket Priorità</option>
       </select>
-      <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()" maxlength="20">
+      <input type="search" id="filter-user" placeholder="ID utente target" oninput="renderLogs()" maxlength="20">
+      <input type="search" id="filter-log-text" placeholder="Cerca target, moderatore o motivo" oninput="renderLogs()" maxlength="100">
     </div>
     <div id="logs-content" class="loading">Caricamento...</div>
   </div>
@@ -1899,16 +2905,40 @@ function renderModlogsContent() {
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let allLogs = [];
-  async function loadLogs() {
-    if (!allLogs.length) { const res = await apiFetch('/api/logs/all'); allLogs = await res.json(); }
+  let logsLoaded = false;
+  async function loadLogs(force) {
+    const el = document.getElementById('logs-content');
+    if (!logsLoaded || force) {
+      el.innerHTML = '<p class="loading">Caricamento log...</p>';
+      try {
+        const res = await apiFetch('/api/logs/all');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+        allLogs = data;
+        logsLoaded = true;
+      } catch (error) {
+        el.innerHTML = '<div class="tool-empty">Impossibile caricare i log. <button class="secondary small" onclick="loadLogs(true)">Riprova</button></div>';
+        console.error('[modlogs] caricamento non riuscito', error);
+        return;
+      }
+    }
+    renderLogs();
+  }
+  function renderLogs() {
     const type = document.getElementById('filter-type').value;
     const userId = document.getElementById('filter-user').value.trim();
+    const query = document.getElementById('filter-log-text').value.trim().toLowerCase();
     let logs = allLogs;
     if (type) logs = logs.filter(l => l.type === type);
     if (userId) logs = logs.filter(l => (l.target_id || '').includes(userId));
+    if (query) logs = logs.filter(l => [l.target, l.target_id, l.moderator, l.reason, l.type]
+      .some(value => String(value || '').toLowerCase().includes(query)));
     const el = document.getElementById('logs-content');
-    if (!logs.length) { el.innerHTML = '<p class="loading">Nessun log trovato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
+    document.getElementById('logs-total').textContent = allLogs.length.toLocaleString('it-IT');
+    document.getElementById('logs-visible').textContent = logs.length.toLocaleString('it-IT');
+    if (!logs.length) { el.innerHTML = '<div class="tool-empty">' + (allLogs.length ? 'Nessun log corrisponde ai filtri.' : 'Non ci sono ancora log di moderazione.') + '</div>'; return; }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
       logs.map(l => '<tr>' +
         '<td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td>' +
         '<td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td>' +
@@ -1916,9 +2946,9 @@ function renderModlogsContent() {
         '<td>' + esc(l.moderator || '-') + '</td>' +
         '<td>' + esc(l.reason || '-') + '</td>' +
         '<td>' + esc(l.duration || '-') + '</td>' +
-      '</tr>').join('') + '</tbody></table>';
+      '</tr>').join('') + '</tbody></table></div>';
   }
-  loadLogs();
+  loadLogs(false);
   </script>`;
 }
 
@@ -1971,63 +3001,111 @@ function renderNotesContent() {
 function renderTicketsContent() {
   return `
   <div class="section">
-    <h2>🎫 Ticket Aperti</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Gestisci i ticket aperti sul server.</p>
+    <div class="tool-heading">
+      <div><h2>🎫 Ticket Aperti</h2><p class="tool-subtitle">Gestisci assegnazione, priorità e chiusura dei ticket attivi.</p></div>
+      <button class="secondary small" onclick="loadTickets(true)">↻ Aggiorna</button>
+    </div>
+    <div class="tool-stats">
+      <div class="tool-stat"><strong id="tickets-total">—</strong><span>Ticket aperti</span></div>
+      <div class="tool-stat"><strong id="tickets-urgent">—</strong><span>Priorità alta/urgente</span></div>
+    </div>
     <div class="form-row" style="margin-bottom:14px;">
-      <select id="tp-channel"></select>
+      <select id="tp-channel" aria-label="Canale in cui inviare il pannello ticket"></select>
       <button onclick="createTicketPanel()">📋 Crea Pannello Ticket</button>
+    </div>
+    <div class="tool-controls">
+      <input type="search" id="ticket-filter" placeholder="Cerca server, canale o utente" oninput="renderTickets()" maxlength="100">
+      <select id="ticket-priority-filter" onchange="renderTickets()" aria-label="Filtra per priorità">
+        <option value="">Tutte le priorità</option><option value="low">Bassa</option><option value="med">Media</option><option value="high">Alta</option><option value="urgent">Urgente</option>
+      </select>
     </div>
     <div id="tickets-content" class="loading">Caricamento...</div>
   </div>
 
   <div class="section">
-    <h2>📜 Archivio Transcripts (Ultimi 100)</h2>
+    <div class="tool-heading">
+      <div><h2>📜 Archivio Transcripts</h2><p class="tool-subtitle">Ultimi 100 ticket chiusi, con transcript consultabili.</p></div>
+      <button class="secondary small" onclick="loadTranscripts(true)">↻ Aggiorna</button>
+    </div>
+    <div class="tool-controls"><input type="search" id="transcript-filter" placeholder="Cerca canale, utente o staff" oninput="renderTranscripts()" maxlength="100"></div>
     <div id="transcripts-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  let openTickets = [];
+  let savedTranscripts = [];
 
   async function loadChannelsForPanel() {
-    const res = await apiFetch('/api/messages/channels');
-    const chs = await res.json();
     const sel = document.getElementById('tp-channel');
-    sel.innerHTML = chs.map(c => '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
+    try {
+      const res = await apiFetch('/api/messages/channels');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const chs = await res.json();
+      sel.innerHTML = chs.map(c => '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale disponibile</option>';
+    } catch (error) {
+      sel.innerHTML = '<option value="">Canali non disponibili</option>';
+      console.error('[tickets] caricamento canali non riuscito', error);
+    }
   }
 
   async function createTicketPanel() {
     const channelId = document.getElementById('tp-channel').value;
     if (!channelId) { alert('Seleziona un canale'); return; }
     if (!confirm('Inviare il pannello ticket in questo canale?')) return;
-    const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
-    if (res.ok) alert('✅ Pannello inviato');
-    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
+    try {
+      const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
+      if (res.ok) alert('✅ Pannello inviato');
+      else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
+    } catch (error) { alert('❌ Invio non riuscito. Controlla la connessione e riprova.'); console.error('[tickets] invio pannello non riuscito', error); }
   }
 
-  async function loadTickets() {
-    const res = await apiFetch('/api/tickets');
-    const tickets = await res.json();
+  async function loadTickets(force) {
     const el = document.getElementById('tickets-content');
-    if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Azioni</th></tr></thead><tbody>' +
+    if (!force || !openTickets.length) el.innerHTML = '<p class="loading">Caricamento ticket...</p>';
+    try {
+      const res = await apiFetch('/api/tickets');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      openTickets = data;
+      renderTickets();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Impossibile caricare i ticket. <button class="secondary small" onclick="loadTickets(true)">Riprova</button></div>';
+      console.error('[tickets] caricamento non riuscito', error);
+    }
+  }
+
+  function renderTickets() {
+    const query = document.getElementById('ticket-filter').value.trim().toLowerCase();
+    const priority = document.getElementById('ticket-priority-filter').value;
+    const tickets = openTickets.filter(t => {
+      const matchesQuery = !query || [t.guild, t.channel, t.userId, t.claimedBy].some(value => String(value || '').toLowerCase().includes(query));
+      return matchesQuery && (!priority || t.priority === priority);
+    });
+    document.getElementById('tickets-total').textContent = openTickets.length.toLocaleString('it-IT');
+    document.getElementById('tickets-urgent').textContent = openTickets.filter(t => t.priority === 'high' || t.priority === 'urgent').length.toLocaleString('it-IT');
+    const el = document.getElementById('tickets-content');
+    if (!tickets.length) { el.innerHTML = '<div class="tool-empty">' + (openTickets.length ? 'Nessun ticket corrisponde ai filtri.' : 'Non ci sono ticket aperti.') + '</div>'; return; }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Azioni</th></tr></thead><tbody>' +
       tickets.map(t => '<tr>' +
         '<td>' + esc(t.guild) + '</td>' +
         '<td>#' + esc(t.channel) + '</td>' +
         '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
         '<td>' + esc(t.claimedBy || '-') + '</td>' +
-        '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td>' +
+        '<td><span class="badge ' + esc(t.priority === 'urgent' || t.priority === 'high' ? 'ban' : 'default') + '">' + esc(t.priority || '—') + '</span></td>' +
+        '<td><div class="ticket-actions">' +
           '<button class="secondary small" onclick="claimTicket(\\'' + esc(t.channelId) + '\\')">Prendi</button> ' +
-          '<select style="width:auto;display:inline-block;margin:0 6px 0 0;padding:4px 8px;" onchange="setPriority(\\'' + esc(t.channelId) + '\\', this.value)">' +
+          '<select aria-label="Modifica priorità" onchange="setPriority(\\'' + esc(t.channelId) + '\\', this.value)">' +
             '<option value="">Priorità</option>' +
-            '<option value="low">🟢 Bassa</option>' +
-            '<option value="med">🟡 Media</option>' +
-            '<option value="high">🟠 Alta</option>' +
-            '<option value="urgent">🔴 Urgente</option>' +
+            '<option value="low"' + (t.priority === 'low' ? ' selected' : '') + '>🟢 Bassa</option>' +
+            '<option value="med"' + (t.priority === 'med' ? ' selected' : '') + '>🟡 Media</option>' +
+            '<option value="high"' + (t.priority === 'high' ? ' selected' : '') + '>🟠 Alta</option>' +
+            '<option value="urgent"' + (t.priority === 'urgent' ? ' selected' : '') + '>🔴 Urgente</option>' +
           '</select>' +
           '<button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button>' +
-        '</td>' +
-      '</tr>').join('') + '</tbody></table>';
+        '</div></td>' +
+      '</tr>').join('') + '</tbody></table></div>';
   }
 
   async function claimTicket(channelId) {
@@ -2043,33 +3121,50 @@ function renderTicketsContent() {
     else alert('❌ ' + ((r.data && r.data.error) || 'Errore'));
   }
 
-  async function loadTranscripts() {
-    const res = await apiFetch('/api/tickets/transcripts');
-    const transcripts = await res.json();
+  async function loadTranscripts(force) {
     const el = document.getElementById('transcripts-content');
-    if (!transcripts.length) { el.innerHTML = '<p class="loading">Nessun transcript salvato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Link</th></tr></thead><tbody>' +
+    el.innerHTML = '<p class="loading">Caricamento archivio...</p>';
+    try {
+      const res = await apiFetch('/api/tickets/transcripts');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      savedTranscripts = data;
+      renderTranscripts();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Impossibile caricare i transcript. <button class="secondary small" onclick="loadTranscripts(true)">Riprova</button></div>';
+      console.error('[tickets] caricamento transcript non riuscito', error);
+    }
+  }
+
+  function renderTranscripts() {
+    const query = document.getElementById('transcript-filter').value.trim().toLowerCase();
+    const transcripts = savedTranscripts.filter(t => !query || [t.channel_name, t.user_id, t.claimed_by, t.priority]
+      .some(value => String(value || '').toLowerCase().includes(query)));
+    const el = document.getElementById('transcripts-content');
+    if (!transcripts.length) { el.innerHTML = '<div class="tool-empty">' + (savedTranscripts.length ? 'Nessun transcript corrisponde alla ricerca.' : 'Non ci sono transcript salvati.') + '</div>'; return; }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th>Data</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Link</th></tr></thead><tbody>' +
       transcripts.map(t => '<tr>' +
         '<td>' + esc(new Date(t.created_at).toLocaleString('it-IT')) + '</td>' +
         '<td>#' + esc(t.channel_name) + '</td>' +
         '<td>' + esc(t.user_id) + '</td>' +
         '<td>' + esc(t.claimed_by || '-') + '</td>' +
-        '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td><a href="/api/tickets/transcripts/' + esc(t.id) + '" target="_blank" rel="noopener" style="padding:5px 10px;background:#444;color:#eee;border-radius:6px;font-size:12px;">Visualizza</a></td>' +
-      '</tr>').join('') + '</tbody></table>';
+        '<td><span class="badge default">' + esc(t.priority || '—') + '</span></td>' +
+        '<td><a class="user-link" href="/api/tickets/transcripts/' + encodeURIComponent(t.id) + '" target="_blank" rel="noopener">Visualizza ↗</a></td>' +
+        '</tr>').join('') + '</tbody></table></div>';
   }
 
   async function closeTicket(channelId) {
     if (!confirm('Chiudere ed eliminare questo ticket? Verrà salvato un transcript.')) return;
     const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
-    if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(); loadTranscripts(); }
+    if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(true); loadTranscripts(true); }
     else { const data = await res.json().catch(() => ({})); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
 
   loadChannelsForPanel();
   loadTickets();
   loadTranscripts();
-  setInterval(loadTickets, 15000);
+  setInterval(() => loadTickets(true), 15000);
   </script>`;
 }
 
@@ -2077,67 +3172,135 @@ function renderTicketsContent() {
 function renderCommandsContent() {
   return `
   <div class="section">
-    <h2>➕ Aggiungi Comando Custom</h2>
-    <div class="form-row">
-      <input type="text" id="cmd-name" placeholder="Nome (es. regole)" maxlength="50">
-      <input type="text" id="cmd-response" placeholder="Risposta" maxlength="4096">
-      <button onclick="addCmd()">Aggiungi</button>
-    </div>
+    <div class="tool-heading"><div><h2>➕ Crea un comando</h2><p class="tool-subtitle">Aggiungi una risposta personalizzata richiamabile con il prefisso del bot.</p></div></div>
+    <input type="text" id="cmd-name" placeholder="Nome comando (es. regole)" maxlength="50" oninput="updateCommandPreview()" aria-label="Nome comando">
+    <textarea id="cmd-response" rows="3" placeholder="Scrivi la risposta del bot..." maxlength="4096" oninput="updateCommandPreview()" aria-label="Risposta comando"></textarea>
+    <div class="field-meta"><span>Solo lettere, numeri, trattini e underscore</span><span id="cmd-response-count">0 / 4096</span></div>
+    <div class="tool-preview"><div id="cmd-preview-name" style="margin-bottom:8px;color:#b9a9ff;font-weight:700;">-nome-comando</div><div id="cmd-preview">La risposta apparirà qui in anteprima.</div></div>
+    <div class="export-bar" style="margin-top:12px;"><button onclick="addCmd()">➕ Aggiungi comando</button></div>
     <div id="cmd-msg"></div>
   </div>
 
   <div class="section">
-    <h2>🔧 Comandi Custom</h2>
-    <div class="export-bar">
-      <a href="#" onclick="bulkDeleteCmds();return false;">🗑️ Elimina selezionati</a>
+    <div class="tool-heading">
+      <div><h2>🔧 I tuoi comandi</h2><p class="tool-subtitle">Gestisci i comandi registrati e rimuovi quelli non più necessari.</p></div>
+      <button class="secondary small" onclick="loadCmds(true)">↻ Aggiorna</button>
+    </div>
+    <div class="tool-stats"><div class="tool-stat"><strong id="cmd-total">—</strong><span>Comandi registrati</span></div><div class="tool-stat"><strong id="cmd-selected-count">0</strong><span>Selezionati</span></div></div>
+    <div class="tool-controls">
+      <input type="search" id="cmd-filter" placeholder="Cerca per comando o risposta" oninput="renderCmds()" maxlength="100">
+      <button class="danger small" onclick="bulkDeleteCmds()">🗑️ Elimina selezionati</button>
     </div>
     <div id="commands-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  async function loadCmds() {
-    const res = await apiFetch('/api/commands');
-    const cmds = await res.json();
+  let customCommands = [];
+  let selectedCommands = new Set();
+  async function loadCmds(force) {
     const el = document.getElementById('commands-content');
-    if (!cmds.length) { el.innerHTML = '<p class="loading">Nessun comando custom.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
-      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + esc(c.name) + '"></td><td><code>-' + esc(c.name) + '</code></td><td>' + esc(c.response) + '</td><td><button class="danger small" onclick="removeCmd(\\'' + esc(c.name) + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+    el.innerHTML = '<p class="loading">Caricamento comandi...</p>';
+    try {
+      const res = await apiFetch('/api/commands');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      customCommands = data;
+      selectedCommands = new Set(Array.from(selectedCommands).filter(name => customCommands.some(command => command.name === name)));
+      renderCmds();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Impossibile caricare i comandi. <button class="secondary small" onclick="loadCmds(true)">Riprova</button></div>';
+      console.error('[commands] caricamento non riuscito', error);
+    }
+  }
+  function renderCmds() {
+    const query = document.getElementById('cmd-filter').value.trim().toLowerCase();
+    const cmds = customCommands.filter(c => !query || (c.name + ' ' + c.response).toLowerCase().includes(query));
+    const el = document.getElementById('commands-content');
+    document.getElementById('cmd-total').textContent = customCommands.length.toLocaleString('it-IT');
+    updateCommandSelection();
+    if (!cmds.length) {
+      el.innerHTML = '<div class="tool-empty">' + (customCommands.length ? 'Nessun comando corrisponde alla ricerca.' : 'Non hai ancora creato comandi personalizzati.') + '</div>';
+      return;
+    }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()" aria-label="Seleziona i comandi visibili"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
+      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + esc(c.name) + '"' + (selectedCommands.has(c.name) ? ' checked' : '') + ' onchange="setCommandSelected(this)"></td><td><code>-' + esc(c.name) + '</code></td><td style="white-space:pre-wrap;overflow-wrap:anywhere;">' + esc(c.response) + '</td><td><button class="danger small" onclick="removeCmd(\\'' + esc(c.name) + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table></div>';
+    updateCommandSelection();
   }
   function toggleAllCmds() {
     const checked = document.getElementById('cmd-select-all').checked;
-    document.querySelectorAll('.cmd-check').forEach(c => c.checked = checked);
+    document.querySelectorAll('.cmd-check').forEach(c => {
+      c.checked = checked;
+      if (checked) selectedCommands.add(c.value);
+      else selectedCommands.delete(c.value);
+    });
+    updateCommandSelection();
+  }
+  function setCommandSelected(checkbox) {
+    if (checkbox.checked) selectedCommands.add(checkbox.value);
+    else selectedCommands.delete(checkbox.value);
+    updateCommandSelection();
+  }
+  function updateCommandSelection() {
+    const checks = Array.from(document.querySelectorAll('.cmd-check'));
+    const selectedVisible = checks.filter(c => selectedCommands.has(c.value)).length;
+    const count = document.getElementById('cmd-selected-count');
+    if (count) count.textContent = selectedCommands.size.toLocaleString('it-IT');
+    const selectAll = document.getElementById('cmd-select-all');
+    if (selectAll) {
+      selectAll.checked = checks.length > 0 && selectedVisible === checks.length;
+      selectAll.indeterminate = selectedVisible > 0 && selectedVisible < checks.length;
+    }
+  }
+  function updateCommandPreview() {
+    const name = document.getElementById('cmd-name').value.trim();
+    const response = document.getElementById('cmd-response').value;
+    document.getElementById('cmd-response-count').textContent = response.length.toLocaleString('it-IT') + ' / 4096';
+    document.getElementById('cmd-preview').textContent = response || 'La risposta apparirà qui in anteprima.';
+    document.getElementById('cmd-preview-name').textContent = name && /^[a-z0-9_-]{1,50}$/i.test(name) ? '-' + name.toLowerCase() : '-nome-comando';
   }
   async function bulkDeleteCmds() {
-    const names = Array.from(document.querySelectorAll('.cmd-check:checked')).map(c => c.value);
+    const names = Array.from(selectedCommands);
     if (!names.length) { alert('Nessun comando selezionato'); return; }
     if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
-    const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) { alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(); }
-    else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
+    try {
+      const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) { names.forEach(name => selectedCommands.delete(name)); alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(true); }
+      else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
+    } catch (error) { alert('❌ Eliminazione non riuscita. Riprova.'); console.error('[commands] eliminazione multipla non riuscita', error); }
   }
   async function addCmd() {
     const name = document.getElementById('cmd-name').value.trim();
     const response = document.getElementById('cmd-response').value.trim();
     const msg = document.getElementById('cmd-msg');
     if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
-      document.getElementById('cmd-name').value = '';
-      document.getElementById('cmd-response').value = '';
-      loadCmds();
-    } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
+    if (!/^[a-z0-9_-]{1,50}$/i.test(name)) { msg.innerHTML = '<span class="error">❌ Usa solo lettere, numeri, trattini e underscore nel nome</span>'; return; }
+    if (/@(everyone|here)\b/i.test(response)) { msg.innerHTML = '<span class="error">❌ Le menzioni @everyone e @here non sono consentite nelle risposte custom</span>'; return; }
+    try {
+      const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        msg.innerHTML = '<span class="success">✅ Comando -' + esc(name.toLowerCase()) + ' aggiunto</span>';
+        document.getElementById('cmd-name').value = '';
+        document.getElementById('cmd-response').value = '';
+        updateCommandPreview();
+        loadCmds(true);
+      } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
+    } catch (error) { msg.innerHTML = '<span class="error">❌ Connessione non riuscita. Riprova.</span>'; console.error('[commands] creazione non riuscita', error); }
   }
   async function removeCmd(name) {
     if (!confirm('Eliminare il comando -' + name + '?')) return;
-    const res = await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadCmds();
+    try {
+      const res = await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
+      selectedCommands.delete(name);
+      loadCmds(true);
+    } catch (error) { alert('❌ Eliminazione non riuscita. Riprova.'); console.error('[commands] eliminazione non riuscita', error); }
   }
   loadCmds();
+  updateCommandPreview();
   </script>`;
 }
 
@@ -2456,45 +3619,89 @@ function renderUserContent(userId) {
 function renderSearchContent(q) {
   return `
   <div class="section">
-    <h2>🔍 Risultati per "${escapeHtml(q)}"</h2>
+    <div class="tool-heading">
+      <div><h2>🔍 Ricerca globale</h2><p class="tool-subtitle">Trova utenti e contenuti in blacklist, note staff, log e ticket autorizzati.</p></div>
+    </div>
+    <form class="tool-controls" action="/search" method="get" role="search">
+      <input type="search" name="q" id="search-query" placeholder="Utente, ID, motivo o parola chiave..." value="${escapeHtml(q)}" maxlength="100" aria-label="Termine di ricerca">
+      <button type="submit">Cerca</button>
+    </form>
+    <div class="tool-stats">
+      <div class="tool-stat"><strong id="search-total">—</strong><span>Risultati totali</span></div>
+      <div class="tool-stat"><strong id="search-categories">—</strong><span>Sezioni con risultati</span></div>
+    </div>
+    <div class="tool-controls" id="search-filters" aria-label="Filtra categoria risultati"></div>
     <div id="search-content" class="loading">Ricerca in corso...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   const QUERY = ${safeJson(q)};
+  let searchResults = null;
+  let searchCategory = 'all';
 
   async function doSearch() {
     const el = document.getElementById('search-content');
     if (!QUERY.trim()) { el.innerHTML = '<p class="loading">Inserisci un termine di ricerca.</p>'; return; }
-    const res = await apiFetch('/api/search?q=' + encodeURIComponent(QUERY));
-    const data = await res.json();
-    const total = data.blacklist.length + data.notes.length + data.logs.length + data.tickets.length;
-    if (!total) { el.innerHTML = '<p class="loading">Nessun risultato.</p>'; return; }
+    el.innerHTML = '<p class="loading">Ricerca in corso...</p>';
+    try {
+      const res = await apiFetch('/api/search?q=' + encodeURIComponent(QUERY));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data || !Array.isArray(data.blacklist) || !Array.isArray(data.notes) || !Array.isArray(data.logs) || !Array.isArray(data.tickets)) {
+        throw new Error('Risposta non valida dal server');
+      }
+      searchResults = data;
+      renderSearchResults();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Ricerca non disponibile. <button class="secondary small" onclick="doSearch()">Riprova</button></div>';
+      console.error('[search] ricerca non riuscita', error);
+    }
+  }
 
+  function setSearchCategory(category) {
+    searchCategory = category;
+    renderSearchResults();
+  }
+
+  function renderSearchResults() {
+    if (!searchResults) return;
+    const groups = [
+      { key: 'blacklist', label: 'Blacklist', icon: '🚫', rows: searchResults.blacklist },
+      { key: 'notes', label: 'Note staff', icon: '📝', rows: searchResults.notes },
+      { key: 'logs', label: 'Mod Logs', icon: '📋', rows: searchResults.logs },
+      { key: 'tickets', label: 'Ticket', icon: '🎫', rows: searchResults.tickets }
+    ];
+    const total = groups.reduce((sum, group) => sum + group.rows.length, 0);
+    const activeGroups = groups.filter(group => group.rows.length);
+    document.getElementById('search-total').textContent = total.toLocaleString('it-IT');
+    document.getElementById('search-categories').textContent = activeGroups.length.toLocaleString('it-IT');
+    document.getElementById('search-filters').innerHTML = '<button class="' + (searchCategory === 'all' ? '' : 'secondary') + ' small" onclick="setSearchCategory(\\'all\\')">Tutto · ' + total + '</button>' +
+      activeGroups.map(group => '<button class="' + (searchCategory === group.key ? '' : 'secondary') + ' small" onclick="setSearchCategory(\\'' + group.key + '\\')">' + group.icon + ' ' + esc(group.label) + ' · ' + group.rows.length + '</button>').join('');
+    const visibleGroups = searchCategory === 'all' ? activeGroups : activeGroups.filter(group => group.key === searchCategory);
+    if (!visibleGroups.length) {
+      document.getElementById('search-content').innerHTML = '<div class="tool-empty">' + (total ? 'Nessun risultato in questa categoria.' : 'Nessun risultato per “' + esc(QUERY) + '”. Prova con un altro ID o termine.') + '</div>';
+      return;
+    }
     let html = '';
-    if (data.blacklist.length) {
-      html += '<h3 style="margin-top:20px;">🚫 Blacklist (' + data.blacklist.length + ')</h3>';
-      html += '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
-        data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    if (data.notes.length) {
-      html += '<h3 style="margin-top:20px;">📝 Note (' + data.notes.length + ')</h3>';
-      html += '<table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
-        data.notes.map(n => '<tr><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + esc(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.content) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    if (data.logs.length) {
-      html += '<h3 style="margin-top:20px;">📋 Logs (' + data.logs.length + ')</h3>';
-      html += '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
-        data.logs.slice(0, 50).map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + esc(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
-      if (data.logs.length > 50) html += '<p style="color:#888;font-size:12px;">...e altri ' + (data.logs.length - 50) + ' log</p>';
-    }
-    if (data.tickets.length) {
-      html += '<h3 style="margin-top:20px;">🎫 Ticket (' + data.tickets.length + ')</h3>';
-      html += '<table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
-        data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    el.innerHTML = html;
+    visibleGroups.forEach(group => {
+      html += '<h3 style="margin:22px 0 10px;">' + group.icon + ' ' + esc(group.label) + ' <span style="color:#858a9b;font-size:12px;font-weight:400;">' + group.rows.length + '</span></h3>';
+      if (group.key === 'blacklist') {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
+          group.rows.map(e => '<tr><td><a class="user-link" href="/user/' + encodeURIComponent(e.user_id) + '">' + esc(e.username) + '</a><div><code>' + esc(e.user_id) + '</code></div></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td></tr>').join('') + '</tbody></table></div>';
+      } else if (group.key === 'notes') {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
+          group.rows.map(n => '<tr><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + encodeURIComponent(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.content) + '</td></tr>').join('') + '</tbody></table></div>';
+      } else if (group.key === 'logs') {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
+          group.rows.slice(0, 50).map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + encodeURIComponent(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td></tr>').join('') + '</tbody></table></div>';
+        if (group.rows.length > 50) html += '<p class="tool-subtitle" style="margin-top:8px;">Mostrati 50 di ' + group.rows.length + ' log.</p>';
+      } else {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
+          group.rows.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td></tr>').join('') + '</tbody></table></div>';
+      }
+    });
+    document.getElementById('search-content').innerHTML = html;
   }
   doSearch();
   </script>`;
@@ -2548,32 +3755,57 @@ function renderAccessLogsContent() {
 function renderMessagesContent() {
   return `
   <div class="section">
-    <h2>✉️ Invia Messaggio</h2>
-    <label style="font-size:13px;color:#888;">Canale</label>
-    <select id="msg-channel"></select>
+    <div class="tool-heading">
+      <div><h2>✉️ Invia un messaggio</h2><p class="tool-subtitle">Componi un messaggio o un embed e controlla l’anteprima prima dell’invio.</p></div>
+    </div>
+    <div class="charts-grid">
+      <div>
+        <label for="msg-channel" style="font-size:12px;color:#aeb2c1;">Server e canale</label>
+        <select id="msg-channel" onchange="updateMessagePreview()" aria-label="Seleziona server e canale"></select>
 
-    <label style="font-size:13px;color:#888;">Testo (max 2000)</label>
-    <textarea id="msg-content" rows="3" placeholder="Ciao {user}..." maxlength="2000"></textarea>
+        <label for="msg-content" style="font-size:12px;color:#aeb2c1;">Messaggio</label>
+        <textarea id="msg-content" rows="5" placeholder="Scrivi il messaggio da inviare..." maxlength="2000" oninput="updateMessagePreview()"></textarea>
+        <div class="field-meta"><span>Massimo 2000 caratteri</span><span id="msg-content-count">0 / 2000</span></div>
+        <div class="mention-help">
+          Per menzionare davvero qualcuno usa la sintassi Discord con il suo ID:
+          utente <code>&lt;@ID&gt;</code> (oppure <code>&lt;@!ID&gt;</code>), ruolo <code>&lt;@&amp;ID&gt;</code>.
+          Un testo come <code>@nome</code> non identifica da solo un account. <code>@everyone</code> e <code>@here</code> non generano ping.
+        </div>
+        <label class="inline-check"><input id="msg-allow-mentions" type="checkbox" checked onchange="updateMessagePreview()"> Attiva le menzioni esplicite di utenti e ruoli</label>
 
-    <details style="margin:14px 0;">
-      <summary style="cursor:pointer;color:#5865F2;">➕ Aggiungi embed (opzionale)</summary>
-      <div style="margin-top:12px;">
-        <input id="emb-title" placeholder="Titolo" maxlength="256">
-        <textarea id="emb-desc" rows="3" placeholder="Descrizione" maxlength="4096"></textarea>
-        <input id="emb-color" placeholder="Colore (es. #5865F2)" maxlength="20">
-        <input id="emb-image" placeholder="URL immagine" maxlength="500">
-        <input id="emb-thumb" placeholder="URL thumbnail" maxlength="500">
-        <input id="emb-footer" placeholder="Footer" maxlength="2048">
+        <details style="margin:14px 0;">
+          <summary style="cursor:pointer;color:#b9a9ff;">➕ Aggiungi embed opzionale</summary>
+          <div style="margin-top:12px;">
+            <input id="emb-title" placeholder="Titolo" maxlength="256" oninput="updateMessagePreview()">
+            <textarea id="emb-desc" rows="3" placeholder="Descrizione" maxlength="4096" oninput="updateMessagePreview()"></textarea>
+            <input id="emb-color" placeholder="Colore (es. #5865F2)" maxlength="20" oninput="updateMessagePreview()">
+            <input id="emb-image" placeholder="URL immagine" maxlength="500" oninput="updateMessagePreview()">
+            <input id="emb-thumb" placeholder="URL thumbnail" maxlength="500" oninput="updateMessagePreview()">
+            <input id="emb-footer" placeholder="Footer" maxlength="2048" oninput="updateMessagePreview()">
+          </div>
+        </details>
+
+        <button id="msg-send" onclick="sendMessage()">📤 Invia messaggio</button>
+        <div id="msg-result" role="status" aria-live="polite"></div>
       </div>
-    </details>
-
-    <button onclick="sendMessage()">📤 Invia</button>
-    <div id="msg-result"></div>
+      <div>
+        <h3 style="margin:0 0 10px;color:#d4d6e0;font-size:14px;">Anteprima</h3>
+        <div class="tool-preview" style="min-height:130px;">
+          <div id="msg-preview-channel" style="margin-bottom:10px;color:#858a9b;font-size:11px;">Seleziona un canale</div>
+          <div id="msg-preview-content" style="white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+          <div id="msg-preview-embed" style="display:none;margin-top:12px;padding:12px;border-left:3px solid #8068ed;border-radius:4px;background:#171923;">
+            <strong id="msg-preview-title"></strong>
+            <div id="msg-preview-description" style="margin-top:6px;white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+            <div id="msg-preview-footer" style="margin-top:10px;color:#858a9b;font-size:11px;"></div>
+          </div>
+          <div id="msg-preview-hints" style="margin-top:12px;color:#858a9b;font-size:11px;"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="section">
-    <h2>🧹 Moderazione canale</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:12px;">Agisce sul canale selezionato sopra.</p>
+    <div class="tool-heading"><div><h2>🧹 Moderazione canale</h2><p class="tool-subtitle">Le azioni si applicano al canale selezionato sopra.</p></div></div>
     <div class="form-row">
       <input id="mc-amount" type="number" min="1" max="100" value="10" style="max-width:120px;">
       <button class="danger small" onclick="modClear()">🧹 Pulisci</button>
@@ -2588,12 +3820,49 @@ function renderMessagesContent() {
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let channelsCache = [];
   async function loadChannels() {
-    const res = await apiFetch('/api/messages/channels');
-    channelsCache = await res.json();
     const sel = document.getElementById('msg-channel');
-    sel.innerHTML = channelsCache.map(c =>
-      '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>'
-    ).join('') || '<option value="">Nessun canale</option>';
+    try {
+      const res = await apiFetch('/api/messages/channels');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      channelsCache = data;
+      const grouped = {};
+      channelsCache.forEach(channel => {
+        const key = channel.guildId;
+        if (!grouped[key]) grouped[key] = { name: channel.guildName, channels: [] };
+        grouped[key].channels.push(channel);
+      });
+      sel.innerHTML = Object.keys(grouped).map(guildId => '<optgroup label="' + esc(grouped[guildId].name) + '">' +
+        grouped[guildId].channels.map(c => '<option value="' + esc(c.channelId) + '">#' + esc(c.channelName) + '</option>').join('') + '</optgroup>').join('') ||
+        '<option value="">Nessun canale accessibile</option>';
+      updateMessagePreview();
+    } catch (error) {
+      sel.innerHTML = '<option value="">Canali non disponibili</option>';
+      document.getElementById('msg-result').innerHTML = '<span class="error">❌ Impossibile caricare i canali. Riprova ricaricando la pagina.</span>';
+      console.error('[messages] caricamento canali non riuscito', error);
+    }
+  }
+
+  function updateMessagePreview() {
+    const channel = channelsCache.find(c => c.channelId === document.getElementById('msg-channel').value);
+    const content = document.getElementById('msg-content').value;
+    const title = document.getElementById('emb-title').value.trim();
+    const description = document.getElementById('emb-desc').value.trim();
+    const footer = document.getElementById('emb-footer').value.trim();
+    const mentionEnabled = document.getElementById('msg-allow-mentions').checked;
+    document.getElementById('msg-preview-channel').textContent = channel ? channel.guildName + ' · #' + channel.channelName : 'Seleziona un canale';
+    document.getElementById('msg-preview-content').textContent = content || 'Il testo del messaggio apparirà qui.';
+    document.getElementById('msg-content-count').textContent = content.length.toLocaleString('it-IT') + ' / 2000';
+    document.getElementById('msg-preview-title').textContent = title;
+    document.getElementById('msg-preview-description').textContent = description;
+    document.getElementById('msg-preview-footer').textContent = footer;
+    const embedPreview = document.getElementById('msg-preview-embed');
+    embedPreview.style.display = title || description || footer ? 'block' : 'none';
+    const mentionMatches = content.match(/<@!?\\d{17,20}>|<@&\\d{17,20}>/g) || [];
+    document.getElementById('msg-preview-hints').textContent = mentionMatches.length
+      ? (mentionEnabled ? mentionMatches.length + ' menzion' + (mentionMatches.length === 1 ? 'e' : 'i') + ' esplicite attive · @everyone/@here restano disattivati' : 'Menzioni disattivate: il testo verrà inviato senza ping')
+      : (mentionEnabled ? 'I tag Discord di utenti e ruoli verranno menzionati · ping di massa disattivati' : 'Menzioni disattivate');
   }
 
   async function sendMessage() {
@@ -2612,16 +3881,24 @@ function renderMessagesContent() {
     if (!content && !embed.title && !embed.description) {
       result.innerHTML = '<span class="error">❌ Testo o embed obbligatorio</span>'; return;
     }
-    const btn = document.querySelector('button[onclick="sendMessage()"]');
+    const btn = document.getElementById('msg-send');
     btn.disabled = true; btn.textContent = '⏳ Invio...';
-    const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed }) });
-    const data = await res.json().catch(() => ({}));
-    btn.disabled = false; btn.textContent = '📤 Invia';
-    if (res.ok) {
-      result.innerHTML = '<span class="success">✅ Inviato! ID: ' + esc(data.messageId) + '</span>';
-      document.getElementById('msg-content').value = '';
-    } else {
-      result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
+    try {
+      const allowMentions = document.getElementById('msg-allow-mentions').checked;
+      const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed, allowMentions }) });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        result.innerHTML = '<span class="success">✅ Inviato in #' + esc(currentChannel().channelName) + ' · ID: ' + esc(data.messageId) + '</span>';
+        document.getElementById('msg-content').value = '';
+        updateMessagePreview();
+      } else {
+        result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
+      }
+    } catch (error) {
+      result.innerHTML = '<span class="error">❌ Invio non riuscito. Controlla la connessione e riprova.</span>';
+      console.error('[messages] invio non riuscito', error);
+    } finally {
+      btn.disabled = false; btn.textContent = '📤 Invia messaggio';
     }
   }
 
