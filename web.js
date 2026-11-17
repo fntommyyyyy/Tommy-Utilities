@@ -502,6 +502,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   const schemaMessagesSend = z.object({
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
+    allowMentions: z.boolean().optional().default(true),
     embed: z.object({
       title: z.string().max(256).optional(),
       description: z.string().max(4096).optional(),
@@ -1413,7 +1414,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       const botMember = channel.guild?.members?.me;
       if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
 
-      const payload = { allowedMentions: { parse: ['users'] } };
+      const payload = { allowedMentions: { parse: data.allowMentions ? ['users', 'roles'] : [] } };
       if (data.content) payload.content = data.content;
       if (data.embed && (data.embed.title || data.embed.description)) {
         const e = new EmbedBuilder();
@@ -2080,6 +2081,30 @@ function renderLayout(user, page, params = {}, security = {}) {
   a.user-link:hover { border-bottom-style: solid; color: #c4b8ff; }
   .filter-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
   .filter-bar select, .filter-bar input { max-width: 250px; }
+  .tool-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:16px; }
+  .tool-heading h2 { margin-bottom:5px; }
+  .tool-subtitle { margin:0; color:#8c91a2; font-size:12px; line-height:1.6; }
+  .tool-stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin:14px 0; }
+  .tool-stat { padding:13px 15px; border:1px solid #292c3a; border-radius:11px; background:linear-gradient(145deg,#151722,#101117); }
+  .tool-stat strong { display:block; color:#e7e8ef; font-size:20px; }
+  .tool-stat span { display:block; margin-top:3px; color:#8c91a2; font-size:10px; text-transform:uppercase; letter-spacing:.08em; }
+  .tool-controls { display:flex; align-items:center; flex-wrap:wrap; gap:9px; margin:14px 0; }
+  .tool-controls input,.tool-controls select { flex:1 1 190px; width:auto; max-width:330px; margin:0; }
+  .tool-empty { padding:24px; border:1px dashed #343746; border-radius:11px; color:#9297a8; text-align:center; }
+  .tool-preview { padding:14px; border:1px solid #292c3a; border-radius:10px; background:#0e1017; color:#d5d7e0; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .tool-table-wrap { overflow-x:auto; }
+  .mention-help { margin:7px 0 12px; padding:10px 12px; border-left:2px solid #8068ed; border-radius:0 8px 8px 0; background:#151621; color:#aeb2c1; font-size:12px; line-height:1.6; }
+  .mention-help code { color:#d2c8ff; }
+  .inline-check { display:flex; align-items:center; gap:9px; margin:2px 0 14px; color:#c4c7d2; font-size:12px; }
+  .inline-check input { width:auto; margin:0; accent-color:#8068ed; }
+  .field-meta { display:flex; justify-content:space-between; gap:10px; margin:-5px 0 10px; color:#858a9b; font-size:11px; }
+  .ticket-actions { display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-width:245px; }
+  .ticket-actions select { width:auto; min-width:105px; margin:0; padding:6px 8px; }
+  @media(max-width:600px) {
+    .tool-heading { flex-direction:column; }
+    .tool-controls input,.tool-controls select { flex-basis:100%; max-width:none; }
+    .ticket-actions { min-width:220px; }
+  }
   .badge { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
   .badge.kick, .badge.warn { background: #9c6a23; color: #fff1d2; }
   .badge.ban { background: #a83e55; color: #fff; }
@@ -2849,10 +2874,16 @@ function renderPermissionsContent() {
 function renderModlogsContent() {
   return `
   <div class="section">
-    <h2>📋 Mod Logs</h2>
-    <div class="export-bar"><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
-    <div class="filter-bar">
-      <select id="filter-type" onchange="loadLogs()">
+    <div class="tool-heading">
+      <div><h2>📋 Mod Logs</h2><p class="tool-subtitle">Registro delle azioni di moderazione, con filtri rapidi e ricerca nei dettagli.</p></div>
+      <div class="export-bar"><button class="secondary small" onclick="loadLogs(true)">↻ Aggiorna</button><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
+    </div>
+    <div class="tool-stats">
+      <div class="tool-stat"><strong id="logs-total">—</strong><span>Log disponibili</span></div>
+      <div class="tool-stat"><strong id="logs-visible">—</strong><span>Risultati filtrati</span></div>
+    </div>
+    <div class="tool-controls">
+      <select id="filter-type" onchange="renderLogs()">
         <option value="">Tutti i tipi</option>
         <option value="Kick">Kick</option>
         <option value="Ban">Ban</option>
@@ -2865,7 +2896,8 @@ function renderModlogsContent() {
         <option value="Ticket Claim">Ticket Claim</option>
         <option value="Ticket Priorità">Ticket Priorità</option>
       </select>
-      <input type="text" id="filter-user" placeholder="Filtra per ID utente" oninput="loadLogs()" maxlength="20">
+      <input type="search" id="filter-user" placeholder="ID utente target" oninput="renderLogs()" maxlength="20">
+      <input type="search" id="filter-log-text" placeholder="Cerca target, moderatore o motivo" oninput="renderLogs()" maxlength="100">
     </div>
     <div id="logs-content" class="loading">Caricamento...</div>
   </div>
@@ -2873,16 +2905,40 @@ function renderModlogsContent() {
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let allLogs = [];
-  async function loadLogs() {
-    if (!allLogs.length) { const res = await apiFetch('/api/logs/all'); allLogs = await res.json(); }
+  let logsLoaded = false;
+  async function loadLogs(force) {
+    const el = document.getElementById('logs-content');
+    if (!logsLoaded || force) {
+      el.innerHTML = '<p class="loading">Caricamento log...</p>';
+      try {
+        const res = await apiFetch('/api/logs/all');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+        allLogs = data;
+        logsLoaded = true;
+      } catch (error) {
+        el.innerHTML = '<div class="tool-empty">Impossibile caricare i log. <button class="secondary small" onclick="loadLogs(true)">Riprova</button></div>';
+        console.error('[modlogs] caricamento non riuscito', error);
+        return;
+      }
+    }
+    renderLogs();
+  }
+  function renderLogs() {
     const type = document.getElementById('filter-type').value;
     const userId = document.getElementById('filter-user').value.trim();
+    const query = document.getElementById('filter-log-text').value.trim().toLowerCase();
     let logs = allLogs;
     if (type) logs = logs.filter(l => l.type === type);
     if (userId) logs = logs.filter(l => (l.target_id || '').includes(userId));
+    if (query) logs = logs.filter(l => [l.target, l.target_id, l.moderator, l.reason, l.type]
+      .some(value => String(value || '').toLowerCase().includes(query)));
     const el = document.getElementById('logs-content');
-    if (!logs.length) { el.innerHTML = '<p class="loading">Nessun log trovato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
+    document.getElementById('logs-total').textContent = allLogs.length.toLocaleString('it-IT');
+    document.getElementById('logs-visible').textContent = logs.length.toLocaleString('it-IT');
+    if (!logs.length) { el.innerHTML = '<div class="tool-empty">' + (allLogs.length ? 'Nessun log corrisponde ai filtri.' : 'Non ci sono ancora log di moderazione.') + '</div>'; return; }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th><th>Durata</th></tr></thead><tbody>' +
       logs.map(l => '<tr>' +
         '<td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td>' +
         '<td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td>' +
@@ -2890,9 +2946,9 @@ function renderModlogsContent() {
         '<td>' + esc(l.moderator || '-') + '</td>' +
         '<td>' + esc(l.reason || '-') + '</td>' +
         '<td>' + esc(l.duration || '-') + '</td>' +
-      '</tr>').join('') + '</tbody></table>';
+      '</tr>').join('') + '</tbody></table></div>';
   }
-  loadLogs();
+  loadLogs(false);
   </script>`;
 }
 
@@ -2945,63 +3001,111 @@ function renderNotesContent() {
 function renderTicketsContent() {
   return `
   <div class="section">
-    <h2>🎫 Ticket Aperti</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:14px;">Gestisci i ticket aperti sul server.</p>
+    <div class="tool-heading">
+      <div><h2>🎫 Ticket Aperti</h2><p class="tool-subtitle">Gestisci assegnazione, priorità e chiusura dei ticket attivi.</p></div>
+      <button class="secondary small" onclick="loadTickets(true)">↻ Aggiorna</button>
+    </div>
+    <div class="tool-stats">
+      <div class="tool-stat"><strong id="tickets-total">—</strong><span>Ticket aperti</span></div>
+      <div class="tool-stat"><strong id="tickets-urgent">—</strong><span>Priorità alta/urgente</span></div>
+    </div>
     <div class="form-row" style="margin-bottom:14px;">
-      <select id="tp-channel"></select>
+      <select id="tp-channel" aria-label="Canale in cui inviare il pannello ticket"></select>
       <button onclick="createTicketPanel()">📋 Crea Pannello Ticket</button>
+    </div>
+    <div class="tool-controls">
+      <input type="search" id="ticket-filter" placeholder="Cerca server, canale o utente" oninput="renderTickets()" maxlength="100">
+      <select id="ticket-priority-filter" onchange="renderTickets()" aria-label="Filtra per priorità">
+        <option value="">Tutte le priorità</option><option value="low">Bassa</option><option value="med">Media</option><option value="high">Alta</option><option value="urgent">Urgente</option>
+      </select>
     </div>
     <div id="tickets-content" class="loading">Caricamento...</div>
   </div>
 
   <div class="section">
-    <h2>📜 Archivio Transcripts (Ultimi 100)</h2>
+    <div class="tool-heading">
+      <div><h2>📜 Archivio Transcripts</h2><p class="tool-subtitle">Ultimi 100 ticket chiusi, con transcript consultabili.</p></div>
+      <button class="secondary small" onclick="loadTranscripts(true)">↻ Aggiorna</button>
+    </div>
+    <div class="tool-controls"><input type="search" id="transcript-filter" placeholder="Cerca canale, utente o staff" oninput="renderTranscripts()" maxlength="100"></div>
     <div id="transcripts-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  let openTickets = [];
+  let savedTranscripts = [];
 
   async function loadChannelsForPanel() {
-    const res = await apiFetch('/api/messages/channels');
-    const chs = await res.json();
     const sel = document.getElementById('tp-channel');
-    sel.innerHTML = chs.map(c => '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale</option>';
+    try {
+      const res = await apiFetch('/api/messages/channels');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const chs = await res.json();
+      sel.innerHTML = chs.map(c => '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>').join('') || '<option value="">Nessun canale disponibile</option>';
+    } catch (error) {
+      sel.innerHTML = '<option value="">Canali non disponibili</option>';
+      console.error('[tickets] caricamento canali non riuscito', error);
+    }
   }
 
   async function createTicketPanel() {
     const channelId = document.getElementById('tp-channel').value;
     if (!channelId) { alert('Seleziona un canale'); return; }
     if (!confirm('Inviare il pannello ticket in questo canale?')) return;
-    const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
-    if (res.ok) alert('✅ Pannello inviato');
-    else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
+    try {
+      const res = await apiFetch('/api/ticketpanel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId }) });
+      if (res.ok) alert('✅ Pannello inviato');
+      else { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); }
+    } catch (error) { alert('❌ Invio non riuscito. Controlla la connessione e riprova.'); console.error('[tickets] invio pannello non riuscito', error); }
   }
 
-  async function loadTickets() {
-    const res = await apiFetch('/api/tickets');
-    const tickets = await res.json();
+  async function loadTickets(force) {
     const el = document.getElementById('tickets-content');
-    if (!tickets.length) { el.innerHTML = '<p class="loading">Nessun ticket aperto.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Azioni</th></tr></thead><tbody>' +
+    if (!force || !openTickets.length) el.innerHTML = '<p class="loading">Caricamento ticket...</p>';
+    try {
+      const res = await apiFetch('/api/tickets');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      openTickets = data;
+      renderTickets();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Impossibile caricare i ticket. <button class="secondary small" onclick="loadTickets(true)">Riprova</button></div>';
+      console.error('[tickets] caricamento non riuscito', error);
+    }
+  }
+
+  function renderTickets() {
+    const query = document.getElementById('ticket-filter').value.trim().toLowerCase();
+    const priority = document.getElementById('ticket-priority-filter').value;
+    const tickets = openTickets.filter(t => {
+      const matchesQuery = !query || [t.guild, t.channel, t.userId, t.claimedBy].some(value => String(value || '').toLowerCase().includes(query));
+      return matchesQuery && (!priority || t.priority === priority);
+    });
+    document.getElementById('tickets-total').textContent = openTickets.length.toLocaleString('it-IT');
+    document.getElementById('tickets-urgent').textContent = openTickets.filter(t => t.priority === 'high' || t.priority === 'urgent').length.toLocaleString('it-IT');
+    const el = document.getElementById('tickets-content');
+    if (!tickets.length) { el.innerHTML = '<div class="tool-empty">' + (openTickets.length ? 'Nessun ticket corrisponde ai filtri.' : 'Non ci sono ticket aperti.') + '</div>'; return; }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th>Server</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Azioni</th></tr></thead><tbody>' +
       tickets.map(t => '<tr>' +
         '<td>' + esc(t.guild) + '</td>' +
         '<td>#' + esc(t.channel) + '</td>' +
         '<td><a class="user-link" href="/user/' + esc(t.userId) + '">' + esc(t.userId) + '</a></td>' +
         '<td>' + esc(t.claimedBy || '-') + '</td>' +
-        '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td>' +
+        '<td><span class="badge ' + esc(t.priority === 'urgent' || t.priority === 'high' ? 'ban' : 'default') + '">' + esc(t.priority || '—') + '</span></td>' +
+        '<td><div class="ticket-actions">' +
           '<button class="secondary small" onclick="claimTicket(\\'' + esc(t.channelId) + '\\')">Prendi</button> ' +
-          '<select style="width:auto;display:inline-block;margin:0 6px 0 0;padding:4px 8px;" onchange="setPriority(\\'' + esc(t.channelId) + '\\', this.value)">' +
+          '<select aria-label="Modifica priorità" onchange="setPriority(\\'' + esc(t.channelId) + '\\', this.value)">' +
             '<option value="">Priorità</option>' +
-            '<option value="low">🟢 Bassa</option>' +
-            '<option value="med">🟡 Media</option>' +
-            '<option value="high">🟠 Alta</option>' +
-            '<option value="urgent">🔴 Urgente</option>' +
+            '<option value="low"' + (t.priority === 'low' ? ' selected' : '') + '>🟢 Bassa</option>' +
+            '<option value="med"' + (t.priority === 'med' ? ' selected' : '') + '>🟡 Media</option>' +
+            '<option value="high"' + (t.priority === 'high' ? ' selected' : '') + '>🟠 Alta</option>' +
+            '<option value="urgent"' + (t.priority === 'urgent' ? ' selected' : '') + '>🔴 Urgente</option>' +
           '</select>' +
           '<button class="danger small" onclick="closeTicket(\\'' + esc(t.channelId) + '\\')">Chiudi</button>' +
-        '</td>' +
-      '</tr>').join('') + '</tbody></table>';
+        '</div></td>' +
+      '</tr>').join('') + '</tbody></table></div>';
   }
 
   async function claimTicket(channelId) {
@@ -3017,33 +3121,50 @@ function renderTicketsContent() {
     else alert('❌ ' + ((r.data && r.data.error) || 'Errore'));
   }
 
-  async function loadTranscripts() {
-    const res = await apiFetch('/api/tickets/transcripts');
-    const transcripts = await res.json();
+  async function loadTranscripts(force) {
     const el = document.getElementById('transcripts-content');
-    if (!transcripts.length) { el.innerHTML = '<p class="loading">Nessun transcript salvato.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th>Data</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Link</th></tr></thead><tbody>' +
+    el.innerHTML = '<p class="loading">Caricamento archivio...</p>';
+    try {
+      const res = await apiFetch('/api/tickets/transcripts');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      savedTranscripts = data;
+      renderTranscripts();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Impossibile caricare i transcript. <button class="secondary small" onclick="loadTranscripts(true)">Riprova</button></div>';
+      console.error('[tickets] caricamento transcript non riuscito', error);
+    }
+  }
+
+  function renderTranscripts() {
+    const query = document.getElementById('transcript-filter').value.trim().toLowerCase();
+    const transcripts = savedTranscripts.filter(t => !query || [t.channel_name, t.user_id, t.claimed_by, t.priority]
+      .some(value => String(value || '').toLowerCase().includes(query)));
+    const el = document.getElementById('transcripts-content');
+    if (!transcripts.length) { el.innerHTML = '<div class="tool-empty">' + (savedTranscripts.length ? 'Nessun transcript corrisponde alla ricerca.' : 'Non ci sono transcript salvati.') + '</div>'; return; }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th>Data</th><th>Canale</th><th>Utente</th><th>Claim</th><th>Priorità</th><th>Link</th></tr></thead><tbody>' +
       transcripts.map(t => '<tr>' +
         '<td>' + esc(new Date(t.created_at).toLocaleString('it-IT')) + '</td>' +
         '<td>#' + esc(t.channel_name) + '</td>' +
         '<td>' + esc(t.user_id) + '</td>' +
         '<td>' + esc(t.claimed_by || '-') + '</td>' +
-        '<td>' + esc(t.priority || '-') + '</td>' +
-        '<td><a href="/api/tickets/transcripts/' + esc(t.id) + '" target="_blank" rel="noopener" style="padding:5px 10px;background:#444;color:#eee;border-radius:6px;font-size:12px;">Visualizza</a></td>' +
-      '</tr>').join('') + '</tbody></table>';
+        '<td><span class="badge default">' + esc(t.priority || '—') + '</span></td>' +
+        '<td><a class="user-link" href="/api/tickets/transcripts/' + encodeURIComponent(t.id) + '" target="_blank" rel="noopener">Visualizza ↗</a></td>' +
+        '</tr>').join('') + '</tbody></table></div>';
   }
 
   async function closeTicket(channelId) {
     if (!confirm('Chiudere ed eliminare questo ticket? Verrà salvato un transcript.')) return;
     const res = await apiFetch('/api/tickets/' + encodeURIComponent(channelId), { method: 'DELETE' });
-    if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(); loadTranscripts(); }
+    if (res.ok) { alert('✅ Ticket chiuso e transcript salvato'); loadTickets(true); loadTranscripts(true); }
     else { const data = await res.json().catch(() => ({})); alert('Errore: ' + (data.error || 'sconosciuto')); }
   }
 
   loadChannelsForPanel();
   loadTickets();
   loadTranscripts();
-  setInterval(loadTickets, 15000);
+  setInterval(() => loadTickets(true), 15000);
   </script>`;
 }
 
@@ -3051,67 +3172,135 @@ function renderTicketsContent() {
 function renderCommandsContent() {
   return `
   <div class="section">
-    <h2>➕ Aggiungi Comando Custom</h2>
-    <div class="form-row">
-      <input type="text" id="cmd-name" placeholder="Nome (es. regole)" maxlength="50">
-      <input type="text" id="cmd-response" placeholder="Risposta" maxlength="4096">
-      <button onclick="addCmd()">Aggiungi</button>
-    </div>
+    <div class="tool-heading"><div><h2>➕ Crea un comando</h2><p class="tool-subtitle">Aggiungi una risposta personalizzata richiamabile con il prefisso del bot.</p></div></div>
+    <input type="text" id="cmd-name" placeholder="Nome comando (es. regole)" maxlength="50" oninput="updateCommandPreview()" aria-label="Nome comando">
+    <textarea id="cmd-response" rows="3" placeholder="Scrivi la risposta del bot..." maxlength="4096" oninput="updateCommandPreview()" aria-label="Risposta comando"></textarea>
+    <div class="field-meta"><span>Solo lettere, numeri, trattini e underscore</span><span id="cmd-response-count">0 / 4096</span></div>
+    <div class="tool-preview"><div id="cmd-preview-name" style="margin-bottom:8px;color:#b9a9ff;font-weight:700;">-nome-comando</div><div id="cmd-preview">La risposta apparirà qui in anteprima.</div></div>
+    <div class="export-bar" style="margin-top:12px;"><button onclick="addCmd()">➕ Aggiungi comando</button></div>
     <div id="cmd-msg"></div>
   </div>
 
   <div class="section">
-    <h2>🔧 Comandi Custom</h2>
-    <div class="export-bar">
-      <a href="#" onclick="bulkDeleteCmds();return false;">🗑️ Elimina selezionati</a>
+    <div class="tool-heading">
+      <div><h2>🔧 I tuoi comandi</h2><p class="tool-subtitle">Gestisci i comandi registrati e rimuovi quelli non più necessari.</p></div>
+      <button class="secondary small" onclick="loadCmds(true)">↻ Aggiorna</button>
+    </div>
+    <div class="tool-stats"><div class="tool-stat"><strong id="cmd-total">—</strong><span>Comandi registrati</span></div><div class="tool-stat"><strong id="cmd-selected-count">0</strong><span>Selezionati</span></div></div>
+    <div class="tool-controls">
+      <input type="search" id="cmd-filter" placeholder="Cerca per comando o risposta" oninput="renderCmds()" maxlength="100">
+      <button class="danger small" onclick="bulkDeleteCmds()">🗑️ Elimina selezionati</button>
     </div>
     <div id="commands-content" class="loading">Caricamento...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-  async function loadCmds() {
-    const res = await apiFetch('/api/commands');
-    const cmds = await res.json();
+  let customCommands = [];
+  let selectedCommands = new Set();
+  async function loadCmds(force) {
     const el = document.getElementById('commands-content');
-    if (!cmds.length) { el.innerHTML = '<p class="loading">Nessun comando custom.</p>'; return; }
-    el.innerHTML = '<table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
-      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + esc(c.name) + '"></td><td><code>-' + esc(c.name) + '</code></td><td>' + esc(c.response) + '</td><td><button class="danger small" onclick="removeCmd(\\'' + esc(c.name) + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table>';
+    el.innerHTML = '<p class="loading">Caricamento comandi...</p>';
+    try {
+      const res = await apiFetch('/api/commands');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      customCommands = data;
+      selectedCommands = new Set(Array.from(selectedCommands).filter(name => customCommands.some(command => command.name === name)));
+      renderCmds();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Impossibile caricare i comandi. <button class="secondary small" onclick="loadCmds(true)">Riprova</button></div>';
+      console.error('[commands] caricamento non riuscito', error);
+    }
+  }
+  function renderCmds() {
+    const query = document.getElementById('cmd-filter').value.trim().toLowerCase();
+    const cmds = customCommands.filter(c => !query || (c.name + ' ' + c.response).toLowerCase().includes(query));
+    const el = document.getElementById('commands-content');
+    document.getElementById('cmd-total').textContent = customCommands.length.toLocaleString('it-IT');
+    updateCommandSelection();
+    if (!cmds.length) {
+      el.innerHTML = '<div class="tool-empty">' + (customCommands.length ? 'Nessun comando corrisponde alla ricerca.' : 'Non hai ancora creato comandi personalizzati.') + '</div>';
+      return;
+    }
+    el.innerHTML = '<div class="tool-table-wrap"><table><thead><tr><th style="width:30px;"><input type="checkbox" id="cmd-select-all" onclick="toggleAllCmds()" aria-label="Seleziona i comandi visibili"></th><th>Comando</th><th>Risposta</th><th></th></tr></thead><tbody>' +
+      cmds.map(c => '<tr><td><input type="checkbox" class="cmd-check" value="' + esc(c.name) + '"' + (selectedCommands.has(c.name) ? ' checked' : '') + ' onchange="setCommandSelected(this)"></td><td><code>-' + esc(c.name) + '</code></td><td style="white-space:pre-wrap;overflow-wrap:anywhere;">' + esc(c.response) + '</td><td><button class="danger small" onclick="removeCmd(\\'' + esc(c.name) + '\\')">Elimina</button></td></tr>').join('') + '</tbody></table></div>';
+    updateCommandSelection();
   }
   function toggleAllCmds() {
     const checked = document.getElementById('cmd-select-all').checked;
-    document.querySelectorAll('.cmd-check').forEach(c => c.checked = checked);
+    document.querySelectorAll('.cmd-check').forEach(c => {
+      c.checked = checked;
+      if (checked) selectedCommands.add(c.value);
+      else selectedCommands.delete(c.value);
+    });
+    updateCommandSelection();
+  }
+  function setCommandSelected(checkbox) {
+    if (checkbox.checked) selectedCommands.add(checkbox.value);
+    else selectedCommands.delete(checkbox.value);
+    updateCommandSelection();
+  }
+  function updateCommandSelection() {
+    const checks = Array.from(document.querySelectorAll('.cmd-check'));
+    const selectedVisible = checks.filter(c => selectedCommands.has(c.value)).length;
+    const count = document.getElementById('cmd-selected-count');
+    if (count) count.textContent = selectedCommands.size.toLocaleString('it-IT');
+    const selectAll = document.getElementById('cmd-select-all');
+    if (selectAll) {
+      selectAll.checked = checks.length > 0 && selectedVisible === checks.length;
+      selectAll.indeterminate = selectedVisible > 0 && selectedVisible < checks.length;
+    }
+  }
+  function updateCommandPreview() {
+    const name = document.getElementById('cmd-name').value.trim();
+    const response = document.getElementById('cmd-response').value;
+    document.getElementById('cmd-response-count').textContent = response.length.toLocaleString('it-IT') + ' / 4096';
+    document.getElementById('cmd-preview').textContent = response || 'La risposta apparirà qui in anteprima.';
+    document.getElementById('cmd-preview-name').textContent = name && /^[a-z0-9_-]{1,50}$/i.test(name) ? '-' + name.toLowerCase() : '-nome-comando';
   }
   async function bulkDeleteCmds() {
-    const names = Array.from(document.querySelectorAll('.cmd-check:checked')).map(c => c.value);
+    const names = Array.from(selectedCommands);
     if (!names.length) { alert('Nessun comando selezionato'); return; }
     if (!confirm('Eliminare ' + names.length + ' comandi?')) return;
-    const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) { alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(); }
-    else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
+    try {
+      const res = await apiFetch('/api/commands/bulk-delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ names }) });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) { names.forEach(name => selectedCommands.delete(name)); alert('✅ Eliminati ' + data.count + ' comandi'); loadCmds(true); }
+      else alert('❌ [' + res.status + '] ' + (data.error || 'Errore'));
+    } catch (error) { alert('❌ Eliminazione non riuscita. Riprova.'); console.error('[commands] eliminazione multipla non riuscita', error); }
   }
   async function addCmd() {
     const name = document.getElementById('cmd-name').value.trim();
     const response = document.getElementById('cmd-response').value.trim();
     const msg = document.getElementById('cmd-msg');
     if (!name || !response) { msg.innerHTML = '<span class="error">❌ Compila tutti i campi</span>'; return; }
-    const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      msg.innerHTML = '<span class="success">✅ Aggiunto</span>';
-      document.getElementById('cmd-name').value = '';
-      document.getElementById('cmd-response').value = '';
-      loadCmds();
-    } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
+    if (!/^[a-z0-9_-]{1,50}$/i.test(name)) { msg.innerHTML = '<span class="error">❌ Usa solo lettere, numeri, trattini e underscore nel nome</span>'; return; }
+    if (/@(everyone|here)\b/i.test(response)) { msg.innerHTML = '<span class="error">❌ Le menzioni @everyone e @here non sono consentite nelle risposte custom</span>'; return; }
+    try {
+      const res = await apiFetch('/api/commands', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, response }) });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        msg.innerHTML = '<span class="success">✅ Comando -' + esc(name.toLowerCase()) + ' aggiunto</span>';
+        document.getElementById('cmd-name').value = '';
+        document.getElementById('cmd-response').value = '';
+        updateCommandPreview();
+        loadCmds(true);
+      } else { msg.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>'; }
+    } catch (error) { msg.innerHTML = '<span class="error">❌ Connessione non riuscita. Riprova.</span>'; console.error('[commands] creazione non riuscita', error); }
   }
   async function removeCmd(name) {
     if (!confirm('Eliminare il comando -' + name + '?')) return;
-    const res = await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
-    if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
-    loadCmds();
+    try {
+      const res = await apiFetch('/api/commands/' + encodeURIComponent(name), { method: 'DELETE' });
+      if (!res.ok) { const d = await res.json().catch(() => ({})); alert('❌ ' + (d.error || 'Errore')); return; }
+      selectedCommands.delete(name);
+      loadCmds(true);
+    } catch (error) { alert('❌ Eliminazione non riuscita. Riprova.'); console.error('[commands] eliminazione non riuscita', error); }
   }
   loadCmds();
+  updateCommandPreview();
   </script>`;
 }
 
@@ -3430,45 +3619,89 @@ function renderUserContent(userId) {
 function renderSearchContent(q) {
   return `
   <div class="section">
-    <h2>🔍 Risultati per "${escapeHtml(q)}"</h2>
+    <div class="tool-heading">
+      <div><h2>🔍 Ricerca globale</h2><p class="tool-subtitle">Trova utenti e contenuti in blacklist, note staff, log e ticket autorizzati.</p></div>
+    </div>
+    <form class="tool-controls" action="/search" method="get" role="search">
+      <input type="search" name="q" id="search-query" placeholder="Utente, ID, motivo o parola chiave..." value="${escapeHtml(q)}" maxlength="100" aria-label="Termine di ricerca">
+      <button type="submit">Cerca</button>
+    </form>
+    <div class="tool-stats">
+      <div class="tool-stat"><strong id="search-total">—</strong><span>Risultati totali</span></div>
+      <div class="tool-stat"><strong id="search-categories">—</strong><span>Sezioni con risultati</span></div>
+    </div>
+    <div class="tool-controls" id="search-filters" aria-label="Filtra categoria risultati"></div>
     <div id="search-content" class="loading">Ricerca in corso...</div>
   </div>
 
   <script>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   const QUERY = ${safeJson(q)};
+  let searchResults = null;
+  let searchCategory = 'all';
 
   async function doSearch() {
     const el = document.getElementById('search-content');
     if (!QUERY.trim()) { el.innerHTML = '<p class="loading">Inserisci un termine di ricerca.</p>'; return; }
-    const res = await apiFetch('/api/search?q=' + encodeURIComponent(QUERY));
-    const data = await res.json();
-    const total = data.blacklist.length + data.notes.length + data.logs.length + data.tickets.length;
-    if (!total) { el.innerHTML = '<p class="loading">Nessun risultato.</p>'; return; }
+    el.innerHTML = '<p class="loading">Ricerca in corso...</p>';
+    try {
+      const res = await apiFetch('/api/search?q=' + encodeURIComponent(QUERY));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!data || !Array.isArray(data.blacklist) || !Array.isArray(data.notes) || !Array.isArray(data.logs) || !Array.isArray(data.tickets)) {
+        throw new Error('Risposta non valida dal server');
+      }
+      searchResults = data;
+      renderSearchResults();
+    } catch (error) {
+      el.innerHTML = '<div class="tool-empty">Ricerca non disponibile. <button class="secondary small" onclick="doSearch()">Riprova</button></div>';
+      console.error('[search] ricerca non riuscita', error);
+    }
+  }
 
+  function setSearchCategory(category) {
+    searchCategory = category;
+    renderSearchResults();
+  }
+
+  function renderSearchResults() {
+    if (!searchResults) return;
+    const groups = [
+      { key: 'blacklist', label: 'Blacklist', icon: '🚫', rows: searchResults.blacklist },
+      { key: 'notes', label: 'Note staff', icon: '📝', rows: searchResults.notes },
+      { key: 'logs', label: 'Mod Logs', icon: '📋', rows: searchResults.logs },
+      { key: 'tickets', label: 'Ticket', icon: '🎫', rows: searchResults.tickets }
+    ];
+    const total = groups.reduce((sum, group) => sum + group.rows.length, 0);
+    const activeGroups = groups.filter(group => group.rows.length);
+    document.getElementById('search-total').textContent = total.toLocaleString('it-IT');
+    document.getElementById('search-categories').textContent = activeGroups.length.toLocaleString('it-IT');
+    document.getElementById('search-filters').innerHTML = '<button class="' + (searchCategory === 'all' ? '' : 'secondary') + ' small" onclick="setSearchCategory(\\'all\\')">Tutto · ' + total + '</button>' +
+      activeGroups.map(group => '<button class="' + (searchCategory === group.key ? '' : 'secondary') + ' small" onclick="setSearchCategory(\\'' + group.key + '\\')">' + group.icon + ' ' + esc(group.label) + ' · ' + group.rows.length + '</button>').join('');
+    const visibleGroups = searchCategory === 'all' ? activeGroups : activeGroups.filter(group => group.key === searchCategory);
+    if (!visibleGroups.length) {
+      document.getElementById('search-content').innerHTML = '<div class="tool-empty">' + (total ? 'Nessun risultato in questa categoria.' : 'Nessun risultato per “' + esc(QUERY) + '”. Prova con un altro ID o termine.') + '</div>';
+      return;
+    }
     let html = '';
-    if (data.blacklist.length) {
-      html += '<h3 style="margin-top:20px;">🚫 Blacklist (' + data.blacklist.length + ')</h3>';
-      html += '<table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
-        data.blacklist.map(e => '<tr><td><a class="user-link" href="/user/' + esc(e.user_id) + '">' + esc(e.username) + '</a></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    if (data.notes.length) {
-      html += '<h3 style="margin-top:20px;">📝 Note (' + data.notes.length + ')</h3>';
-      html += '<table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
-        data.notes.map(n => '<tr><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + esc(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.content) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    if (data.logs.length) {
-      html += '<h3 style="margin-top:20px;">📋 Logs (' + data.logs.length + ')</h3>';
-      html += '<table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
-        data.logs.slice(0, 50).map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + esc(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td></tr>').join('') + '</tbody></table>';
-      if (data.logs.length > 50) html += '<p style="color:#888;font-size:12px;">...e altri ' + (data.logs.length - 50) + ' log</p>';
-    }
-    if (data.tickets.length) {
-      html += '<h3 style="margin-top:20px;">🎫 Ticket (' + data.tickets.length + ')</h3>';
-      html += '<table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
-        data.tickets.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td></tr>').join('') + '</tbody></table>';
-    }
-    el.innerHTML = html;
+    visibleGroups.forEach(group => {
+      html += '<h3 style="margin:22px 0 10px;">' + group.icon + ' ' + esc(group.label) + ' <span style="color:#858a9b;font-size:12px;font-weight:400;">' + group.rows.length + '</span></h3>';
+      if (group.key === 'blacklist') {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>Utente</th><th>Motivo</th><th>Aggiunto da</th></tr></thead><tbody>' +
+          group.rows.map(e => '<tr><td><a class="user-link" href="/user/' + encodeURIComponent(e.user_id) + '">' + esc(e.username) + '</a><div><code>' + esc(e.user_id) + '</code></div></td><td>' + esc(e.reason) + '</td><td>' + esc(e.moderator_tag) + '</td></tr>').join('') + '</tbody></table></div>';
+      } else if (group.key === 'notes') {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>#</th><th>Utente</th><th>Contenuto</th></tr></thead><tbody>' +
+          group.rows.map(n => '<tr><td>' + esc(n.id) + '</td><td><a class="user-link" href="/user/' + encodeURIComponent(n.user_id) + '">' + esc(n.user_id) + '</a></td><td>' + esc(n.content) + '</td></tr>').join('') + '</tbody></table></div>';
+      } else if (group.key === 'logs') {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>Data</th><th>Tipo</th><th>Target</th><th>Moderatore</th><th>Motivo</th></tr></thead><tbody>' +
+          group.rows.slice(0, 50).map(l => '<tr><td>' + esc(new Date(l.timestamp).toLocaleString('it-IT')) + '</td><td><span class="badge ' + esc((l.type || 'default').toLowerCase()) + '">' + esc(l.type || '-') + '</span></td><td>' + (l.target_id ? '<a class="user-link" href="/user/' + encodeURIComponent(l.target_id) + '">' + esc(l.target || l.target_id) + '</a>' : esc(l.target || '-')) + '</td><td>' + esc(l.moderator || '-') + '</td><td>' + esc(l.reason || '-') + '</td></tr>').join('') + '</tbody></table></div>';
+        if (group.rows.length > 50) html += '<p class="tool-subtitle" style="margin-top:8px;">Mostrati 50 di ' + group.rows.length + ' log.</p>';
+      } else {
+        html += '<div class="tool-table-wrap"><table><thead><tr><th>Server</th><th>Canale</th></tr></thead><tbody>' +
+          group.rows.map(t => '<tr><td>' + esc(t.guild) + '</td><td>#' + esc(t.channel) + '</td></tr>').join('') + '</tbody></table></div>';
+      }
+    });
+    document.getElementById('search-content').innerHTML = html;
   }
   doSearch();
   </script>`;
@@ -3522,32 +3755,57 @@ function renderAccessLogsContent() {
 function renderMessagesContent() {
   return `
   <div class="section">
-    <h2>✉️ Invia Messaggio</h2>
-    <label style="font-size:13px;color:#888;">Canale</label>
-    <select id="msg-channel"></select>
+    <div class="tool-heading">
+      <div><h2>✉️ Invia un messaggio</h2><p class="tool-subtitle">Componi un messaggio o un embed e controlla l’anteprima prima dell’invio.</p></div>
+    </div>
+    <div class="charts-grid">
+      <div>
+        <label for="msg-channel" style="font-size:12px;color:#aeb2c1;">Server e canale</label>
+        <select id="msg-channel" onchange="updateMessagePreview()" aria-label="Seleziona server e canale"></select>
 
-    <label style="font-size:13px;color:#888;">Testo (max 2000)</label>
-    <textarea id="msg-content" rows="3" placeholder="Ciao {user}..." maxlength="2000"></textarea>
+        <label for="msg-content" style="font-size:12px;color:#aeb2c1;">Messaggio</label>
+        <textarea id="msg-content" rows="5" placeholder="Scrivi il messaggio da inviare..." maxlength="2000" oninput="updateMessagePreview()"></textarea>
+        <div class="field-meta"><span>Massimo 2000 caratteri</span><span id="msg-content-count">0 / 2000</span></div>
+        <div class="mention-help">
+          Per menzionare davvero qualcuno usa la sintassi Discord con il suo ID:
+          utente <code>&lt;@ID&gt;</code> (oppure <code>&lt;@!ID&gt;</code>), ruolo <code>&lt;@&amp;ID&gt;</code>.
+          Un testo come <code>@nome</code> non identifica da solo un account. <code>@everyone</code> e <code>@here</code> non generano ping.
+        </div>
+        <label class="inline-check"><input id="msg-allow-mentions" type="checkbox" checked onchange="updateMessagePreview()"> Attiva le menzioni esplicite di utenti e ruoli</label>
 
-    <details style="margin:14px 0;">
-      <summary style="cursor:pointer;color:#5865F2;">➕ Aggiungi embed (opzionale)</summary>
-      <div style="margin-top:12px;">
-        <input id="emb-title" placeholder="Titolo" maxlength="256">
-        <textarea id="emb-desc" rows="3" placeholder="Descrizione" maxlength="4096"></textarea>
-        <input id="emb-color" placeholder="Colore (es. #5865F2)" maxlength="20">
-        <input id="emb-image" placeholder="URL immagine" maxlength="500">
-        <input id="emb-thumb" placeholder="URL thumbnail" maxlength="500">
-        <input id="emb-footer" placeholder="Footer" maxlength="2048">
+        <details style="margin:14px 0;">
+          <summary style="cursor:pointer;color:#b9a9ff;">➕ Aggiungi embed opzionale</summary>
+          <div style="margin-top:12px;">
+            <input id="emb-title" placeholder="Titolo" maxlength="256" oninput="updateMessagePreview()">
+            <textarea id="emb-desc" rows="3" placeholder="Descrizione" maxlength="4096" oninput="updateMessagePreview()"></textarea>
+            <input id="emb-color" placeholder="Colore (es. #5865F2)" maxlength="20" oninput="updateMessagePreview()">
+            <input id="emb-image" placeholder="URL immagine" maxlength="500" oninput="updateMessagePreview()">
+            <input id="emb-thumb" placeholder="URL thumbnail" maxlength="500" oninput="updateMessagePreview()">
+            <input id="emb-footer" placeholder="Footer" maxlength="2048" oninput="updateMessagePreview()">
+          </div>
+        </details>
+
+        <button id="msg-send" onclick="sendMessage()">📤 Invia messaggio</button>
+        <div id="msg-result" role="status" aria-live="polite"></div>
       </div>
-    </details>
-
-    <button onclick="sendMessage()">📤 Invia</button>
-    <div id="msg-result"></div>
+      <div>
+        <h3 style="margin:0 0 10px;color:#d4d6e0;font-size:14px;">Anteprima</h3>
+        <div class="tool-preview" style="min-height:130px;">
+          <div id="msg-preview-channel" style="margin-bottom:10px;color:#858a9b;font-size:11px;">Seleziona un canale</div>
+          <div id="msg-preview-content" style="white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+          <div id="msg-preview-embed" style="display:none;margin-top:12px;padding:12px;border-left:3px solid #8068ed;border-radius:4px;background:#171923;">
+            <strong id="msg-preview-title"></strong>
+            <div id="msg-preview-description" style="margin-top:6px;white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+            <div id="msg-preview-footer" style="margin-top:10px;color:#858a9b;font-size:11px;"></div>
+          </div>
+          <div id="msg-preview-hints" style="margin-top:12px;color:#858a9b;font-size:11px;"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="section">
-    <h2>🧹 Moderazione canale</h2>
-    <p style="color:#888;font-size:13px;margin-bottom:12px;">Agisce sul canale selezionato sopra.</p>
+    <div class="tool-heading"><div><h2>🧹 Moderazione canale</h2><p class="tool-subtitle">Le azioni si applicano al canale selezionato sopra.</p></div></div>
     <div class="form-row">
       <input id="mc-amount" type="number" min="1" max="100" value="10" style="max-width:120px;">
       <button class="danger small" onclick="modClear()">🧹 Pulisci</button>
@@ -3562,12 +3820,49 @@ function renderMessagesContent() {
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   let channelsCache = [];
   async function loadChannels() {
-    const res = await apiFetch('/api/messages/channels');
-    channelsCache = await res.json();
     const sel = document.getElementById('msg-channel');
-    sel.innerHTML = channelsCache.map(c =>
-      '<option value="' + esc(c.channelId) + '">' + esc(c.guildName) + ' → #' + esc(c.channelName) + '</option>'
-    ).join('') || '<option value="">Nessun canale</option>';
+    try {
+      const res = await apiFetch('/api/messages/channels');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      if (!Array.isArray(data)) throw new Error('Risposta non valida dal server');
+      channelsCache = data;
+      const grouped = {};
+      channelsCache.forEach(channel => {
+        const key = channel.guildId;
+        if (!grouped[key]) grouped[key] = { name: channel.guildName, channels: [] };
+        grouped[key].channels.push(channel);
+      });
+      sel.innerHTML = Object.keys(grouped).map(guildId => '<optgroup label="' + esc(grouped[guildId].name) + '">' +
+        grouped[guildId].channels.map(c => '<option value="' + esc(c.channelId) + '">#' + esc(c.channelName) + '</option>').join('') + '</optgroup>').join('') ||
+        '<option value="">Nessun canale accessibile</option>';
+      updateMessagePreview();
+    } catch (error) {
+      sel.innerHTML = '<option value="">Canali non disponibili</option>';
+      document.getElementById('msg-result').innerHTML = '<span class="error">❌ Impossibile caricare i canali. Riprova ricaricando la pagina.</span>';
+      console.error('[messages] caricamento canali non riuscito', error);
+    }
+  }
+
+  function updateMessagePreview() {
+    const channel = channelsCache.find(c => c.channelId === document.getElementById('msg-channel').value);
+    const content = document.getElementById('msg-content').value;
+    const title = document.getElementById('emb-title').value.trim();
+    const description = document.getElementById('emb-desc').value.trim();
+    const footer = document.getElementById('emb-footer').value.trim();
+    const mentionEnabled = document.getElementById('msg-allow-mentions').checked;
+    document.getElementById('msg-preview-channel').textContent = channel ? channel.guildName + ' · #' + channel.channelName : 'Seleziona un canale';
+    document.getElementById('msg-preview-content').textContent = content || 'Il testo del messaggio apparirà qui.';
+    document.getElementById('msg-content-count').textContent = content.length.toLocaleString('it-IT') + ' / 2000';
+    document.getElementById('msg-preview-title').textContent = title;
+    document.getElementById('msg-preview-description').textContent = description;
+    document.getElementById('msg-preview-footer').textContent = footer;
+    const embedPreview = document.getElementById('msg-preview-embed');
+    embedPreview.style.display = title || description || footer ? 'block' : 'none';
+    const mentionMatches = content.match(/<@!?\\d{17,20}>|<@&\\d{17,20}>/g) || [];
+    document.getElementById('msg-preview-hints').textContent = mentionMatches.length
+      ? (mentionEnabled ? mentionMatches.length + ' menzion' + (mentionMatches.length === 1 ? 'e' : 'i') + ' esplicite attive · @everyone/@here restano disattivati' : 'Menzioni disattivate: il testo verrà inviato senza ping')
+      : (mentionEnabled ? 'I tag Discord di utenti e ruoli verranno menzionati · ping di massa disattivati' : 'Menzioni disattivate');
   }
 
   async function sendMessage() {
@@ -3586,16 +3881,24 @@ function renderMessagesContent() {
     if (!content && !embed.title && !embed.description) {
       result.innerHTML = '<span class="error">❌ Testo o embed obbligatorio</span>'; return;
     }
-    const btn = document.querySelector('button[onclick="sendMessage()"]');
+    const btn = document.getElementById('msg-send');
     btn.disabled = true; btn.textContent = '⏳ Invio...';
-    const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed }) });
-    const data = await res.json().catch(() => ({}));
-    btn.disabled = false; btn.textContent = '📤 Invia';
-    if (res.ok) {
-      result.innerHTML = '<span class="success">✅ Inviato! ID: ' + esc(data.messageId) + '</span>';
-      document.getElementById('msg-content').value = '';
-    } else {
-      result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
+    try {
+      const allowMentions = document.getElementById('msg-allow-mentions').checked;
+      const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed, allowMentions }) });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        result.innerHTML = '<span class="success">✅ Inviato in #' + esc(currentChannel().channelName) + ' · ID: ' + esc(data.messageId) + '</span>';
+        document.getElementById('msg-content').value = '';
+        updateMessagePreview();
+      } else {
+        result.innerHTML = '<span class="error">❌ [' + res.status + '] ' + esc(data.error || 'Errore') + '</span>';
+      }
+    } catch (error) {
+      result.innerHTML = '<span class="error">❌ Invio non riuscito. Controlla la connessione e riprova.</span>';
+      console.error('[messages] invio non riuscito', error);
+    } finally {
+      btn.disabled = false; btn.textContent = '📤 Invia messaggio';
     }
   }
 
