@@ -178,8 +178,9 @@ function checkCooldown(userId, commandName, cooldownTime = 3000) {
 
 async function safeReply(interaction, data) {
   try {
-    if (interaction.replied || interaction.deferred) return await interaction.followUp(data);
-    return await interaction.reply(data);
+    const payload = embedTextPayload(data);
+    if (interaction.replied || interaction.deferred) return await interaction.followUp(payload);
+    return await interaction.reply(payload);
   } catch (err) {
     log.err('safeReply fallito', err);
     return null;
@@ -188,7 +189,9 @@ async function safeReply(interaction, data) {
 
 async function safeReplySource(source, data, isSlash) {
   if (isSlash) return safeReply(source, data);
-  const payload = { ...data };
+  const normalized = embedTextPayload(data);
+  if (!normalized) return null;
+  const payload = { ...normalized };
   delete payload.ephemeral;
   try {
     return await source.channel.send(payload);
@@ -209,6 +212,27 @@ function buildResultEmbed(result, defaultTitle = 'Risultato') {
   const color = isSuccess ? 0x00FF00 : isError ? 0xFF0000 : 0x0099FF;
 
   return EmbedManager.createEmbed({ title, description: cleanText || 'Operazione completata.', color, timestamp: true });
+}
+
+function embedTextPayload(data, defaultTitle = 'Risposta') {
+  const payload = typeof data === 'string' ? { content: data } : data;
+  if (!payload || typeof payload.content !== 'string' || payload.embeds?.length) return payload;
+
+  const { content, ...options } = payload;
+  const canMentionUsers = !options.allowedMentions || options.allowedMentions.parse?.includes('users');
+  const canMentionRoles = !options.allowedMentions || options.allowedMentions.parse?.includes('roles');
+  const canMentionEveryone = !options.allowedMentions || options.allowedMentions.parse?.includes('everyone');
+  const mentions = content.match(/<@!?(\d{17,20})>|<@&\d{17,20}>|@everyone|@here/g) || [];
+  const mentionContent = mentions.filter(mention =>
+    mention.startsWith('@') ? canMentionEveryone
+      : mention.startsWith('<@&') ? canMentionRoles
+        : canMentionUsers
+  ).join(' ');
+  return {
+    ...options,
+    ...(mentionContent ? { content: mentionContent } : {}),
+    embeds: [buildResultEmbed({ message: content }, defaultTitle)]
+  };
 }
 
 // ==================== EMBED MANAGER ====================
@@ -1867,15 +1891,17 @@ async function handlePrefixCommand(message) {
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
       await message.delete().catch(err => log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`));
     }
-    return channel.send({
+    const response = embedTextPayload({
       content: custom,
       allowedMentions: { parse: ['users', 'everyone'], repliedUser: false }
-    }).catch(err => log.err('custom command send', err));
+    }, `Comando: ${commandName}`);
+    response.embeds = [EmbedManager.info(`Comando: ${commandName}`, custom)];
+    return channel.send(response).catch(err => log.err('custom command send', err));
   }
 
   const cd = checkCooldown(member.id, commandName);
   if (cd.onCooldown) {
-    return message.reply({ content: `⏳ Aspetta ${cd.remaining}s prima di riusare questo comando.`, allowedMentions: { repliedUser: false } });
+    return message.reply(embedTextPayload({ content: `⏳ Aspetta ${cd.remaining}s prima di riusare questo comando.`, allowedMentions: { repliedUser: false } }));
   }
 
   const replyMethod = async (r) => {
@@ -1927,50 +1953,50 @@ async function handlePrefixCommand(message) {
       }
 
       case 'kick': {
-        if (!args[0]) return message.reply('❌ Uso: `-kick <id o @utente> [motivo]`');
+        if (!args[0]) return message.reply(embedTextPayload('❌ Uso: `-kick <id o @utente> [motivo]`'));
         const r = await CommandLogic.kick(guild, member, args[0], args.slice(1).join(' ') || 'Nessun motivo');
         return replyMethod({ ...r, title: 'Kick' });
       }
       case 'ban': {
-        if (!args[0]) return message.reply('❌ Uso: `-ban <id o @utente> [motivo]`');
+        if (!args[0]) return message.reply(embedTextPayload('❌ Uso: `-ban <id o @utente> [motivo]`'));
         const r = await CommandLogic.ban(guild, member, args[0], args.slice(1).join(' ') || 'Nessun motivo');
         return replyMethod({ ...r, title: 'Ban' });
       }
       case 'unban': {
-        if (!args[0]) return message.reply('❌ Uso: `-unban <id o @utente>`');
+        if (!args[0]) return message.reply(embedTextPayload('❌ Uso: `-unban <id o @utente>`'));
         const r = await CommandLogic.unban(guild, member, args[0]);
         return replyMethod({ ...r, title: 'Unban' });
       }
       case 'clear': {
         const amount = parseInt(args[0]);
-        if (isNaN(amount)) return message.reply('❌ Uso: `-clear <1-100>`');
+        if (isNaN(amount)) return message.reply(embedTextPayload('❌ Uso: `-clear <1-100>`'));
         const r = await CommandLogic.clear(channel, member, amount);
         return replyMethod({ ...r, title: 'Clear' });
       }
       case 'purge': {
         const amount = parseInt(args[0]);
-        if (isNaN(amount)) return message.reply('❌ Uso: `-purge <1-100>`');
+        if (isNaN(amount)) return message.reply(embedTextPayload('❌ Uso: `-purge <1-100>`'));
         return purgeMessages(message, amount, member, false);
       }
       case 'invite': {
-        if (!args[0]) return message.reply('❌ Uso: `-invite <id o @utente>`');
+        if (!args[0]) return message.reply(embedTextPayload('❌ Uso: `-invite <id o @utente>`'));
         return CommandLogic.invite(message, guild, member, args[0], async (r) => {
           return message.reply({ embeds: [buildResultEmbed(r, 'Invito')], allowedMentions: { repliedUser: false } });
         });
       }
       case 'giverole': {
-        if (!args[0] || !args[1]) return message.reply('❌ Uso: `-giverole <user> <role>`');
+        if (!args[0] || !args[1]) return message.reply(embedTextPayload('❌ Uso: `-giverole <user> <role>`'));
         const r = await CommandLogic.addRole(guild, member, args[0], args[1]);
         return replyMethod({ ...r, title: 'Give Role' });
       }
       case 'removerole': {
-        if (!args[0] || !args[1]) return message.reply('❌ Uso: `-removerole <user> <role>`');
+        if (!args[0] || !args[1]) return message.reply(embedTextPayload('❌ Uso: `-removerole <user> <role>`'));
         const r = await CommandLogic.removeRole(guild, member, args[0], args[1]);
         return replyMethod({ ...r, title: 'Remove Role' });
       }
       case 'deleterole':
       case 'delrole': {
-        if (!args[0]) return message.reply('❌ Uso: `-deleterole <@ruolo o ID> [motivo]`');
+        if (!args[0]) return message.reply(embedTextPayload('❌ Uso: `-deleterole <@ruolo o ID> [motivo]`'));
         const r = await CommandLogic.deleteRole(guild, member, args[0], args.slice(1).join(' ') || 'Nessun motivo');
         return replyMethod({ ...r, title: 'Ruolo Eliminato' });
       }
@@ -2040,13 +2066,13 @@ async function handlePrefixCommand(message) {
         }
 
         if (!args[0] || !content) {
-          return message.reply('❌ Uso: `-remind <ore> <minuti> <testo>`\nEsempi: `-remind 1 30 scrim`, `-remind 1h30m scrim`, `-remind 10m scrim`');
+          return message.reply(embedTextPayload('❌ Uso: `-remind <ore> <minuti> <testo>`\nEsempi: `-remind 1 30 scrim`, `-remind 1h30m scrim`, `-remind 10m scrim`'));
         }
 
-        if (!ms) return message.reply('❌ Formato tempo non valido. Usa ore e minuti: `1 30`, `1h30m`, `1:30`.');
-        if (ms < 5000) return message.reply('❌ Il tempo minimo è 5 secondi.');
-        if (ms > 30 * 24 * 60 * 60 * 1000) return message.reply('❌ Il tempo massimo è 30 giorni.');
-        if (content.length > 500) return message.reply('❌ Il testo è troppo lungo (max 500 caratteri).');
+        if (!ms) return message.reply(embedTextPayload('❌ Formato tempo non valido. Usa ore e minuti: `1 30`, `1h30m`, `1:30`.'));
+        if (ms < 5000) return message.reply(embedTextPayload('❌ Il tempo minimo è 5 secondi.'));
+        if (ms > 30 * 24 * 60 * 60 * 1000) return message.reply(embedTextPayload('❌ Il tempo massimo è 30 giorni.'));
+        if (content.length > 500) return message.reply(embedTextPayload('❌ Il testo è troppo lungo (max 500 caratteri).'));
 
         const remindAt = new Date(Date.now() + ms);
         const id = storage.addReminder(member.id, guild.id, channel.id, content, remindAt);
@@ -2406,7 +2432,7 @@ async function handlePrefixCommand(message) {
               .setTimestamp();
             return message.reply({ embeds: [embed] });
           }
-          return message.reply({ content: text, allowedMentions: { parse: [], repliedUser: false } });
+          return message.reply(embedTextPayload({ content: text, allowedMentions: { parse: [], repliedUser: false } }, 'Anteprima Benvenuto'));
         }
 
         if (sub === 'disable' || sub === 'off') {
@@ -2427,7 +2453,7 @@ async function handlePrefixCommand(message) {
     }
   } catch (err) {
     log.err('handlePrefixCommand', err);
-    return message.reply('❌ Errore durante l\'esecuzione del comando.');
+    return message.reply(embedTextPayload('❌ Errore durante l\'esecuzione del comando.'));
   }
 }
 
@@ -2507,7 +2533,7 @@ async function handleSlashCommand(interaction) {
 
     case 'roles': {
       const res = await CommandLogic.listRoles(guild);
-      return interaction.reply({ content: res.message, ephemeral: true });
+      return interaction.reply({ ...embedTextPayload({ content: res.message }, 'Lista Ruoli'), ephemeral: true });
     }
 
     case 'warn': {
@@ -2905,7 +2931,7 @@ async function handleButton(interaction) {
       new ButtonBuilder().setCustomId('prio_high').setLabel('🟠 Alta').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('prio_urgent').setLabel('🔴 Urgente').setStyle(ButtonStyle.Danger)
     );
-    return interaction.reply({ content: 'Scegli la priorità:', components: [row], ephemeral: true });
+    return interaction.reply(embedTextPayload({ content: 'Scegli la priorità:', components: [row], ephemeral: true }));
   }
 
   if (['prio_low', 'prio_med', 'prio_high', 'prio_urgent'].includes(interaction.customId)) {
@@ -2921,7 +2947,7 @@ async function handleButton(interaction) {
       channel: ch.name,
       reason: `Priorità: ${priority.toUpperCase()}`
     });
-    return interaction.update({ content: `✅ Priorità impostata a: **${priority.toUpperCase()}**`, components: [] });
+    return interaction.update(embedTextPayload({ content: `✅ Priorità impostata a: **${priority.toUpperCase()}**`, components: [] }));
   }
 }
 
