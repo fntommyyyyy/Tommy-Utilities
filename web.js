@@ -1738,10 +1738,14 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
       await logMod(guild, {
         type: data.action === 'add' ? 'Ruolo Aggiunto' : 'Ruolo Rimosso',
-        title: data.action === 'add' ? 'Ruolo assegnato' : 'Ruolo rimosso',
+        title: 'Member Role Update',
         targetId: member.id,
         target: `${member.user.username} (${member.id})`,
         moderator: dashMod(req),
+        moderatorId: req.session.user.id,
+        roleChanges: data.action === 'add'
+          ? { added: [{ id: role.id, name: role.name }], removed: [] }
+          : { added: [], removed: [{ id: role.id, name: role.name }] },
         reason: role.name
       });
       res.json({ ok: true });
