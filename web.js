@@ -661,9 +661,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
-  app.get('/', (req, res) => {
-    res.json({ message: 'Bot Dashboard', version: '5.4.4', loggedIn: !!req.session.user });
-  });
+  app.get('/', (req, res) => res.redirect('/resources'));
 
   // ==================== OAUTH ====================
   app.get('/auth/login', (req, res) => {
