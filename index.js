@@ -348,9 +348,9 @@ const ModLogModule = {
       ].filter(Boolean).join('\n\n');
       const fields = roleChanges
         ? [
-            { name: 'Responsible', value: logData.moderatorId ? `<@${logData.moderatorId}> \`${logData.moderatorId}\`` : logData.moderator || 'Unknown', inline: false },
-            { name: 'Target', value: `<@${logData.targetId}> \`${logData.targetId}\``, inline: false },
-            { name: 'Date', value: `<t:${Math.floor((logData.eventTimestamp || Date.now()) / 1000)}:F>`, inline: false },
+            { name: 'Responsible', value: logData.moderatorId ? `<@${logData.moderatorId}> \`${logData.moderatorId}\`` : logData.moderator || 'Unknown', inline: true },
+            { name: 'Target', value: `<@${logData.targetId}> \`${logData.targetId}\``, inline: true },
+            { name: 'Date', value: `<t:${Math.floor((logData.eventTimestamp || Date.now()) / 1000)}:F>`, inline: true },
             { name: 'Changes', value: roleChangeSections || 'Nessun ruolo modificato.', inline: false }
           ]
         : [
