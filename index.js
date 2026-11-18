@@ -4,6 +4,7 @@ const {
   GatewayIntentBits,
   Partials,
   Events,
+  AuditLogEvent,
   PermissionsBitField,
   ChannelType,
   ActionRowBuilder,
@@ -765,7 +766,148 @@ async function sendWelcome(member) {
   }
 }
 
+const recentMemberAuditActions = new Map();
+const processedMemberAuditEntries = new Map();
+const auditLogWarnings = new Set();
+const MEMBER_AUDIT_ACTIONS = new Map([
+  [AuditLogEvent.MemberKick, { type: 'Kick', title: 'Utente espulso' }],
+  [AuditLogEvent.MemberBanAdd, { type: 'Ban', title: 'Utente bannato' }],
+  [AuditLogEvent.MemberBanRemove, { type: 'Unban', title: 'Utente sbannato' }],
+  [AuditLogEvent.MemberUpdate, { type: 'Utente Modificato', title: 'Profilo utente modificato' }],
+  [AuditLogEvent.MemberRoleUpdate, { type: 'Ruoli Modificati', title: 'Ruoli utente modificati' }],
+  [AuditLogEvent.MemberMove, { type: 'Spostamento Vocale', title: 'Utente spostato in vocale' }],
+  [AuditLogEvent.MemberDisconnect, { type: 'Disconnessione Vocale', title: 'Utente disconnesso dal vocale' }]
+]);
+
+function rememberMemberAuditAction(guildId, targetId, action) {
+  const now = Date.now();
+  for (const [key, record] of recentMemberAuditActions) {
+    if (now - record.timestamp > 15000) recentMemberAuditActions.delete(key);
+  }
+  recentMemberAuditActions.set(`${guildId}:${targetId}`, { action, timestamp: now });
+}
+
+function describeAuditChanges(entry) {
+  const labels = {
+    nick: 'Nickname',
+    roles: 'Ruoli',
+    communication_disabled_until: 'Timeout',
+    deaf: 'Audio disattivato',
+    mute: 'Microfono disattivato',
+    channel_id: 'Canale vocale'
+  };
+  const formatValue = value => {
+    if (value == null) return 'nessuno';
+    if (Array.isArray(value)) {
+      return value.map(item => item?.name || item?.id || String(item)).join(', ') || 'nessuno';
+    }
+    if (typeof value === 'object') return value.name || value.id || 'modificato';
+    return String(value);
+  };
+  return (entry.changes || []).map(change => {
+    const key = change.key || 'Dettaglio';
+    const oldValue = change.old ?? change.old_value;
+    const newValue = change.new ?? change.new_value;
+    if (oldValue === undefined && newValue === undefined) return null;
+    return `${labels[key] || key}: ${formatValue(oldValue)} → ${formatValue(newValue)}`;
+  }).filter(Boolean).join('; ').slice(0, 1000);
+}
+
+async function findRecentMemberAuditEntry(guild, targetId) {
+  try {
+    const entries = [];
+    for (const action of [AuditLogEvent.MemberKick, AuditLogEvent.MemberBanAdd]) {
+      const logs = await guild.fetchAuditLogs({ type: action, limit: 5 });
+      entries.push(...logs.entries.values());
+    }
+    return entries
+      .filter(entry => entry.targetId === targetId && Date.now() - entry.createdTimestamp < 15000)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp)[0] || null;
+  } catch (err) {
+    if (!auditLogWarnings.has(guild.id)) {
+      auditLogWarnings.add(guild.id);
+      log.warn(`Lettura audit log non riuscita per ${guild.id}: ${err.message}`);
+    }
+    return null;
+  }
+}
+
+async function handleGuildAuditLogEntryCreate(entry, guild) {
+  const action = MEMBER_AUDIT_ACTIONS.get(entry.action);
+  const targetId = entry.targetId || entry.target?.id;
+  if (!action || !targetId) return;
+
+  const now = Date.now();
+  for (const [id, timestamp] of processedMemberAuditEntries) {
+    if (now - timestamp > 60000) processedMemberAuditEntries.delete(id);
+  }
+  if (processedMemberAuditEntries.has(entry.id)) return;
+  processedMemberAuditEntries.set(entry.id, now);
+
+  if (entry.action === AuditLogEvent.MemberKick || entry.action === AuditLogEvent.MemberBanAdd) {
+    rememberMemberAuditAction(guild.id, targetId, entry.action);
+  }
+  if (entry.executor?.id === client.user?.id) return;
+
+  const targetName = entry.target?.user?.username || entry.target?.username || entry.target?.tag || targetId;
+  const moderator = entry.executor
+    ? `${entry.executor.tag || entry.executor.username} (${entry.executor.id})`
+    : 'Sistema Discord';
+  const details = describeAuditChanges(entry);
+  await ModLogModule.logUserAction(guild, {
+    type: action.type,
+    title: action.title,
+    targetId,
+    target: `${targetName} (${targetId})`,
+    moderator,
+    reason: entry.reason || details || 'Azione registrata nei log di Discord'
+  });
+}
+
+async function handleGuildMemberRemove(member) {
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  const key = `${member.guild.id}:${member.id}`;
+  const recentAction = recentMemberAuditActions.get(key);
+  if (recentAction && Date.now() - recentAction.timestamp < 15000) {
+    recentMemberAuditActions.delete(key);
+    return;
+  }
+
+  const auditEntry = await findRecentMemberAuditEntry(member.guild, member.id);
+  if (auditEntry) {
+    await handleGuildAuditLogEntryCreate(auditEntry, member.guild);
+    return;
+  }
+
+  const cutoff = new Date(Date.now() - 15000).toISOString();
+  const alreadyLogged = storage.db.prepare(`
+    SELECT 1 FROM mod_logs
+    WHERE guild_id = ? AND target_id = ? AND timestamp >= ?
+      AND type IN ('Kick', 'Kick (dashboard)', 'Ban', 'Ban (dashboard)', 'Blacklist Kick')
+    LIMIT 1
+  `).get(member.guild.id, member.id, cutoff);
+  if (alreadyLogged) return;
+
+  await ModLogModule.logUserAction(member.guild, {
+    type: 'Uscita',
+    title: 'Utente uscito dal server',
+    targetId: member.id,
+    target: `${member.user.username} (${member.id})`,
+    moderator: 'Uscita volontaria',
+    reason: 'Il membro ha lasciato il server'
+  });
+}
+
 async function handleGuildMemberAdd(member) {
+  await ModLogModule.logUserAction(member.guild, {
+    type: 'Ingresso',
+    title: 'Utente entrato nel server',
+    targetId: member.user.id,
+    target: `${member.user.username} (${member.user.id})`,
+    moderator: 'Ingresso autonomo',
+    reason: 'Nuovo membro nel server'
+  });
+
   if (storage.isBlacklisted(member.user.id)) {
     const entry = storage.getBlacklistEntry(member.user.id);
     try {
@@ -796,6 +938,14 @@ async function handleGuildMemberAdd(member) {
         if (botMember.permissions.has(PermissionsBitField.Flags.ManageRoles) &&
             role.position < botMember.roles.highest.position) {
           await member.roles.add(role, 'Auto-role all\'ingresso');
+          await ModLogModule.logUserAction(member.guild, {
+            type: 'Ruolo Aggiunto',
+            title: 'Ruolo automatico assegnato',
+            targetId: member.user.id,
+            target: `${member.user.username} (${member.user.id})`,
+            moderator: 'Sistema Automatico',
+            reason: role.name
+          });
         }
       }
     }
@@ -3038,6 +3188,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on(Events.MessageCreate, handlePrefixCommand);
 client.on(Events.GuildMemberAdd, handleGuildMemberAdd);
+client.on(Events.GuildMemberRemove, member => {
+  handleGuildMemberRemove(member).catch(err => log.err('guildMemberRemove mod log', err));
+});
+client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
+  handleGuildAuditLogEntryCreate(entry, guild).catch(err => log.err('guildAuditLogEntryCreate mod log', err));
+});
 
 process.on('unhandledRejection', (err) => log.err('unhandledRejection', err));
 process.on('uncaughtException', (err) => log.err('uncaughtException', err));
