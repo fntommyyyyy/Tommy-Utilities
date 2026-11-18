@@ -1205,7 +1205,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
           kind: 'guild',
           id: guild.id,
           name: guild.name,
-          iconUrl: guild.iconURL({ size: 96 }),
+          iconUrl: guild.iconURL({ size: 128 }),
           memberCount: guild.memberCount,
           permissions: access?.authorized && ENV_ADMIN_IDS.includes(req.session.user.id)
             ? DASHBOARD_FEATURES
