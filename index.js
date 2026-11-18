@@ -343,32 +343,33 @@ const ModLogModule = {
 
       const roleChanges = logData.roleChanges;
       const roleChangeSections = roleChanges && [
-        roleChanges.added.length && `✅ **Additions:**\n${roleChanges.added.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n')}`,
-        roleChanges.removed.length && `❌ **Removals:**\n${roleChanges.removed.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n')}`
+        roleChanges.added.length && `✅ **Additions:**\n　▶ ${roleChanges.added.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n　▶ ')}`,
+        roleChanges.removed.length && `❌ **Removals:**\n　▶ ${roleChanges.removed.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n　▶ ')}`
       ].filter(Boolean).join('\n\n');
-      const fields = roleChanges
-        ? [
-            { name: 'Responsible', value: logData.moderatorId ? `<@${logData.moderatorId}> \`${logData.moderatorId}\`` : logData.moderator || 'Unknown', inline: true },
-            { name: 'Target', value: `<@${logData.targetId}> \`${logData.targetId}\``, inline: true },
-            { name: 'Date', value: `<t:${Math.floor((logData.eventTimestamp || Date.now()) / 1000)}:F>`, inline: true },
-            { name: 'Changes', value: roleChangeSections || 'Nessun ruolo modificato.', inline: false }
-          ]
-        : [
-            { name: 'Type', value: logData.type || 'N/A', inline: true },
-            logData.target && { name: 'Target', value: logData.target, inline: true },
-            logData.moderator && { name: 'Moderator', value: logData.moderator, inline: true },
-            logData.user && { name: 'User', value: logData.user, inline: true },
-            logData.channel && { name: 'Channel', value: logData.channel, inline: true },
-            logData.duration && { name: 'Duration', value: logData.duration, inline: true },
-            logData.reason && { name: 'Reason', value: logData.reason, inline: false },
-            { name: 'Date', value: new Date().toLocaleString('it-IT'), inline: false }
-          ].filter(Boolean);
+      const roleUpdateDescription = roleChanges && [
+        `▶ **Responsible:** ${logData.moderatorId ? `<@${logData.moderatorId}> \`${logData.moderatorId}\`` : logData.moderator || 'Unknown'}`,
+        `▶ **Target:** <@${logData.targetId}> \`${logData.targetId}\``,
+        `▶ <t:${Math.floor((logData.eventTimestamp || Date.now()) / 1000)}:F>`,
+        '**Changes**',
+        roleChangeSections || 'Nessun ruolo modificato.'
+      ].join('\n');
+      const fields = roleChanges ? [] : [
+        { name: 'Type', value: logData.type || 'N/A', inline: true },
+        logData.target && { name: 'Target', value: logData.target, inline: true },
+        logData.moderator && { name: 'Moderator', value: logData.moderator, inline: true },
+        logData.user && { name: 'User', value: logData.user, inline: true },
+        logData.channel && { name: 'Channel', value: logData.channel, inline: true },
+        logData.duration && { name: 'Duration', value: logData.duration, inline: true },
+        logData.reason && { name: 'Reason', value: logData.reason, inline: false },
+        { name: 'Date', value: new Date().toLocaleString('it-IT'), inline: false }
+      ].filter(Boolean);
 
       const embed = EmbedManager.createEmbed({
         title: logData.title || 'Azione Mod',
+        description: roleUpdateDescription,
         color: roleChanges ? 0xF47B20 : 0x5865F2,
         fields,
-        timestamp: true
+        timestamp: !roleChanges
       });
 
       await ch.send({ embeds: [embed] }).catch(err => log.warn(`Log send fallito: ${err.message}`));
