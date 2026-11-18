@@ -1715,6 +1715,33 @@ const CommandLogic = {
   }
 };
 
+async function executeDashboardPrefixCommand(guild, channel, member, content) {
+  const parsed = content.match(/^[-&]\s*([a-z0-9_-]+)/i);
+  if (!parsed) return false;
+  const commandName = parsed[1].toLowerCase();
+  if (!BUILTIN_PREFIX_COMMANDS.has(commandName) && !storage.getCommand(commandName)) return false;
+
+  const mentionedIds = [...content.matchAll(/<@!?(\d{17,20})>/g)].map(match => match[1]);
+  const mentionedUsers = [];
+  for (const id of mentionedIds) {
+    const user = await client.users.fetch(id).catch(() => null);
+    if (user) mentionedUsers.push(user);
+  }
+  const message = {
+    author: member.user,
+    member,
+    guild,
+    channel,
+    content,
+    createdTimestamp: Date.now(),
+    mentions: { users: { first: () => mentionedUsers[0] || null } },
+    reply: payload => channel.send(payload),
+    delete: async () => {}
+  };
+  await handlePrefixCommand(message);
+  return true;
+}
+
 // ==================== SLASH COMMANDS ====================
 const slashCommands = [
   new SlashCommandBuilder().setName('help').setDescription('Mostra la lista dei comandi'),
@@ -3073,7 +3100,8 @@ let webServer = null;
 
     webServer = createWebServer({
   storage, client, log, botStartTime, buildTranscriptHtml,
-  modLog: (guild, data) => ModLogModule.logUserAction(guild, data)
+  modLog: (guild, data) => ModLogModule.logUserAction(guild, data),
+  executeDashboardCommand: executeDashboardPrefixCommand
 });
 
 
