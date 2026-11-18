@@ -3270,7 +3270,7 @@ function renderModlogsContent() {
   return `
   <div class="section">
     <div class="tool-heading">
-      <div><h2>📋 Mod Logs</h2><p class="tool-subtitle">Registro delle azioni di moderazione, con filtri rapidi e ricerca nei dettagli.</p></div>
+      <div><h2>📋 Mod Logs</h2><p class="tool-subtitle">Azioni di moderazione e modifiche ai membri, con filtri rapidi e ricerca nei dettagli.</p></div>
       <div class="export-bar"><button class="secondary small" onclick="loadLogs(true)">↻ Aggiorna</button><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
     </div>
     <div class="tool-stats">
@@ -3284,6 +3284,13 @@ function renderModlogsContent() {
         <option value="Ban">Ban</option>
         <option value="Warn">Warn</option>
         <option value="Timeout">Timeout</option>
+        <option value="Ingresso">Ingresso</option>
+        <option value="Uscita">Uscita</option>
+        <option value="Unban">Unban</option>
+        <option value="Utente Modificato">Profilo utente</option>
+        <option value="Ruoli Modificati">Ruoli modificati</option>
+        <option value="Spostamento Vocale">Spostamento vocale</option>
+        <option value="Disconnessione Vocale">Disconnessione vocale</option>
         <option value="Clear">Clear</option>
         <option value="Purge">Purge</option>
         <option value="Lock">Lock</option>
