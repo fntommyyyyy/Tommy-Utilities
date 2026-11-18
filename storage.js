@@ -192,6 +192,7 @@ class StorageService {
         category TEXT NOT NULL DEFAULT 'Server Discord',
         description TEXT NOT NULL DEFAULT '',
         url TEXT,
+        invite_url TEXT,
         updated_by TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -273,6 +274,7 @@ class StorageService {
 
     this._ensureColumn('mod_logs', 'guild_id', 'TEXT');
     this._ensureColumn('ticket_transcripts', 'guild_id', 'TEXT');
+    this._ensureColumn('public_resource_guild_overrides', 'invite_url', 'TEXT');
     try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_mod_logs_guild ON mod_logs(guild_id)'); } catch {}
     try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_tr_guild ON ticket_transcripts(guild_id)'); } catch {}
   }
@@ -466,13 +468,14 @@ class StorageService {
     this._resourceDelete = this.db.prepare('DELETE FROM public_resources WHERE id = ?');
     this._guildResourceOverrides = this.db.prepare('SELECT * FROM public_resource_guild_overrides');
     this._guildResourceOverrideUpsert = this.db.prepare(`
-      INSERT INTO public_resource_guild_overrides (guild_id, title, category, description, url, updated_by, updated_at)
-      VALUES (@guildId, @title, @category, @description, @url, @updatedBy, @updatedAt)
+      INSERT INTO public_resource_guild_overrides (guild_id, title, category, description, url, invite_url, updated_by, updated_at)
+      VALUES (@guildId, @title, @category, @description, @url, @inviteUrl, @updatedBy, @updatedAt)
       ON CONFLICT(guild_id) DO UPDATE SET
         title = excluded.title,
         category = excluded.category,
         description = excluded.description,
         url = excluded.url,
+        invite_url = excluded.invite_url,
         updated_by = excluded.updated_by,
         updated_at = excluded.updated_at
     `);
@@ -681,9 +684,9 @@ class StorageService {
   }
   deletePublicResource(id) { return this._resourceDelete.run(id).changes > 0; }
   getGuildResourceOverrides() { return this._guildResourceOverrides.all(); }
-  saveGuildResourceOverride(guildId, { title, category = 'Server Discord', description = '', url = '', updatedBy }) {
+  saveGuildResourceOverride(guildId, { title, category = 'Server Discord', description = '', url = '', inviteUrl = '', updatedBy }) {
     this._guildResourceOverrideUpsert.run({
-      guildId, title, category, description, url: url || null, updatedBy,
+      guildId, title, category, description, url: url || null, inviteUrl: inviteUrl || null, updatedBy,
       updatedAt: new Date().toISOString()
     });
   }
