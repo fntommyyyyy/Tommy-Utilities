@@ -1934,12 +1934,10 @@ async function handlePrefixCommand(message) {
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
       await message.delete().catch(err => log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`));
     }
-    const response = embedTextPayload({
+    return channel.send({
       content: custom,
       allowedMentions: { parse: ['users', 'everyone'], repliedUser: false }
-    }, `Comando: ${commandName}`);
-    response.embeds = [EmbedManager.info(`Comando: ${commandName}`, custom)];
-    return channel.send(response).catch(err => log.err('custom command send', err));
+    }).catch(err => log.err('custom command send', err));
   }
 
   const cd = checkCooldown(member.id, commandName);
