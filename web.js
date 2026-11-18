@@ -2658,15 +2658,34 @@ function renderDashboardContent(security = {}) {
 
 function renderResourcesContent(canManageResources = false) {
   return `
-  <section class="resources-hero">
-    <p class="eyebrow">TOMMY UTILITIES · RISORSE</p>
-    <h2>Resources</h2>
-    <p>Esplora pubblicamente i server Discord collegati al bot. Le funzioni di gestione restano riservate agli utenti autorizzati.</p>
+  <section class="dashboard-hero public-landing-hero">
+    <div class="hero-mark" aria-hidden="true">T</div>
+    <p class="hero-eyebrow">TOMMY UTILITIES · BOT CONTROL CENTER</p>
+    <h2>Il tuo bot.<br><span>Sempre sotto controllo.</span></h2>
+    <p class="hero-description">Esplora i server Discord e le risorse della community da un unico punto.</p>
+    <div class="hero-actions">
+      <a class="hero-button hero-button-primary" href="/auth/login">Accedi alla dashboard <span aria-hidden="true">→</span></a>
+      <a class="hero-button hero-button-quiet" href="#public-resources">Scopri le risorse <span aria-hidden="true">↓</span></a>
+    </div>
+    <div class="hero-status"><span class="status-led checking" id="public-status-led"></span><span id="public-status-summary" aria-live="polite">Verifica stato servizi...</span></div>
   </section>
-  <section>
+  <section class="section status-panel public-status-panel" aria-labelledby="public-status-title">
+    <div class="status-panel-heading">
+      <div><p class="hero-eyebrow">MONITORAGGIO LIVE</p><h2 id="public-status-title">Stato dei servizi</h2></div>
+      <span class="status-updated" id="public-status-updated">In attesa di aggiornamento</span>
+    </div>
+    <div class="status-grid">
+      <div class="status-item"><span class="status-item-label">Dashboard API</span><strong class="status-value checking" id="public-status-api">Controllo...</strong></div>
+      <div class="status-item"><span class="status-item-label">Gateway Discord</span><strong class="status-value checking" id="public-status-gateway">Controllo...</strong></div>
+      <div class="status-item"><span class="status-item-label">Server Discord</span><strong class="status-value checking" id="public-status-guilds">Controllo...</strong></div>
+      <div class="status-item"><span class="status-item-label">Ping gateway</span><strong class="status-value checking" id="public-status-ping">Controllo...</strong></div>
+    </div>
+  </section>
+  <section id="public-resources">
     <div class="resources-section-heading">
-      <h2>Server Discord</h2>
-      <p>Server collegati e consultabili da tutti.</p>
+      <p class="hero-eyebrow">ESPLORA</p>
+      <h2>Resources</h2>
+      <p>Server Discord e risorse pubbliche della community.</p>
     </div>
     ${canManageResources ? `
     <form class="section resource-admin-form" id="resource-form">
@@ -2733,6 +2752,41 @@ function renderResourcesContent(canManageResources = false) {
     ['overview', '/dashboard', 'Apri dashboard'],
     ['global_blacklist', '/dashboard', 'Apri blacklist']
   ];
+  function setPublicStatus(id, state, label) {
+    const element = document.getElementById(id);
+    element.textContent = label;
+    element.className = 'status-value ' + state;
+  }
+  async function loadPublicStatus() {
+    try {
+      const response = await fetch('/health', { cache: 'no-store' });
+      if (!response.ok) throw new Error('Health check non disponibile');
+      const health = await response.json();
+      const apiOnline = health.status === 'ok';
+      const gatewayOnline = Number.isFinite(health.ping);
+      document.getElementById('public-status-led').className = 'status-led ' + (apiOnline ? 'online' : 'offline');
+      document.getElementById('public-status-summary').textContent = apiOnline ? 'Dashboard operativa' : 'Servizi non disponibili';
+      setPublicStatus('public-status-api', apiOnline ? 'online' : 'offline', apiOnline ? 'Online' : 'Non disponibile');
+      setPublicStatus('public-status-gateway', gatewayOnline ? 'online' : 'offline', gatewayOnline ? 'Connesso' : 'Non disponibile');
+      setPublicStatus('public-status-guilds', apiOnline ? 'online' : 'offline',
+        Number.isFinite(health.guilds) ? health.guilds.toLocaleString('it-IT') : 'N/D');
+      setPublicStatus('public-status-ping', gatewayOnline ? 'online' : 'offline',
+        gatewayOnline ? health.ping + ' ms' : 'N/D');
+      const checkedAt = new Date(health.timestamp);
+      document.getElementById('public-status-updated').textContent = Number.isNaN(checkedAt.getTime())
+        ? 'Aggiornamento live'
+        : 'Aggiornato alle ' + checkedAt.toLocaleTimeString('it-IT');
+    } catch (error) {
+      console.error('[public status] aggiornamento non riuscito', error);
+      document.getElementById('public-status-led').className = 'status-led offline';
+      document.getElementById('public-status-summary').textContent = 'Stato non disponibile';
+      setPublicStatus('public-status-api', 'offline', 'Non disponibile');
+      setPublicStatus('public-status-gateway', 'offline', 'Non disponibile');
+      setPublicStatus('public-status-guilds', 'offline', 'N/D');
+      setPublicStatus('public-status-ping', 'offline', 'N/D');
+      document.getElementById('public-status-updated').textContent = 'Stato non disponibile';
+    }
+  }
   async function loadResources() {
     const root = document.getElementById('resources-list');
     try {
@@ -2927,6 +2981,7 @@ function renderResourcesContent(canManageResources = false) {
       button.disabled = false;
     }
   });
+  loadPublicStatus();
   loadResources();
   </script>`;
 }
