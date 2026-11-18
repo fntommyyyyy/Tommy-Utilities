@@ -341,20 +341,32 @@ const ModLogModule = {
       const ch = guild.channels.cache.get(channelId);
       if (!ch) return;
 
-      const fields = [
-        { name: 'Type', value: logData.type || 'N/A', inline: true },
-        logData.target && { name: 'Target', value: logData.target, inline: true },
-        logData.moderator && { name: 'Moderator', value: logData.moderator, inline: true },
-        logData.user && { name: 'User', value: logData.user, inline: true },
-        logData.channel && { name: 'Channel', value: logData.channel, inline: true },
-        logData.duration && { name: 'Duration', value: logData.duration, inline: true },
-        logData.reason && { name: 'Reason', value: logData.reason, inline: false },
-        { name: 'Date', value: new Date().toLocaleString('it-IT'), inline: false }
-      ].filter(Boolean);
+      const roleChanges = logData.roleChanges;
+      const roleChangeSections = roleChanges && [
+        roleChanges.added.length && `✅ **Additions:**\n${roleChanges.added.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n')}`,
+        roleChanges.removed.length && `❌ **Removals:**\n${roleChanges.removed.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n')}`
+      ].filter(Boolean).join('\n\n');
+      const fields = roleChanges
+        ? [
+            { name: 'Responsible', value: logData.moderatorId ? `<@${logData.moderatorId}> \`${logData.moderatorId}\`` : logData.moderator || 'Unknown', inline: false },
+            { name: 'Target', value: `<@${logData.targetId}> \`${logData.targetId}\``, inline: false },
+            { name: 'Date', value: `<t:${Math.floor((logData.eventTimestamp || Date.now()) / 1000)}:F>`, inline: false },
+            { name: 'Changes', value: roleChangeSections || 'Nessun ruolo modificato.', inline: false }
+          ]
+        : [
+            { name: 'Type', value: logData.type || 'N/A', inline: true },
+            logData.target && { name: 'Target', value: logData.target, inline: true },
+            logData.moderator && { name: 'Moderator', value: logData.moderator, inline: true },
+            logData.user && { name: 'User', value: logData.user, inline: true },
+            logData.channel && { name: 'Channel', value: logData.channel, inline: true },
+            logData.duration && { name: 'Duration', value: logData.duration, inline: true },
+            logData.reason && { name: 'Reason', value: logData.reason, inline: false },
+            { name: 'Date', value: new Date().toLocaleString('it-IT'), inline: false }
+          ].filter(Boolean);
 
       const embed = EmbedManager.createEmbed({
         title: logData.title || 'Azione Mod',
-        color: 0x5865F2,
+        color: roleChanges ? 0xF47B20 : 0x5865F2,
         fields,
         timestamp: true
       });
@@ -813,6 +825,39 @@ function describeAuditChanges(entry) {
   }).filter(Boolean).join('; ').slice(0, 1000);
 }
 
+function getAuditRoleChanges(entry) {
+  const result = { added: [], removed: [] };
+  const normalize = value => (Array.isArray(value) ? value : value ? [value] : [])
+    .map(role => typeof role === 'string' ? { id: role, name: role } : role)
+    .filter(role => role && (role.id || role.name));
+  const appendUnique = (target, roles) => {
+    const known = new Set(target.map(role => role.id || role.name));
+    for (const role of roles) {
+      const key = role.id || role.name;
+      if (!known.has(key)) {
+        target.push(role);
+        known.add(key);
+      }
+    }
+  };
+
+  for (const change of entry.changes || []) {
+    if (change.key === '$add') {
+      appendUnique(result.added, normalize(change.new ?? change.old));
+    } else if (change.key === '$remove') {
+      appendUnique(result.removed, normalize(change.new ?? change.old));
+    } else if (change.key === 'roles') {
+      const before = normalize(change.old);
+      const after = normalize(change.new);
+      const beforeIds = new Set(before.map(role => role.id || role.name));
+      const afterIds = new Set(after.map(role => role.id || role.name));
+      appendUnique(result.added, after.filter(role => !beforeIds.has(role.id || role.name)));
+      appendUnique(result.removed, before.filter(role => !afterIds.has(role.id || role.name)));
+    }
+  }
+  return result;
+}
+
 async function findRecentMemberAuditEntry(guild, targetId) {
   try {
     const entries = [];
@@ -850,16 +895,21 @@ async function handleGuildAuditLogEntryCreate(entry, guild) {
   if (entry.executor?.id === client.user?.id) return;
 
   const targetName = entry.target?.user?.username || entry.target?.username || entry.target?.tag || targetId;
-  const moderator = entry.executor
-    ? `${entry.executor.tag || entry.executor.username} (${entry.executor.id})`
+  const moderatorId = entry.executorId || entry.executor?.id || null;
+  const moderator = moderatorId
+    ? `${entry.executor?.tag || entry.executor?.username || `<@${moderatorId}>`} (${moderatorId})`
     : 'Sistema Discord';
   const details = describeAuditChanges(entry);
+  const isRoleUpdate = entry.action === AuditLogEvent.MemberRoleUpdate;
   await ModLogModule.logUserAction(guild, {
     type: action.type,
-    title: action.title,
+    title: isRoleUpdate ? 'Member Role Update' : action.title,
     targetId,
     target: `${targetName} (${targetId})`,
     moderator,
+    moderatorId,
+    eventTimestamp: entry.createdTimestamp,
+    roleChanges: isRoleUpdate ? getAuditRoleChanges(entry) : undefined,
     reason: entry.reason || details || 'Azione registrata nei log di Discord'
   });
 }
@@ -940,10 +990,12 @@ async function handleGuildMemberAdd(member) {
           await member.roles.add(role, 'Auto-role all\'ingresso');
           await ModLogModule.logUserAction(member.guild, {
             type: 'Ruolo Aggiunto',
-            title: 'Ruolo automatico assegnato',
+            title: 'Member Role Update',
             targetId: member.user.id,
             target: `${member.user.username} (${member.user.id})`,
             moderator: 'Sistema Automatico',
+            moderatorId: client.user.id,
+            roleChanges: { added: [{ id: role.id, name: role.name }], removed: [] },
             reason: role.name
           });
         }
@@ -1738,6 +1790,16 @@ const CommandLogic = {
       return { success: false, message: `❌ L'utente ha già il ruolo ${role.name}!` };
 
     await member.roles.add(role);
+    await ModLogModule.logUserAction(guild, {
+      type: 'Ruolo Aggiunto',
+      title: 'Member Role Update',
+      targetId: member.id,
+      target: `${member.user.tag} (${member.id})`,
+      moderator: `${actorName(executor)} (${executor.id})`,
+      moderatorId: executor.id,
+      roleChanges: { added: [{ id: role.id, name: role.name }], removed: [] },
+      reason: role.name
+    });
     return { success: true, message: `✅ Ruolo **${role.name}** assegnato a ${member.user.tag}!` };
   },
 
@@ -1766,6 +1828,16 @@ const CommandLogic = {
       return { success: false, message: `❌ L'utente non ha il ruolo ${role.name}!` };
 
     await member.roles.remove(role);
+    await ModLogModule.logUserAction(guild, {
+      type: 'Ruolo Rimosso',
+      title: 'Member Role Update',
+      targetId: member.id,
+      target: `${member.user.tag} (${member.id})`,
+      moderator: `${actorName(executor)} (${executor.id})`,
+      moderatorId: executor.id,
+      roleChanges: { added: [], removed: [{ id: role.id, name: role.name }] },
+      reason: role.name
+    });
     return { success: true, message: `✅ Ruolo **${role.name}** rimosso da ${member.user.tag}!` };
   },
 
