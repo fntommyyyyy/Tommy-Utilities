@@ -507,6 +507,17 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       message: 'Il link deve iniziare con http:// o https://'
     })
   });
+  const schemaGuildResourceOverride = z.object({
+    title: z.string().trim().min(1).max(100),
+    category: z.string().trim().max(40).optional().default('Server Discord').transform(value => value || 'Server Discord'),
+    description: z.string().trim().max(500).optional().default(''),
+    url: z.union([
+      z.literal(''),
+      z.string().trim().url().max(2048).refine(value => /^https?:\/\//i.test(value), {
+        message: 'Il link deve iniziare con http:// o https://'
+      })
+    ]).optional().default('')
+  });
   const schemaMessagesSend = z.object({
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
@@ -1200,19 +1211,30 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
     }
     try {
+      const guildOverrides = new Map(
+        storage.getGuildResourceOverrides().map(override => [override.guild_id, override])
+      );
       const resources = [...client.guilds.cache.values()]
-        .map(guild => ({
-          kind: 'guild',
-          id: guild.id,
-          name: guild.name,
-          iconUrl: guild.iconURL({ size: 128 }),
-          memberCount: guild.memberCount,
-          permissions: access?.authorized && ENV_ADMIN_IDS.includes(req.session.user.id)
-            ? DASHBOARD_FEATURES
-            : access?.authorized
-              ? [...(access.guildPermissions.get(guild.id) || [])]
-              : []
-        }))
+        .map(guild => {
+          const override = guildOverrides.get(guild.id);
+          return {
+            kind: 'guild',
+            id: guild.id,
+            name: override?.title || guild.name,
+            category: override ? override.category : 'Server Discord',
+            description: override
+              ? override.description
+              : 'Server Discord collegato al bot. Le funzioni di gestione richiedono un account autorizzato.',
+            resourceUrl: override?.url || null,
+            iconUrl: guild.iconURL({ size: 128 }),
+            memberCount: guild.memberCount,
+            permissions: access?.authorized && ENV_ADMIN_IDS.includes(req.session.user.id)
+              ? DASHBOARD_FEATURES
+              : access?.authorized
+                ? [...(access.guildPermissions.get(guild.id) || [])]
+                : []
+          };
+        })
         .sort((a, b) => a.name.localeCompare(b.name));
       const customResources = storage.getPublicResources().map(resource => ({
         kind: 'custom',
@@ -1242,6 +1264,29 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       if (!storage.updatePublicResource(id, data)) return res.status(404).json({ error: 'Risorsa non trovata' });
       res.json({ ok: true });
     } catch (e) { apiError(res, e, 'Impossibile modificare la risorsa'); }
+  });
+
+  app.put('/api/resources/guild/:guildId', actionLimiter, requireAuth, (req, res) => {
+    if (!req.dashboardAccess.manager) return res.status(403).json({ error: 'Solo gli amministratori dashboard possono modificare le schede server' });
+    const guildId = req.params.guildId;
+    if (!/^\d{17,20}$/.test(guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    if (!client.guilds.cache.has(guildId)) return res.status(404).json({ error: 'Server non trovato' });
+    const data = parseOrFail(schemaGuildResourceOverride, req.body || {}, res);
+    if (!data) return;
+    try {
+      storage.saveGuildResourceOverride(guildId, { ...data, updatedBy: req.session.user.id });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Impossibile modificare la scheda server'); }
+  });
+
+  app.delete('/api/resources/guild/:guildId', actionLimiter, requireAuth, (req, res) => {
+    if (!req.dashboardAccess.manager) return res.status(403).json({ error: 'Solo gli amministratori dashboard possono ripristinare le schede server' });
+    const guildId = req.params.guildId;
+    if (!/^\d{17,20}$/.test(guildId)) return res.status(400).json({ error: 'ID server non valido' });
+    try {
+      storage.deleteGuildResourceOverride(guildId);
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Impossibile ripristinare la scheda server'); }
   });
 
   app.delete('/api/resources/:id', actionLimiter, requireAuth, (req, res) => {
@@ -2616,15 +2661,18 @@ function renderResourcesContent(canManageResources = false) {
     <form class="section resource-admin-form" id="resource-form">
       <h2 id="resource-form-title">Aggiungi una risorsa</h2>
       <input id="resource-id" name="id" type="hidden">
+      <input id="resource-kind" name="kind" type="hidden" value="custom">
+      <p id="resource-form-help">Le risorse personalizzate sono pubbliche. Puoi usare un link a una guida, a un documento o a un file.</p>
       <div class="resource-form-grid">
         <label>Titolo<input name="title" type="text" maxlength="100" required placeholder="Es. Guida alle lobby"></label>
         <label>Categoria<input name="category" type="text" maxlength="40" placeholder="Es. Guide"></label>
-        <label class="resource-form-wide">Link<input name="url" type="url" maxlength="2048" required placeholder="https://..."></label>
+        <label class="resource-form-wide">Link<input id="resource-url" name="url" type="url" maxlength="2048" required placeholder="https://..."></label>
         <label class="resource-form-wide">Descrizione<textarea name="description" maxlength="500" rows="3" placeholder="Descrivi brevemente questa risorsa"></textarea></label>
       </div>
       <div class="resource-form-actions">
         <button type="submit">Pubblica risorsa</button>
         <button id="resource-form-cancel" class="secondary" type="button" hidden>Annulla modifica</button>
+        <button id="resource-form-reset-guild" class="secondary" type="button" hidden>Ripristina dati Discord</button>
         <span id="resource-form-status" role="status" aria-live="polite"></span>
       </div>
     </form>
@@ -2636,8 +2684,10 @@ function renderResourcesContent(canManageResources = false) {
   <style>
     .resource-admin-form { margin-bottom: 20px; padding: 20px; }
     .resource-admin-form h2 { margin-bottom: 14px; font-size: 17px; }
+    #resource-form-help { margin: -7px 0 14px; color: var(--muted); font-size: 11px; }
     .resource-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
     .resource-form-grid label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
+    .resource-form-grid label small { color: #777d90; font-size: 10px; font-weight: 400; }
     .resource-form-grid input, .resource-form-grid textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: #0c0e16; color: var(--text); font: inherit; }
     .resource-form-grid textarea { resize: vertical; }
     .resource-form-grid input:focus, .resource-form-grid textarea:focus { outline: 2px solid rgba(144, 126, 255, .45); outline-offset: 1px; }
@@ -2718,13 +2768,25 @@ function renderResourcesContent(canManageResources = false) {
         const dashboardLink = destination
           ? '<a class="resource-link" href="' + destination[1] + '">' + destination[2] + ' →</a>'
           : '';
+        const editButton = canManageResources
+          ? '<button class="secondary small resource-edit" type="button" data-resource-guild-edit="' + encodeURIComponent(guild.id) +
+            '" data-resource-title="' + resourceEsc(guild.name) +
+            '" data-resource-category="' + resourceEsc(guild.category || 'Server Discord') +
+            '" data-resource-url="' + resourceEsc(guild.resourceUrl || '') +
+            '" data-resource-description="' + resourceEsc(guild.description || '') +
+            '">Modifica scheda</button>'
+          : '';
+        const externalLink = guild.resourceUrl
+          ? '<a class="resource-link" href="' + resourceEsc(guild.resourceUrl) + '" target="_blank" rel="noopener noreferrer">Link aggiuntivo ↗</a>'
+          : '';
         return '<article class="card resource-card">' +
           '<div class="resource-card-header"><div class="resource-card-icon">' + icon + '</div>' +
-          '<div><div class="resource-card-type">SERVER DISCORD</div><h3>' + resourceEsc(guild.name) + '</h3></div></div>' +
+          '<div><div class="resource-card-type">' + resourceEsc(guild.category || 'Server Discord') + '</div><h3>' + resourceEsc(guild.name) + '</h3></div></div>' +
           '<div class="resource-card-meta">' + members + '</div>' +
-          '<p class="resource-card-copy">Server Discord collegato al bot. Le funzioni di gestione richiedono un account autorizzato.</p>' +
+          (guild.description ? '<p class="resource-card-copy">' + resourceEsc(guild.description) + '</p>' : '') +
           '<div class="resource-tags">' + tagsMarkup + '</div>' +
-          '<div class="resource-card-actions"><a class="resource-server-link" href="https://discord.com/channels/' + encodeURIComponent(guild.id) + '" target="_blank" rel="noopener noreferrer">Apri server</a>' + dashboardLink + '</div>' +
+          '<div class="resource-card-actions"><a class="resource-server-link" href="https://discord.com/channels/' + encodeURIComponent(guild.id) + '" target="_blank" rel="noopener noreferrer">Apri server</a>' +
+          '<div class="resource-admin-actions">' + externalLink + dashboardLink + editButton + '</div></div>' +
           '</article>';
       }).join('');
     } catch (error) {
@@ -2736,15 +2798,38 @@ function renderResourcesContent(canManageResources = false) {
   if (resourceForm) {
     const submitButton = resourceForm.querySelector('button[type="submit"]');
     const cancelButton = document.getElementById('resource-form-cancel');
+    const resetGuildButton = document.getElementById('resource-form-reset-guild');
     const resetResourceForm = () => {
       resourceForm.reset();
       document.getElementById('resource-id').value = '';
+      document.getElementById('resource-kind').value = 'custom';
       document.getElementById('resource-form-title').textContent = 'Aggiungi una risorsa';
+      document.getElementById('resource-form-help').textContent = 'Le risorse personalizzate sono pubbliche. Puoi usare un link a una guida, a un documento o a un file.';
+      document.getElementById('resource-url').required = true;
+      document.getElementById('resource-url').placeholder = 'https://...';
       submitButton.textContent = 'Pubblica risorsa';
       cancelButton.hidden = true;
+      resetGuildButton.hidden = true;
+      document.getElementById('resource-form-status').textContent = '';
     };
 
     cancelButton.addEventListener('click', resetResourceForm);
+    resetGuildButton.addEventListener('click', async () => {
+      const guildId = document.getElementById('resource-id').value;
+      if (!guildId || !confirm('Ripristinare questa scheda ai dati originali di Discord?')) return;
+      resetGuildButton.disabled = true;
+      try {
+        const response = await apiFetch('/api/resources/guild/' + encodeURIComponent(guildId), { method: 'DELETE' });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || 'Impossibile ripristinare la scheda.');
+        resetResourceForm();
+        await loadResources();
+      } catch (error) {
+        document.getElementById('resource-form-status').textContent = error.message || 'Errore durante il ripristino.';
+      } finally {
+        resetGuildButton.disabled = false;
+      }
+    });
     resourceForm.addEventListener('submit', async event => {
       event.preventDefault();
       const status = document.getElementById('resource-form-status');
@@ -2753,8 +2838,13 @@ function renderResourcesContent(canManageResources = false) {
       try {
         const formData = new FormData(resourceForm);
         const resourceId = document.getElementById('resource-id').value;
-        const response = await apiFetch(resourceId ? '/api/resources/' + encodeURIComponent(resourceId) : '/api/resources', {
-          method: resourceId ? 'PUT' : 'POST',
+        const resourceKind = document.getElementById('resource-kind').value;
+        const endpoint = resourceKind === 'guild'
+          ? '/api/resources/guild/' + encodeURIComponent(resourceId)
+          : resourceId ? '/api/resources/' + encodeURIComponent(resourceId) : '/api/resources';
+        const method = resourceId ? 'PUT' : 'POST';
+        const response = await apiFetch(endpoint, {
+          method,
           body: JSON.stringify({
             title: formData.get('title'),
             category: formData.get('category'),
@@ -2765,8 +2855,9 @@ function renderResourcesContent(canManageResources = false) {
         const result = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(result.error || 'Impossibile salvare la risorsa.');
         const wasEditing = !!resourceId;
+        const wasGuild = resourceKind === 'guild';
         resetResourceForm();
-        status.textContent = wasEditing ? 'Modifiche salvate.' : 'Risorsa pubblicata.';
+        status.textContent = wasGuild ? 'Scheda server aggiornata.' : wasEditing ? 'Modifiche salvate.' : 'Risorsa pubblicata.';
         await loadResources();
       } catch (error) {
         status.textContent = error.message || 'Errore durante il salvataggio.';
@@ -2777,16 +2868,24 @@ function renderResourcesContent(canManageResources = false) {
   }
   document.getElementById('resources-list').addEventListener('click', async event => {
     if (!canManageResources) return;
-    const editButton = event.target.closest('[data-resource-edit]');
+    const editButton = event.target.closest('[data-resource-edit], [data-resource-guild-edit]');
     if (editButton) {
-      document.getElementById('resource-id').value = editButton.dataset.resourceEdit;
+      const isGuild = !!editButton.dataset.resourceGuildEdit;
+      document.getElementById('resource-id').value = isGuild ? editButton.dataset.resourceGuildEdit : editButton.dataset.resourceEdit;
+      document.getElementById('resource-kind').value = isGuild ? 'guild' : 'custom';
       document.querySelector('#resource-form [name="title"]').value = editButton.dataset.resourceTitle;
       document.querySelector('#resource-form [name="category"]').value = editButton.dataset.resourceCategory;
       document.querySelector('#resource-form [name="url"]').value = editButton.dataset.resourceUrl;
       document.querySelector('#resource-form [name="description"]').value = editButton.dataset.resourceDescription;
-      document.getElementById('resource-form-title').textContent = 'Modifica risorsa';
-      document.querySelector('#resource-form button[type="submit"]').textContent = 'Salva modifiche';
+      document.getElementById('resource-url').required = !isGuild;
+      document.getElementById('resource-url').placeholder = isGuild ? 'Link aggiuntivo facoltativo' : 'https://...';
+      document.getElementById('resource-form-title').textContent = isGuild ? 'Modifica scheda server' : 'Modifica risorsa';
+      document.getElementById('resource-form-help').textContent = isGuild
+        ? 'Modifica solo la scheda pubblica: il nome e le impostazioni del server Discord non cambiano.'
+        : 'Le risorse personalizzate sono pubbliche. Puoi usare un link a una guida, a un documento o a un file.';
+      document.querySelector('#resource-form button[type="submit"]').textContent = isGuild ? 'Salva scheda' : 'Salva modifiche';
       document.getElementById('resource-form-cancel').hidden = false;
+      document.getElementById('resource-form-reset-guild').hidden = !isGuild;
       document.getElementById('resource-form-status').textContent = '';
       document.getElementById('resource-form').scrollIntoView({ behavior: 'smooth', block: 'center' });
       return;

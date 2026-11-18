@@ -186,6 +186,16 @@ class StorageService {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS public_resource_guild_overrides (
+        guild_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'Server Discord',
+        description TEXT NOT NULL DEFAULT '',
+        url TEXT,
+        updated_by TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS ticket_transcripts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
@@ -454,6 +464,19 @@ class StorageService {
       WHERE id = @id
     `);
     this._resourceDelete = this.db.prepare('DELETE FROM public_resources WHERE id = ?');
+    this._guildResourceOverrides = this.db.prepare('SELECT * FROM public_resource_guild_overrides');
+    this._guildResourceOverrideUpsert = this.db.prepare(`
+      INSERT INTO public_resource_guild_overrides (guild_id, title, category, description, url, updated_by, updated_at)
+      VALUES (@guildId, @title, @category, @description, @url, @updatedBy, @updatedAt)
+      ON CONFLICT(guild_id) DO UPDATE SET
+        title = excluded.title,
+        category = excluded.category,
+        description = excluded.description,
+        url = excluded.url,
+        updated_by = excluded.updated_by,
+        updated_at = excluded.updated_at
+    `);
+    this._guildResourceOverrideDelete = this.db.prepare('DELETE FROM public_resource_guild_overrides WHERE guild_id = ?');
 
     // ===== TICKET TRANSCRIPTS =====
     this._trInsert = this.db.prepare(`
@@ -657,6 +680,14 @@ class StorageService {
     return this._resourceUpdate.run({ id, title, category, description, url }).changes > 0;
   }
   deletePublicResource(id) { return this._resourceDelete.run(id).changes > 0; }
+  getGuildResourceOverrides() { return this._guildResourceOverrides.all(); }
+  saveGuildResourceOverride(guildId, { title, category = 'Server Discord', description = '', url = '', updatedBy }) {
+    this._guildResourceOverrideUpsert.run({
+      guildId, title, category, description, url: url || null, updatedBy,
+      updatedAt: new Date().toISOString()
+    });
+  }
+  deleteGuildResourceOverride(guildId) { return this._guildResourceOverrideDelete.run(guildId).changes > 0; }
 
   getDashboardRolePermissions(guildId) {
     return this.db.prepare(
