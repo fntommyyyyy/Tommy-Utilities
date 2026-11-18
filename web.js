@@ -516,6 +516,16 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       z.string().trim().url().max(2048).refine(value => /^https?:\/\//i.test(value), {
         message: 'Il link deve iniziare con http:// o https://'
       })
+    ]).optional().default(''),
+    inviteUrl: z.union([
+      z.literal(''),
+      z.string().trim().url().max(2048).refine(value => {
+        const invite = new URL(value);
+        return invite.protocol === 'https:' && (
+          (invite.hostname === 'discord.gg' && /^\/[a-z0-9_-]+\/?$/i.test(invite.pathname)) ||
+          (['discord.com', 'discordapp.com'].includes(invite.hostname) && /^\/invite\/[a-z0-9_-]+\/?$/i.test(invite.pathname))
+        );
+      }, { message: 'Inserisci un link invito Discord valido' })
     ]).optional().default('')
   });
   const schemaMessagesSend = z.object({
@@ -1226,6 +1236,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
               ? override.description
               : 'Server Discord collegato al bot. Le funzioni di gestione richiedono un account autorizzato.',
             resourceUrl: override?.url || null,
+            inviteUrl: override?.invite_url || (guild.vanityURLCode ? `https://discord.gg/${guild.vanityURLCode}` : null),
             iconUrl: guild.iconURL({ size: 128 }),
             memberCount: guild.memberCount,
             permissions: access?.authorized && ENV_ADMIN_IDS.includes(req.session.user.id)
@@ -2667,6 +2678,7 @@ function renderResourcesContent(canManageResources = false) {
         <label>Titolo<input name="title" type="text" maxlength="100" required placeholder="Es. Guida alle lobby"></label>
         <label>Categoria<input name="category" type="text" maxlength="40" placeholder="Es. Guide"></label>
         <label class="resource-form-wide">Link<input id="resource-url" name="url" type="url" maxlength="2048" required placeholder="https://..."></label>
+        <label id="resource-invite-field" class="resource-form-wide" hidden>Link invito Discord<input id="resource-invite-url" name="inviteUrl" type="url" maxlength="2048" placeholder="https://discord.gg/..."></label>
         <label class="resource-form-wide">Descrizione<textarea name="description" maxlength="500" rows="3" placeholder="Descrivi brevemente questa risorsa"></textarea></label>
       </div>
       <div class="resource-form-actions">
@@ -2687,6 +2699,7 @@ function renderResourcesContent(canManageResources = false) {
     #resource-form-help { margin: -7px 0 14px; color: var(--muted); font-size: 11px; }
     .resource-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
     .resource-form-grid label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
+    .resource-form-grid #resource-invite-field[hidden] { display: none; }
     .resource-form-grid label small { color: #777d90; font-size: 10px; font-weight: 400; }
     .resource-form-grid input, .resource-form-grid textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: #0c0e16; color: var(--text); font: inherit; }
     .resource-form-grid textarea { resize: vertical; }
@@ -2773,19 +2786,23 @@ function renderResourcesContent(canManageResources = false) {
             '" data-resource-title="' + resourceEsc(guild.name) +
             '" data-resource-category="' + resourceEsc(guild.category || 'Server Discord') +
             '" data-resource-url="' + resourceEsc(guild.resourceUrl || '') +
+            '" data-resource-invite-url="' + resourceEsc(guild.inviteUrl || '') +
             '" data-resource-description="' + resourceEsc(guild.description || '') +
             '">Modifica scheda</button>'
           : '';
         const externalLink = guild.resourceUrl
           ? '<a class="resource-link" href="' + resourceEsc(guild.resourceUrl) + '" target="_blank" rel="noopener noreferrer">Link aggiuntivo ↗</a>'
           : '';
+        const inviteLink = guild.inviteUrl
+          ? '<a class="resource-server-link" href="' + resourceEsc(guild.inviteUrl) + '" target="_blank" rel="noopener noreferrer">Apri server</a>'
+          : '<span class="resource-server-link" aria-disabled="true" title="Link invito non configurato">Invito non configurato</span>';
         return '<article class="card resource-card">' +
           '<div class="resource-card-header"><div class="resource-card-icon">' + icon + '</div>' +
           '<div><div class="resource-card-type">' + resourceEsc(guild.category || 'Server Discord') + '</div><h3>' + resourceEsc(guild.name) + '</h3></div></div>' +
           '<div class="resource-card-meta">' + members + '</div>' +
           (guild.description ? '<p class="resource-card-copy">' + resourceEsc(guild.description) + '</p>' : '') +
           '<div class="resource-tags">' + tagsMarkup + '</div>' +
-          '<div class="resource-card-actions"><a class="resource-server-link" href="https://discord.com/channels/' + encodeURIComponent(guild.id) + '" target="_blank" rel="noopener noreferrer">Apri server</a>' +
+          '<div class="resource-card-actions">' + inviteLink +
           '<div class="resource-admin-actions">' + externalLink + dashboardLink + editButton + '</div></div>' +
           '</article>';
       }).join('');
@@ -2807,6 +2824,8 @@ function renderResourcesContent(canManageResources = false) {
       document.getElementById('resource-form-help').textContent = 'Le risorse personalizzate sono pubbliche. Puoi usare un link a una guida, a un documento o a un file.';
       document.getElementById('resource-url').required = true;
       document.getElementById('resource-url').placeholder = 'https://...';
+      document.getElementById('resource-invite-field').hidden = true;
+      document.getElementById('resource-invite-url').value = '';
       submitButton.textContent = 'Pubblica risorsa';
       cancelButton.hidden = true;
       resetGuildButton.hidden = true;
@@ -2849,6 +2868,7 @@ function renderResourcesContent(canManageResources = false) {
             title: formData.get('title'),
             category: formData.get('category'),
             url: formData.get('url'),
+            inviteUrl: formData.get('inviteUrl'),
             description: formData.get('description')
           })
         });
@@ -2876,12 +2896,14 @@ function renderResourcesContent(canManageResources = false) {
       document.querySelector('#resource-form [name="title"]').value = editButton.dataset.resourceTitle;
       document.querySelector('#resource-form [name="category"]').value = editButton.dataset.resourceCategory;
       document.querySelector('#resource-form [name="url"]').value = editButton.dataset.resourceUrl;
+      document.getElementById('resource-invite-field').hidden = !isGuild;
+      document.getElementById('resource-invite-url').value = isGuild ? editButton.dataset.resourceInviteUrl : '';
       document.querySelector('#resource-form [name="description"]').value = editButton.dataset.resourceDescription;
       document.getElementById('resource-url').required = !isGuild;
       document.getElementById('resource-url').placeholder = isGuild ? 'Link aggiuntivo facoltativo' : 'https://...';
       document.getElementById('resource-form-title').textContent = isGuild ? 'Modifica scheda server' : 'Modifica risorsa';
       document.getElementById('resource-form-help').textContent = isGuild
-        ? 'Modifica solo la scheda pubblica: il nome e le impostazioni del server Discord non cambiano.'
+        ? 'Modifica la scheda pubblica e il link invito; le impostazioni del server Discord non cambiano.'
         : 'Le risorse personalizzate sono pubbliche. Puoi usare un link a una guida, a un documento o a un file.';
       document.querySelector('#resource-form button[type="submit"]').textContent = isGuild ? 'Salva scheda' : 'Salva modifiche';
       document.getElementById('resource-form-cancel').hidden = false;
