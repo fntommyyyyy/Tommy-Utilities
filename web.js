@@ -25,7 +25,7 @@ const { z } = require('zod');
 // IMPORT LOBBY
 const { mountLobbies, renderLobbiesContent } = require('./lobbies');
 
-function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml, modLog: modLogFn }) {
+function createWebServer({ storage, client, log, botStartTime, buildTranscriptHtml, modLog: modLogFn, executeDashboardCommand }) {
   const app = express();
   const PORT = parseInt(process.env.PORT) || 3000;
   const HOST = process.env.WEB_HOST || '0.0.0.0';
@@ -1523,6 +1523,15 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
       const botMember = channel.guild?.members?.me;
       if (botMember && !channel.permissionsFor(botMember)?.has('SendMessages')) return res.status(403).json({ error: 'Il bot non può scrivere in questo canale' });
+
+      const hasEmbed = data.embed && (data.embed.title || data.embed.description);
+      if (data.content && !hasEmbed && sender && executeDashboardCommand &&
+          await executeDashboardCommand(channel.guild, channel, sender, data.content)) {
+        try {
+          storage.saveDashboardAccess(req.session.user.id, `CMD→#${channel.name} (${channel.guild.name})`, (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-', (req.headers['user-agent'] || '').slice(0, 300));
+        } catch {}
+        return res.json({ ok: true, command: true, channelId: channel.id });
+      }
 
       const payload = { allowedMentions: { parse: [
         ...(data.allowMentions ? ['users', 'roles'] : []),
@@ -4142,7 +4151,7 @@ function renderMessagesContent() {
   return `
   <div class="section">
     <div class="tool-heading">
-      <div><h2>✉️ Invia un messaggio</h2><p class="tool-subtitle">Componi un messaggio o un embed e controlla l’anteprima prima dell’invio.</p></div>
+      <div><h2>✉️ Invia un messaggio</h2><p class="tool-subtitle">Invia un messaggio o un embed. I comandi con prefisso <code>-</code> o <code>&amp;</code> vengono eseguiti con i permessi del tuo account Discord.</p></div>
     </div>
     <div class="charts-grid">
       <div>
@@ -4284,7 +4293,9 @@ function renderMessagesContent() {
       const res = await apiFetch('/api/messages/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channelId, content, embed, allowMentions, allowMassMentions }) });
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        result.innerHTML = '<span class="success">✅ Inviato in #' + esc(currentChannel().channelName) + ' · ID: ' + esc(data.messageId) + '</span>';
+        result.innerHTML = data.command
+          ? '<span class="success">✅ Comando processato in #' + esc(currentChannel().channelName) + '</span>'
+          : '<span class="success">✅ Inviato in #' + esc(currentChannel().channelName) + ' · ID: ' + esc(data.messageId) + '</span>';
         document.getElementById('msg-content').value = '';
         updateMessagePreview();
       } else {
