@@ -661,7 +661,6 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
   });
-  app.get('/', (req, res) => res.redirect('/resources'));
 
   // ==================== OAUTH ====================
   app.get('/auth/login', (req, res) => {
@@ -1885,7 +1884,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   };
 
   app.get('/dashboard', requireAuth, pageHandler('dashboard'));
-  app.get('/resources', async (req, res) => {
+  const publicResourcesHandler = async (req, res) => {
     let user = null;
     let security = { isPublicResources: true };
     if (req.session.user) {
@@ -1903,7 +1902,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
     }
     res.send(renderLayout(user, 'resources', {}, security));
-  });
+  };
+  app.get('/', publicResourcesHandler);
+  app.get('/resources', (req, res) => res.redirect('/'));
   app.get('/modlogs', requireAuth, pageHandler('modlogs'));
   app.get('/notes', requireAuth, pageHandler('notes'));
   app.get('/tickets', requireAuth, pageHandler('tickets'));
@@ -1988,7 +1989,7 @@ function renderLayout(user, page, params = {}, security = {}) {
       { href: '/dashboard', page: 'dashboard', feature: 'dashboard', icon: '◈', label: 'Dashboard' },
       { href: '/charts', page: 'charts', feature: 'analytics', icon: '📈', label: 'Grafici' },
       { href: '/top', page: 'top', feature: 'analytics', icon: '🏆', label: 'Top' },
-      { href: '/resources', page: 'resources', feature: 'resources', icon: '🔗', label: 'Resources' }
+      { href: '/', page: 'resources', feature: 'resources', icon: '🔗', label: 'Resources' }
     ] },
     { label: 'Moderazione', items: [
       { href: '/search', page: 'search', feature: 'moderation', icon: '🔎', label: 'Ricerca' },
