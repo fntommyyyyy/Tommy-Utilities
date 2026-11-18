@@ -2538,7 +2538,7 @@ function renderDashboardContent(security = {}) {
   <section class="dashboard-hero">
     <div class="hero-mark" aria-hidden="true">T</div>
     <p class="hero-eyebrow">TOMMY UTILITIES · BOT CONTROL CENTER</p>
-    <h2>Il tuo bot.<br><span>Sempre sotto controllo.</span></h2>
+    <h2>Tutto il tuo server.<br><span>A portata di mano.</span></h2>
     <p class="hero-description">${canViewOverview ? 'Monitora l\'operatività e gestisci le attività del tuo server da un unico pannello.' : 'Gestisci la blacklist globale autorizzata per i tuoi ruoli.'}</p>
     <div class="hero-actions">${quickLinks}</div>
     ${canViewOverview ? '<div class="hero-status"><span class="status-led checking" id="status-led"></span><span id="status-summary" aria-live="polite">Verifica stato servizi...</span></div>' : ''}
