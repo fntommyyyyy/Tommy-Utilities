@@ -448,6 +448,11 @@ class StorageService {
       INSERT INTO public_resources (title, category, description, url, created_by, created_at)
       VALUES (@title, @category, @description, @url, @createdBy, @createdAt)
     `);
+    this._resourceUpdate = this.db.prepare(`
+      UPDATE public_resources
+      SET title = @title, category = @category, description = @description, url = @url
+      WHERE id = @id
+    `);
     this._resourceDelete = this.db.prepare('DELETE FROM public_resources WHERE id = ?');
 
     // ===== TICKET TRANSCRIPTS =====
@@ -647,6 +652,9 @@ class StorageService {
       createdAt: new Date().toISOString()
     });
     return Number(result.lastInsertRowid);
+  }
+  updatePublicResource(id, { title, category = 'Generale', description = '', url }) {
+    return this._resourceUpdate.run({ id, title, category, description, url }).changes > 0;
   }
   deletePublicResource(id) { return this._resourceDelete.run(id).changes > 0; }
 
