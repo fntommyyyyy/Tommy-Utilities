@@ -176,6 +176,16 @@ class StorageService {
         PRIMARY KEY (guild_id, role_id)
       );
 
+      CREATE TABLE IF NOT EXISTS public_resources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'Generale',
+        description TEXT NOT NULL DEFAULT '',
+        url TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS ticket_transcripts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         channel_id TEXT NOT NULL,
@@ -430,6 +440,16 @@ class StorageService {
     `);
     this._getAccess = this.db.prepare('SELECT * FROM dashboard_access ORDER BY id DESC LIMIT ?');
 
+    // ===== PUBLIC RESOURCES =====
+    this._resourcesAll = this.db.prepare(
+      'SELECT id, title, category, description, url, created_at FROM public_resources ORDER BY created_at DESC, id DESC'
+    );
+    this._resourceInsert = this.db.prepare(`
+      INSERT INTO public_resources (title, category, description, url, created_by, created_at)
+      VALUES (@title, @category, @description, @url, @createdBy, @createdAt)
+    `);
+    this._resourceDelete = this.db.prepare('DELETE FROM public_resources WHERE id = ?');
+
     // ===== TICKET TRANSCRIPTS =====
     this._trInsert = this.db.prepare(`
       INSERT INTO ticket_transcripts (channel_id, channel_name, user_id, claimed_by, priority, html_content, guild_id, created_at)
@@ -618,6 +638,18 @@ class StorageService {
     this._saveAccess.run(userId, username, ip || null, userAgent || null, new Date().toISOString());
   }
   getDashboardAccessLogs(limit = 500) { return this._getAccess.all(limit); }
+
+  // ==================== PUBLIC RESOURCES ====================
+  getPublicResources() { return this._resourcesAll.all(); }
+  addPublicResource({ title, category = 'Generale', description = '', url, createdBy }) {
+    const result = this._resourceInsert.run({
+      title, category, description, url, createdBy,
+      createdAt: new Date().toISOString()
+    });
+    return Number(result.lastInsertRowid);
+  }
+  deletePublicResource(id) { return this._resourceDelete.run(id).changes > 0; }
+
   getDashboardRolePermissions(guildId) {
     return this.db.prepare(
       'SELECT role_id, permissions_json FROM dashboard_role_permissions WHERE guild_id = ?'

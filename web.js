@@ -499,6 +499,14 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     name: z.string().min(1).max(50).regex(/^[a-z0-9_-]+$/i),
     response: z.string().min(1).max(4096)
   }).refine(d => !/@(everyone|here)\b/i.test(d.response), { message: 'La risposta non può menzionare everyone o here' });
+  const schemaPublicResource = z.object({
+    title: z.string().trim().min(1).max(100),
+    category: z.string().trim().max(40).optional().default('Generale').transform(value => value || 'Generale'),
+    description: z.string().trim().max(500).optional().default(''),
+    url: z.string().trim().url().max(2048).refine(value => /^https?:\/\//i.test(value), {
+      message: 'Il link deve iniziare con http:// o https://'
+    })
+  });
   const schemaMessagesSend = z.object({
     channelId: z.string().regex(/^\d{17,20}$/),
     content: z.string().max(2000).optional(),
@@ -1194,6 +1202,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     try {
       const resources = [...client.guilds.cache.values()]
         .map(guild => ({
+          kind: 'guild',
           id: guild.id,
           name: guild.name,
           iconUrl: guild.iconURL({ size: 96 }),
@@ -1205,8 +1214,32 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
               : []
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
-      res.json(resources);
+      const customResources = storage.getPublicResources().map(resource => ({
+        kind: 'custom',
+        ...resource
+      }));
+      res.json([...customResources, ...resources]);
     } catch (e) { apiError(res, e, 'Impossibile caricare le risorse'); }
+  });
+
+  app.post('/api/resources', actionLimiter, requireAuth, (req, res) => {
+    if (!req.dashboardAccess.manager) return res.status(403).json({ error: 'Solo gli amministratori dashboard possono aggiungere risorse' });
+    const data = parseOrFail(schemaPublicResource, req.body || {}, res);
+    if (!data) return;
+    try {
+      const id = storage.addPublicResource({ ...data, createdBy: req.session.user.id });
+      res.status(201).json({ ok: true, id });
+    } catch (e) { apiError(res, e, 'Impossibile aggiungere la risorsa'); }
+  });
+
+  app.delete('/api/resources/:id', actionLimiter, requireAuth, (req, res) => {
+    if (!req.dashboardAccess.manager) return res.status(403).json({ error: 'Solo gli amministratori dashboard possono rimuovere risorse' });
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'ID risorsa non valido' });
+    try {
+      if (!storage.deletePublicResource(id)) return res.status(404).json({ error: 'Risorsa non trovata' });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Impossibile rimuovere la risorsa'); }
   });
 
   app.get('/api/dashboard/managed-guilds', requireAuth, async (req, res) => {
@@ -1925,7 +1958,7 @@ function renderLayout(user, page, params = {}, security = {}) {
   // Ogni pagina viene generata solo quando è quella richiesta
   const renderers = {
     dashboard: () => renderDashboardContent(security),
-    resources: () => renderResourcesContent(),
+    resources: () => renderResourcesContent(!!security.isDashboardManager),
     modlogs: () => renderModlogsContent(),
     notes: () => renderNotesContent(),
     tickets: () => renderTicketsContent(),
@@ -2555,7 +2588,7 @@ function renderDashboardContent(security = {}) {
   </script>`;
 }
 
-function renderResourcesContent() {
+function renderResourcesContent(canManageResources = false) {
   return `
   <section class="resources-hero">
     <p class="eyebrow">TOMMY UTILITIES · RISORSE</p>
@@ -2567,11 +2600,42 @@ function renderResourcesContent() {
       <h2>Server Discord</h2>
       <p>Server collegati e consultabili da tutti.</p>
     </div>
+    ${canManageResources ? `
+    <form class="section resource-admin-form" id="resource-form">
+      <h2>Aggiungi una risorsa</h2>
+      <div class="resource-form-grid">
+        <label>Titolo<input name="title" type="text" maxlength="100" required placeholder="Es. Guida alle lobby"></label>
+        <label>Categoria<input name="category" type="text" maxlength="40" placeholder="Es. Guide"></label>
+        <label class="resource-form-wide">Link<input name="url" type="url" maxlength="2048" required placeholder="https://..."></label>
+        <label class="resource-form-wide">Descrizione<textarea name="description" maxlength="500" rows="3" placeholder="Descrivi brevemente questa risorsa"></textarea></label>
+      </div>
+      <div class="resource-form-actions">
+        <button type="submit">Pubblica risorsa</button>
+        <span id="resource-form-status" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+    ` : ''}
     <div class="grid resources-grid" id="resources-list" aria-live="polite">
       <div class="section resources-empty">Caricamento server...</div>
     </div>
   </section>
+  <style>
+    .resource-admin-form { margin-bottom: 20px; padding: 20px; }
+    .resource-admin-form h2 { margin-bottom: 14px; font-size: 17px; }
+    .resource-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+    .resource-form-grid label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
+    .resource-form-grid input, .resource-form-grid textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: #0c0e16; color: var(--text); font: inherit; }
+    .resource-form-grid textarea { resize: vertical; }
+    .resource-form-grid input:focus, .resource-form-grid textarea:focus { outline: 2px solid rgba(144, 126, 255, .45); outline-offset: 1px; }
+    .resource-form-wide { grid-column: 1 / -1; }
+    .resource-form-actions { display: flex; align-items: center; gap: 12px; margin-top: 15px; }
+    #resource-form-status { color: var(--muted); font-size: 12px; }
+    .resource-delete { padding: 6px 9px; border: 1px solid rgba(240, 100, 120, .35); border-radius: 8px; background: rgba(240, 100, 120, .1); color: #ff9aa8; font-size: 10px; }
+    .resource-delete:hover { background: rgba(240, 100, 120, .2); }
+    @media (max-width: 600px) { .resource-form-grid { grid-template-columns: 1fr; } }
+  </style>
   <script>
+  const canManageResources = ${canManageResources ? 'true' : 'false'};
   function resourceEsc(value) {
     return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
@@ -2605,6 +2669,17 @@ function renderResourcesContent() {
         return;
       }
       root.innerHTML = data.map(guild => {
+        if (guild.kind === 'custom') {
+          const deleteButton = canManageResources
+            ? '<button class="resource-delete" type="button" data-resource-delete="' + encodeURIComponent(guild.id) + '" aria-label="Rimuovi ' + resourceEsc(guild.title) + '">Rimuovi</button>'
+            : '';
+          return '<article class="card resource-card">' +
+            '<div class="resource-card-header"><div class="resource-card-icon"><span aria-hidden="true">' + resourceEsc((guild.title || 'R').slice(0, 1).toUpperCase()) + '</span></div>' +
+            '<div><div class="resource-card-type">' + resourceEsc(guild.category || 'Generale') + '</div><h3>' + resourceEsc(guild.title) + '</h3></div></div>' +
+            (guild.description ? '<p class="resource-card-copy">' + resourceEsc(guild.description) + '</p>' : '') +
+            '<div class="resource-card-actions"><a class="resource-link" href="' + resourceEsc(guild.url) + '" target="_blank" rel="noopener noreferrer">Apri risorsa ↗</a>' + deleteButton + '</div>' +
+            '</article>';
+        }
         const permissions = Array.isArray(guild.permissions) ? guild.permissions : [];
         const tags = permissions.map(permission => resourceLabels[permission]).filter(Boolean);
         const destination = resourceRoutes.find(([feature]) => permissions.includes(feature));
@@ -2634,6 +2709,52 @@ function renderResourcesContent() {
       root.innerHTML = '<div class="section resources-empty">Errore durante il caricamento delle risorse.</div>';
     }
   }
+  const resourceForm = document.getElementById('resource-form');
+  if (resourceForm) {
+    resourceForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const status = document.getElementById('resource-form-status');
+      const submit = resourceForm.querySelector('button[type="submit"]');
+      status.textContent = 'Salvataggio...';
+      submit.disabled = true;
+      try {
+        const formData = new FormData(resourceForm);
+        const response = await apiFetch('/api/resources', {
+          method: 'POST',
+          body: JSON.stringify({
+            title: formData.get('title'),
+            category: formData.get('category'),
+            url: formData.get('url'),
+            description: formData.get('description')
+          })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || 'Impossibile aggiungere la risorsa.');
+        resourceForm.reset();
+        status.textContent = 'Risorsa pubblicata.';
+        await loadResources();
+      } catch (error) {
+        status.textContent = error.message || 'Errore durante il salvataggio.';
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  }
+  document.getElementById('resources-list').addEventListener('click', async event => {
+    const button = event.target.closest('[data-resource-delete]');
+    if (!button || !canManageResources) return;
+    if (!confirm('Vuoi rimuovere questa risorsa pubblica?')) return;
+    button.disabled = true;
+    try {
+      const response = await apiFetch('/api/resources/' + encodeURIComponent(button.dataset.resourceDelete), { method: 'DELETE' });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Impossibile rimuovere la risorsa.');
+      await loadResources();
+    } catch (error) {
+      alert(error.message || 'Errore durante la rimozione.');
+      button.disabled = false;
+    }
+  });
   loadResources();
   </script>`;
 }
