@@ -1232,6 +1232,18 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e, 'Impossibile aggiungere la risorsa'); }
   });
 
+  app.put('/api/resources/:id', actionLimiter, requireAuth, (req, res) => {
+    if (!req.dashboardAccess.manager) return res.status(403).json({ error: 'Solo gli amministratori dashboard possono modificare risorse' });
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ error: 'ID risorsa non valido' });
+    const data = parseOrFail(schemaPublicResource, req.body || {}, res);
+    if (!data) return;
+    try {
+      if (!storage.updatePublicResource(id, data)) return res.status(404).json({ error: 'Risorsa non trovata' });
+      res.json({ ok: true });
+    } catch (e) { apiError(res, e, 'Impossibile modificare la risorsa'); }
+  });
+
   app.delete('/api/resources/:id', actionLimiter, requireAuth, (req, res) => {
     if (!req.dashboardAccess.manager) return res.status(403).json({ error: 'Solo gli amministratori dashboard possono rimuovere risorse' });
     const id = Number(req.params.id);
@@ -2602,7 +2614,8 @@ function renderResourcesContent(canManageResources = false) {
     </div>
     ${canManageResources ? `
     <form class="section resource-admin-form" id="resource-form">
-      <h2>Aggiungi una risorsa</h2>
+      <h2 id="resource-form-title">Aggiungi una risorsa</h2>
+      <input id="resource-id" name="id" type="hidden">
       <div class="resource-form-grid">
         <label>Titolo<input name="title" type="text" maxlength="100" required placeholder="Es. Guida alle lobby"></label>
         <label>Categoria<input name="category" type="text" maxlength="40" placeholder="Es. Guide"></label>
@@ -2611,6 +2624,7 @@ function renderResourcesContent(canManageResources = false) {
       </div>
       <div class="resource-form-actions">
         <button type="submit">Pubblica risorsa</button>
+        <button id="resource-form-cancel" class="secondary" type="button" hidden>Annulla modifica</button>
         <span id="resource-form-status" role="status" aria-live="polite"></span>
       </div>
     </form>
@@ -2629,6 +2643,7 @@ function renderResourcesContent(canManageResources = false) {
     .resource-form-grid input:focus, .resource-form-grid textarea:focus { outline: 2px solid rgba(144, 126, 255, .45); outline-offset: 1px; }
     .resource-form-wide { grid-column: 1 / -1; }
     .resource-form-actions { display: flex; align-items: center; gap: 12px; margin-top: 15px; }
+    .resource-admin-actions { display: flex; align-items: center; gap: 7px; }
     #resource-form-status { color: var(--muted); font-size: 12px; }
     .resource-delete { padding: 6px 9px; border: 1px solid rgba(240, 100, 120, .35); border-radius: 8px; background: rgba(240, 100, 120, .1); color: #ff9aa8; font-size: 10px; }
     .resource-delete:hover { background: rgba(240, 100, 120, .2); }
@@ -2670,6 +2685,14 @@ function renderResourcesContent(canManageResources = false) {
       }
       root.innerHTML = data.map(guild => {
         if (guild.kind === 'custom') {
+          const editButton = canManageResources
+            ? '<button class="secondary small resource-edit" type="button" data-resource-edit="' + encodeURIComponent(guild.id) +
+              '" data-resource-title="' + resourceEsc(guild.title) +
+              '" data-resource-category="' + resourceEsc(guild.category || 'Generale') +
+              '" data-resource-url="' + resourceEsc(guild.url) +
+              '" data-resource-description="' + resourceEsc(guild.description || '') +
+              '">Modifica</button>'
+            : '';
           const deleteButton = canManageResources
             ? '<button class="resource-delete" type="button" data-resource-delete="' + encodeURIComponent(guild.id) + '" aria-label="Rimuovi ' + resourceEsc(guild.title) + '">Rimuovi</button>'
             : '';
@@ -2677,7 +2700,7 @@ function renderResourcesContent(canManageResources = false) {
             '<div class="resource-card-header"><div class="resource-card-icon"><span aria-hidden="true">' + resourceEsc((guild.title || 'R').slice(0, 1).toUpperCase()) + '</span></div>' +
             '<div><div class="resource-card-type">' + resourceEsc(guild.category || 'Generale') + '</div><h3>' + resourceEsc(guild.title) + '</h3></div></div>' +
             (guild.description ? '<p class="resource-card-copy">' + resourceEsc(guild.description) + '</p>' : '') +
-            '<div class="resource-card-actions"><a class="resource-link" href="' + resourceEsc(guild.url) + '" target="_blank" rel="noopener noreferrer">Apri risorsa ↗</a>' + deleteButton + '</div>' +
+            '<div class="resource-card-actions"><a class="resource-link" href="' + resourceEsc(guild.url) + '" target="_blank" rel="noopener noreferrer">Apri risorsa ↗</a><div class="resource-admin-actions">' + editButton + deleteButton + '</div></div>' +
             '</article>';
         }
         const permissions = Array.isArray(guild.permissions) ? guild.permissions : [];
@@ -2711,16 +2734,27 @@ function renderResourcesContent(canManageResources = false) {
   }
   const resourceForm = document.getElementById('resource-form');
   if (resourceForm) {
+    const submitButton = resourceForm.querySelector('button[type="submit"]');
+    const cancelButton = document.getElementById('resource-form-cancel');
+    const resetResourceForm = () => {
+      resourceForm.reset();
+      document.getElementById('resource-id').value = '';
+      document.getElementById('resource-form-title').textContent = 'Aggiungi una risorsa';
+      submitButton.textContent = 'Pubblica risorsa';
+      cancelButton.hidden = true;
+    };
+
+    cancelButton.addEventListener('click', resetResourceForm);
     resourceForm.addEventListener('submit', async event => {
       event.preventDefault();
       const status = document.getElementById('resource-form-status');
-      const submit = resourceForm.querySelector('button[type="submit"]');
       status.textContent = 'Salvataggio...';
-      submit.disabled = true;
+      submitButton.disabled = true;
       try {
         const formData = new FormData(resourceForm);
-        const response = await apiFetch('/api/resources', {
-          method: 'POST',
+        const resourceId = document.getElementById('resource-id').value;
+        const response = await apiFetch(resourceId ? '/api/resources/' + encodeURIComponent(resourceId) : '/api/resources', {
+          method: resourceId ? 'PUT' : 'POST',
           body: JSON.stringify({
             title: formData.get('title'),
             category: formData.get('category'),
@@ -2729,20 +2763,37 @@ function renderResourcesContent(canManageResources = false) {
           })
         });
         const result = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(result.error || 'Impossibile aggiungere la risorsa.');
-        resourceForm.reset();
-        status.textContent = 'Risorsa pubblicata.';
+        if (!response.ok) throw new Error(result.error || 'Impossibile salvare la risorsa.');
+        const wasEditing = !!resourceId;
+        resetResourceForm();
+        status.textContent = wasEditing ? 'Modifiche salvate.' : 'Risorsa pubblicata.';
         await loadResources();
       } catch (error) {
         status.textContent = error.message || 'Errore durante il salvataggio.';
       } finally {
-        submit.disabled = false;
+        submitButton.disabled = false;
       }
     });
   }
   document.getElementById('resources-list').addEventListener('click', async event => {
+    if (!canManageResources) return;
+    const editButton = event.target.closest('[data-resource-edit]');
+    if (editButton) {
+      document.getElementById('resource-id').value = editButton.dataset.resourceEdit;
+      document.querySelector('#resource-form [name="title"]').value = editButton.dataset.resourceTitle;
+      document.querySelector('#resource-form [name="category"]').value = editButton.dataset.resourceCategory;
+      document.querySelector('#resource-form [name="url"]').value = editButton.dataset.resourceUrl;
+      document.querySelector('#resource-form [name="description"]').value = editButton.dataset.resourceDescription;
+      document.getElementById('resource-form-title').textContent = 'Modifica risorsa';
+      document.querySelector('#resource-form button[type="submit"]').textContent = 'Salva modifiche';
+      document.getElementById('resource-form-cancel').hidden = false;
+      document.getElementById('resource-form-status').textContent = '';
+      document.getElementById('resource-form').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return;
+    }
+
     const button = event.target.closest('[data-resource-delete]');
-    if (!button || !canManageResources) return;
+    if (!button) return;
     if (!confirm('Vuoi rimuovere questa risorsa pubblica?')) return;
     button.disabled = true;
     try {
