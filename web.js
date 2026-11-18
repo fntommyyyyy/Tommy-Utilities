@@ -1182,19 +1182,27 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
     } catch (e) { apiError(res, e); }
   });
 
-  app.get('/api/resources', requireAuth, async (req, res) => {
+  app.get('/api/resources', async (req, res) => {
+    let access = null;
+    if (req.session.user) {
+      try {
+        access = await getDashboardAccess(req.session.user.id);
+      } catch (e) {
+        log.err('api/resources access lookup', e);
+      }
+    }
     try {
-      const allowed = await allowedGuildIds(req.session.user.id);
       const resources = [...client.guilds.cache.values()]
-        .filter(guild => allowed.has(guild.id))
         .map(guild => ({
           id: guild.id,
           name: guild.name,
           iconUrl: guild.iconURL({ size: 96 }),
           memberCount: guild.memberCount,
-          permissions: ENV_ADMIN_IDS.includes(req.session.user.id)
+          permissions: access?.authorized && ENV_ADMIN_IDS.includes(req.session.user.id)
             ? DASHBOARD_FEATURES
-            : [...(req.dashboardAccess.guildPermissions.get(guild.id) || [])]
+            : access?.authorized
+              ? [...(access.guildPermissions.get(guild.id) || [])]
+              : []
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       res.json(resources);
@@ -1765,7 +1773,25 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   };
 
   app.get('/dashboard', requireAuth, pageHandler('dashboard'));
-  app.get('/resources', requireAuth, pageHandler('resources'));
+  app.get('/resources', async (req, res) => {
+    let user = null;
+    let security = { isPublicResources: true };
+    if (req.session.user) {
+      try {
+        const access = await getDashboardAccess(req.session.user.id);
+        if (access.authorized) {
+          user = req.session.user;
+          security = {
+            permissions: [...access.permissions],
+            isDashboardManager: access.manager
+          };
+        }
+      } catch (e) {
+        log.err('public resources access lookup', e);
+      }
+    }
+    res.send(renderLayout(user, 'resources', {}, security));
+  });
   app.get('/modlogs', requireAuth, pageHandler('modlogs'));
   app.get('/notes', requireAuth, pageHandler('notes'));
   app.get('/tickets', requireAuth, pageHandler('tickets'));
@@ -1817,13 +1843,14 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
 // ================= HTML — TUTTE LE PAGINE ===================
 // ============================================================
 function renderLayout(user, page, params = {}, security = {}) {
-  const name = escapeHtml(user.global_name || user.username);
-  const avatar = user.avatar ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(user.id)}/${encodeURIComponent(user.avatar)}.png?size=64` : `https://cdn.discordapp.com/embed/avatars/0.png`;
+  const viewer = user || { id: '', global_name: '', username: 'Visitatore', avatar: null };
+  const name = escapeHtml(viewer.global_name || viewer.username);
+  const avatar = viewer.avatar ? `https://cdn.discordapp.com/avatars/${encodeURIComponent(viewer.id)}/${encodeURIComponent(viewer.avatar)}.png?size=64` : `https://cdn.discordapp.com/embed/avatars/0.png`;
   const csrfToken = security.csrfToken || '';
   const safeQ = escapeHtml(params.q || '');
   const permissions = new Set(security.permissions || []);
   const canViewDashboard = permissions.has('overview') || permissions.has('global_blacklist');
-  const canViewResources = permissions.size > 0;
+  const canViewResources = security.isPublicResources || permissions.size > 0;
   const pageTitles = {
     dashboard: 'Dashboard',
     modlogs: 'Mod Logs',
@@ -2262,14 +2289,21 @@ function renderLayout(user, page, params = {}, security = {}) {
       </div>
       <div class="topbar-actions">
         ${searchControl}
-        <div class="user">
-          <img src="${avatar}" alt="">
-          <span class="user-name">${name}</span>
-          <div class="user-actions">
-            <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
-            <a href="/auth/logout"><button class="danger small">Logout</button></a>
+        ${user ? `
+          <div class="user">
+            <img src="${avatar}" alt="">
+            <span class="user-name">${name}</span>
+            <div class="user-actions">
+              <button class="secondary small" onclick="logoutAll()" title="Invalida tutte le sessioni">🔓 Logout Globale</button>
+              <a href="/auth/logout"><button class="danger small">Logout</button></a>
+            </div>
           </div>
-        </div>
+        ` : `
+          <div class="user">
+            <span class="user-name">Accesso pubblico</span>
+            <div class="user-actions"><a href="/auth/login"><button class="small">Accedi</button></a></div>
+          </div>
+        `}
       </div>
     </header>
     <div class="content-area">${body}</div>
@@ -2526,12 +2560,12 @@ function renderResourcesContent() {
   <section class="resources-hero">
     <p class="eyebrow">TOMMY UTILITIES · RISORSE</p>
     <h2>Resources</h2>
-    <p>I server Discord collegati al bot e le aree a cui hai accesso.</p>
+    <p>Esplora pubblicamente i server Discord collegati al bot. Le funzioni di gestione restano riservate agli utenti autorizzati.</p>
   </section>
   <section>
     <div class="resources-section-heading">
       <h2>Server Discord</h2>
-      <p>Server disponibili in base ai permessi assegnati.</p>
+      <p>Server collegati e consultabili da tutti.</p>
     </div>
     <div class="grid resources-grid" id="resources-list" aria-live="polite">
       <div class="section resources-empty">Caricamento server...</div>
@@ -2567,7 +2601,7 @@ function renderResourcesContent() {
         return;
       }
       if (!data.length) {
-        root.innerHTML = '<div class="section resources-empty">Nessun server Discord visibile con i permessi attuali.</div>';
+        root.innerHTML = '<div class="section resources-empty">Nessuna risorsa disponibile.</div>';
         return;
       }
       root.innerHTML = data.map(guild => {
@@ -2590,7 +2624,7 @@ function renderResourcesContent() {
           '<div class="resource-card-header"><div class="resource-card-icon">' + icon + '</div>' +
           '<div><div class="resource-card-type">SERVER DISCORD</div><h3>' + resourceEsc(guild.name) + '</h3></div></div>' +
           '<div class="resource-card-meta">' + members + '</div>' +
-          '<p class="resource-card-copy">Server collegato al bot. Le sezioni disponibili rispettano i permessi del tuo ruolo.</p>' +
+          '<p class="resource-card-copy">Server Discord collegato al bot. Le funzioni di gestione richiedono un account autorizzato.</p>' +
           '<div class="resource-tags">' + tagsMarkup + '</div>' +
           '<div class="resource-card-actions"><a class="resource-server-link" href="https://discord.com/channels/' + encodeURIComponent(guild.id) + '" target="_blank" rel="noopener noreferrer">Apri server</a>' + dashboardLink + '</div>' +
           '</article>';
