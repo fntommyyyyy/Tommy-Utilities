@@ -358,11 +358,6 @@ const ModLogModule = {
       const details = [
         logData.moderator && `▶ Responsible: ${logData.moderator}`,
         logData.target && `▶ Target: ${logData.target}`,
-        logData.user && `▶ User: ${logData.user}`,
-        logData.channel && `▶ Channel: ${logData.channel}`,
-        logData.duration && `▶ Duration: ${logData.duration}`,
-        logData.reason && !logData.changes && `▶ Reason: ${logData.reason}`,
-        logData.changes && `Changes\n${logData.changes}`,
         `▶ ${new Date().toLocaleString('it-IT', {
           weekday: 'long',
           day: 'numeric',
@@ -370,7 +365,12 @@ const ModLogModule = {
           year: 'numeric',
           hour: '2-digit',
           minute: '2-digit'
-        })}`
+        })}`,
+        logData.changes && `Changes\n${logData.changes}`,
+        logData.user && `▶ User: ${logData.user}`,
+        logData.channel && `▶ Channel: ${logData.channel}`,
+        logData.duration && `▶ Duration: ${logData.duration}`,
+        logData.reason && !logData.changes && `▶ Reason: ${logData.reason}`,
       ].filter(Boolean);
 
       const embed = EmbedManager.createEmbed({
@@ -833,17 +833,21 @@ async function handleGuildMemberAdd(member) {
 
 async function handleVoiceStateUpdate(oldState, newState) {
   const changes = [];
+  const auditChanges = {};
 
   if (oldState.serverMute !== newState.serverMute) {
-    changes.push(`✅ Server mute: ${oldState.serverMute ? 'On' : 'Off'} → ${newState.serverMute ? 'On' : 'Off'}`);
+    changes.push(`${newState.serverMute ? '✅ Server Mute' : '❌ Server Mute'}:\n> ${oldState.serverMute ? 'On' : 'Off'} → ${newState.serverMute ? 'On' : 'Off'}`);
+    auditChanges.mute = newState.serverMute;
   }
   if (oldState.serverDeaf !== newState.serverDeaf) {
-    changes.push(`✅ Server deaf: ${oldState.serverDeaf ? 'On' : 'Off'} → ${newState.serverDeaf ? 'On' : 'Off'}`);
+    changes.push(`${newState.serverDeaf ? '✅ Server Deaf' : '❌ Server Deaf'}:\n> ${oldState.serverDeaf ? 'On' : 'Off'} → ${newState.serverDeaf ? 'On' : 'Off'}`);
+    auditChanges.deaf = newState.serverDeaf;
   }
   if (changes.length === 0) return;
 
   const member = newState.member || oldState.member;
   const targetId = newState.id || oldState.id;
+  const moderator = await findVoiceUpdateModerator(newState.guild || oldState.guild, targetId, auditChanges);
   const actionTypes = [];
   if (oldState.serverMute !== newState.serverMute) {
     actionTypes.push(newState.serverMute ? 'Voice Mute' : 'Voice Unmute');
@@ -856,10 +860,32 @@ async function handleVoiceStateUpdate(oldState, newState) {
     type: actionTypes.join(' / '),
     title: 'Member Voice Update',
     targetId,
-    target: member ? `${member.user.tag} (${targetId})` : targetId,
+    target: member ? `<@${targetId}> (\`${targetId}\`)` : targetId,
+    moderator: moderator ? `<@${moderator.id}> (\`${moderator.id}\`)` : null,
     reason: changes.join('\n'),
     changes: changes.join('\n')
   });
+}
+
+async function findVoiceUpdateModerator(guild, targetId, expectedChanges) {
+  if (!guild.members.me?.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) return null;
+
+  await new Promise(resolve => setTimeout(resolve, 750));
+  try {
+    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: 10 });
+    const entry = auditLogs.entries.find(item =>
+      item.target?.id === targetId &&
+      Date.now() - item.createdTimestamp < 15000 &&
+      item.changes.some(change =>
+        Object.prototype.hasOwnProperty.call(expectedChanges, change.key) &&
+        change.new === expectedChanges[change.key]
+      )
+    );
+    return entry?.executor || null;
+  } catch (err) {
+    log.warn(`Lettura audit log vocale fallita per ${targetId}: ${err.message}`);
+    return null;
+  }
 }
 
 async function findRoleUpdateModerator(guild, targetId, addedRoleIds, removedRoleIds) {
@@ -915,7 +941,7 @@ async function handleGuildMemberUpdate(oldMember, newMember) {
     title: 'Member Role Update',
     targetId: newMember.id,
     target: `<@${newMember.id}> (\`${newMember.id}\`)`,
-    moderator: moderator ? `${moderator.tag} (${moderator.id})` : null,
+    moderator: moderator ? `<@${moderator.id}> (\`${moderator.id}\`)` : null,
     reason: changes.join('\n'),
     changes: changes.join('\n')
   });
