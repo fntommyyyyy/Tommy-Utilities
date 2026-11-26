@@ -3,7 +3,11 @@
   "version": "2.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node scripts/check-syntax.js",
+    "test": "npm run check && node --test",
+    "check:config": "node scripts/check-config.js",
+    "check:deploy": "node scripts/check-deploy.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
