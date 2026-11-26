@@ -20,74 +20,29 @@ const StorageService = require('./storage');
 const { mountLobbies, renderLobbiesContent, handleLobbyCommand, handleLobbyPrefix, lobbyCommandBuilder, handleLobbyButton } = require('./lobbies');
 const { createAdvancedLobby, handleAdvancedLobbyButton } = require('./lobbies-advanced');
 const { createWebServer } = require('./web');
+const { loadBotConfig } = require('./config');
+const { formatDuration, parseDuration, hoursAndMinutesToMs, getAuditRoleChanges } = require('./lib/bot-utils');
+const { createLogger } = require('./lib/logger');
 
 // ==================== VALIDAZIONE ENV ====================
-const TOKEN = (process.env.DISCORD_TOKEN || process.env.TOKEN || '').trim();
-const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
-const MOD_LOG_CHANNEL_ID = (process.env.MOD_LOG_CHANNEL_ID || '').trim();
-const BLACKLIST_ADMIN_SERVERS = (process.env.BLACKLIST_ADMIN_SERVERS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const GUILD_ID = (process.env.GUILD_ID || '').trim();
-
-if (!TOKEN) throw new Error('TOKEN mancante nel file .env');
-if (!CLIENT_ID) throw new Error('CLIENT_ID mancante nel file .env');
-if (!MOD_LOG_CHANNEL_ID) throw new Error('MOD_LOG_CHANNEL_ID mancante nel file .env');
+const {
+  token: TOKEN,
+  clientId: CLIENT_ID,
+  modLogChannelId: MOD_LOG_CHANNEL_ID,
+  blacklistAdminServers: BLACKLIST_ADMIN_SERVERS,
+  guildId: GUILD_ID,
+  dbPath: DB_PATH,
+  dbBackupDir: DB_BACKUP_DIR,
+  dbBackupRetention: DB_BACKUP_RETENTION
+} = loadBotConfig(process.env);
 
 // ==================== LOGGER ====================
-const log = {
-  info: (msg) => console.log(`\x1b[36m[INFO]\x1b[0m ${msg}`),
-  ok: (msg) => console.log(`\x1b[32m[OK]\x1b[0m ${msg}`),
-  warn: (msg) => console.log(`\x1b[33m[WARN]\x1b[0m ${msg}`),
-  err: (msg, err) => console.error(`\x1b[31m[ERR]\x1b[0m ${msg}`, err ?? '')
-};
+const log = createLogger();
 
 // ==================== UTILITY ====================
 function formatDate(iso) {
   if (!iso) return 'N/A';
   return new Date(iso).toLocaleString('it-IT');
-}
-
-function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}g`;
-}
-
-function parseDuration(input) {
-  if (!input) return null;
-  const str = String(input).trim().toLowerCase();
-  const clock = str.match(/^(\d{1,3}):(\d{1,2})$/);
-  if (clock) {
-    const hours = parseInt(clock[1], 10);
-    const minutes = parseInt(clock[2], 10);
-    if (minutes > 59 || (hours === 0 && minutes === 0)) return null;
-    return (hours * 3600 + minutes * 60) * 1000;
-  }
-  const matches = [...str.matchAll(/(\d+)\s*(s|m|h|d)/gi)];
-  if (!matches.length) return null;
-  const consumed = matches.map(m => m[0]).join('').replace(/\s+/g, '');
-  if (consumed !== str.replace(/\s+/g, '')) return null;
-  let ms = 0;
-  const seen = new Set();
-  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
-  for (const m of matches) {
-    const unit = m[2].toLowerCase();
-    if (seen.has(unit)) return null;
-    seen.add(unit);
-    const n = parseInt(m[1], 10);
-    if (!n || n <= 0) return null;
-    ms += n * multipliers[unit];
-  }
-  return ms || null;
-}
-
-function hoursAndMinutesToMs(hours, minutes) {
-  const h = Number(hours) || 0;
-  const m = Number(minutes) || 0;
-  if (!Number.isInteger(h) || !Number.isInteger(m)) return null;
-  if (h < 0 || m < 0 || m > 59 || (h === 0 && m === 0)) return null;
-  return (h * 3600 + m * 60) * 1000;
 }
 
 function getRoles(member, guild) {
@@ -267,7 +222,10 @@ class EmbedManager {
 }
 
 let clientRef = null;
-const storage = new StorageService(process.env.DB_PATH || './data/bot.db');
+const storage = new StorageService(DB_PATH, log, {
+  directory: DB_BACKUP_DIR,
+  retention: DB_BACKUP_RETENTION
+});
 const botStartTime = Date.now();
 
 // ==================== GENERA TRANSCRIPT ====================
@@ -824,39 +782,6 @@ function describeAuditChanges(entry) {
     if (oldValue === undefined && newValue === undefined) return null;
     return `${labels[key] || key}: ${formatValue(oldValue)} → ${formatValue(newValue)}`;
   }).filter(Boolean).join('; ').slice(0, 1000);
-}
-
-function getAuditRoleChanges(entry) {
-  const result = { added: [], removed: [] };
-  const normalize = value => (Array.isArray(value) ? value : value ? [value] : [])
-    .map(role => typeof role === 'string' ? { id: role, name: role } : role)
-    .filter(role => role && (role.id || role.name));
-  const appendUnique = (target, roles) => {
-    const known = new Set(target.map(role => role.id || role.name));
-    for (const role of roles) {
-      const key = role.id || role.name;
-      if (!known.has(key)) {
-        target.push(role);
-        known.add(key);
-      }
-    }
-  };
-
-  for (const change of entry.changes || []) {
-    if (change.key === '$add') {
-      appendUnique(result.added, normalize(change.new ?? change.old));
-    } else if (change.key === '$remove') {
-      appendUnique(result.removed, normalize(change.new ?? change.old));
-    } else if (change.key === 'roles') {
-      const before = normalize(change.old);
-      const after = normalize(change.new);
-      const beforeIds = new Set(before.map(role => role.id || role.name));
-      const afterIds = new Set(after.map(role => role.id || role.name));
-      appendUnique(result.added, after.filter(role => !beforeIds.has(role.id || role.name)));
-      appendUnique(result.removed, before.filter(role => !afterIds.has(role.id || role.name)));
-    }
-  }
-  return result;
 }
 
 async function findRecentMemberAuditEntry(guild, targetId) {
@@ -3322,6 +3247,12 @@ let webServer = null;
 
 (async () => {
   try {
+    try {
+      await storage.backup();
+    } catch (backupError) {
+      log.err('Backup SQLite iniziale fallito; il bot continua senza interrompere il servizio', backupError);
+    }
+
     await client.login(TOKEN);
     log.ok('✅ Bot online');
 
@@ -3341,14 +3272,21 @@ let webServer = null;
   }
 })();
 
+const databaseBackupTimer = setInterval(() => {
+  storage.backup().catch(err => log.err('Backup SQLite pianificato fallito', err));
+}, 60 * 60 * 1000);
+databaseBackupTimer.unref?.();
+
 // ==================== SHUTDOWN (SIGINT + SIGTERM) ====================
 let shuttingDown = false;
-function shutdown(signal) {
+async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(databaseBackupTimer);
   log.warn(`Shutdown (${signal})...`);
   try { if (webServer) webServer.close(); } catch {}
-  try { if (typeof storage.close === 'function') storage.close(); } catch {}
+  try { if (typeof storage.close === 'function') await storage.close(); }
+  catch (err) { log.err('Chiusura database fallita', err); }
   try { client.destroy(); } catch {}
   setTimeout(() => process.exit(0), 500);
 }
