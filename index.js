@@ -4,6 +4,7 @@ const {
   GatewayIntentBits,
   Partials,
   Events,
+  AuditLogEvent,
   PermissionsBitField,
   ChannelType,
   ActionRowBuilder,
@@ -360,7 +361,7 @@ const ModLogModule = {
         logData.user && `▶ User: ${logData.user}`,
         logData.channel && `▶ Channel: ${logData.channel}`,
         logData.duration && `▶ Duration: ${logData.duration}`,
-        logData.reason && `▶ Reason: ${logData.reason}`,
+        logData.reason && !logData.changes && `▶ Reason: ${logData.reason}`,
         logData.changes && `Changes\n${logData.changes}`,
         `▶ ${new Date().toLocaleString('it-IT', {
           weekday: 'long',
@@ -856,6 +857,66 @@ async function handleVoiceStateUpdate(oldState, newState) {
     title: 'Member Voice Update',
     targetId,
     target: member ? `${member.user.tag} (${targetId})` : targetId,
+    reason: changes.join('\n'),
+    changes: changes.join('\n')
+  });
+}
+
+async function findRoleUpdateModerator(guild, targetId, addedRoleIds, removedRoleIds) {
+  if (!guild.members.me?.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) return null;
+
+  await new Promise(resolve => setTimeout(resolve, 750));
+  try {
+    const auditLogs = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberRoleUpdate, limit: 10 });
+    const entry = auditLogs.entries.find(item =>
+      item.target?.id === targetId &&
+      Date.now() - item.createdTimestamp < 15000 &&
+      item.changes.some(change => {
+        const expectedRoleIds = change.key === '$add'
+          ? addedRoleIds
+          : change.key === '$remove' ? removedRoleIds : [];
+        if (expectedRoleIds.length === 0 || !Array.isArray(change.new)) return false;
+        const changedRoleIds = change.new.map(role => typeof role === 'string' ? role : role.id);
+        return expectedRoleIds.some(roleId => changedRoleIds.includes(roleId));
+      })
+    );
+    return entry?.executor || null;
+  } catch (err) {
+    log.warn(`Lettura audit log ruoli fallita per ${targetId}: ${err.message}`);
+    return null;
+  }
+}
+
+async function handleGuildMemberUpdate(oldMember, newMember) {
+  const addedRoles = newMember.roles.cache.filter(role =>
+    role.id !== newMember.guild.id && !oldMember.roles.cache.has(role.id)
+  );
+  const removedRoles = oldMember.roles.cache.filter(role =>
+    role.id !== newMember.guild.id && !newMember.roles.cache.has(role.id)
+  );
+  if (addedRoles.size === 0 && removedRoles.size === 0) return;
+
+  const changes = [];
+  if (addedRoles.size > 0) {
+    changes.push(`✅ Additions:\n${addedRoles.map(role => `> ${role}`).join('\n')}`);
+  }
+  if (removedRoles.size > 0) {
+    changes.push(`❌ Removals:\n${removedRoles.map(role => `> ${role}`).join('\n')}`);
+  }
+
+  const moderator = await findRoleUpdateModerator(
+    newMember.guild,
+    newMember.id,
+    [...addedRoles.keys()],
+    [...removedRoles.keys()]
+  );
+  await ModLogModule.logUserAction(newMember.guild, {
+    type: 'Role Update',
+    title: 'Member Role Update',
+    targetId: newMember.id,
+    target: `<@${newMember.id}> (\`${newMember.id}\`)`,
+    moderator: moderator ? `${moderator.tag} (${moderator.id})` : null,
+    reason: changes.join('\n'),
     changes: changes.join('\n')
   });
 }
@@ -1356,6 +1417,7 @@ function buildHelpEmbed() {
     .addFields(
       { name: '🎫 Ticket', value: '`/ticketpanel` `/ticket` `/close`', inline: true },
       { name: '🛡️ Moderazione', value: '`/warn` `/timeout` `/unmute` `/modlogs` `/kick` `/ban` `/unban` `/clear`', inline: true },
+      { name: '🔇 Vocali', value: '`-mute <@utente o ID> [motivo]`\n`-unmute <@utente o ID>`', inline: true },
       { name: '🚩 Report', value: '`/report` `/reports list|close`', inline: true },
       { name: '🎭 Reaction role', value: '`/reactionrole add|remove|list|clear`', inline: true },
       { name: '🎮 Lobby', value: '`/lobby` e `-lobby`\n`crea` `lista` `info` `iscriviti` `rimuovi` `dropmap` `codice` `elimina`', inline: false },
@@ -1955,7 +2017,7 @@ setInterval(async () => {
 const BUILTIN_PREFIX_COMMANDS = new Set([
   'help', 'stats', 'ping', 'uptime', 'kick', 'ban', 'unban', 'clear', 'purge', 'invite',
   'giverole', 'removerole', 'deleterole', 'delrole', 'roles', 'lock', 'unlock', 'addcmd', 'delcmd', 'listcmd', 'cmds',
-  'remind', 'reminder', 'ticketpanel', 'ticket', 'close', 'userinfo', 'warn', 'timeout', 'unmute',
+  'remind', 'reminder', 'ticketpanel', 'ticket', 'close', 'userinfo', 'warn', 'mute', 'timeout', 'unmute',
   'modlogs', 'md', 'dashboard', 'bl', 'blacklist', 'note', 'notes', 'autorole', 'welcome', 'lobby'
 ]);
 
@@ -2235,6 +2297,38 @@ async function handlePrefixCommand(message) {
           )]
         });
       }
+      case 'mute': {
+        if (!hasStaffOrAdmin(member))
+          return message.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')] });
+        let target = message.mentions.users.first();
+        if (!target && args[0]) {
+          const id = extractUserId(args[0]);
+          if (id) { try { target = await client.users.fetch(id); } catch {} }
+        }
+        if (!target)
+          return message.reply({ embeds: [EmbedManager.error('Sintassi', 'Uso: `-mute <@utente o ID> [motivo]`')] });
+        if (target.id === message.author.id)
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi silenziare te stesso.')] });
+        const targetMember = await guild.members.fetch(target.id).catch(() => null);
+        if (!targetMember)
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Utente non nel server.')] });
+        if (!targetMember.voice.channel)
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'L’utente non è in un canale vocale.')] });
+        if (targetMember.voice.serverMute)
+          return message.reply({ embeds: [EmbedManager.info('Mute vocale', 'L’utente è già silenziato nel server.')] });
+        const bot = guild.members.me;
+        if (!bot.permissions.has(PermissionsBitField.Flags.MuteMembers))
+          return message.reply({ embeds: [EmbedManager.error('Permessi', 'Al bot manca il permesso "Silenzia membri".')] });
+        const reason = args.slice(1).join(' ') || 'Nessun motivo specificato';
+        try { await targetMember.voice.setMute(true, reason); }
+        catch (err) {
+          log.warn(`Mute vocale fallito per ${target.id}: ${err.message}`);
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso silenziare questo utente nel canale vocale.')] });
+        }
+        return channel.send({
+          embeds: [EmbedManager.success('Mute vocale', `**${target.username}** è stato silenziato nel canale vocale.`)]
+        });
+      }
       case 'timeout': {
         if (!hasStaffOrAdmin(member))
           return message.reply({ embeds: [EmbedManager.error('Accesso Negato', 'Serve il ruolo Staff o superiore.')] });
@@ -2294,8 +2388,22 @@ async function handlePrefixCommand(message) {
           return message.reply({ embeds: [EmbedManager.error('Sintassi', 'Uso: `-unmute <@utente o ID> [motivo]`')] });
         const m = await guild.members.fetch(target.id).catch(() => null);
         if (!m) return message.reply({ embeds: [EmbedManager.error('Errore', 'Utente non nel server.')] });
+        const reason = args.slice(1).join(' ') || 'Nessun motivo specificato';
+        if (m.voice.serverMute) {
+          const bot = guild.members.me;
+          if (!bot.permissions.has(PermissionsBitField.Flags.MuteMembers))
+            return message.reply({ embeds: [EmbedManager.error('Permessi', 'Al bot manca il permesso "Silenzia membri".')] });
+          try { await m.voice.setMute(false, reason); }
+          catch (err) {
+            log.warn(`Rimozione mute vocale fallita per ${target.id}: ${err.message}`);
+            return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso rimuovere il mute vocale a questo utente.')] });
+          }
+          return channel.send({
+            embeds: [EmbedManager.success('Mute vocale rimosso', `Mute vocale rimosso a **${target.username}**.`)]
+          });
+        }
         if (!m.communicationDisabledUntilTimestamp)
-          return message.reply({ embeds: [EmbedManager.error('Errore', 'Questo utente non è in timeout.')] });
+          return message.reply({ embeds: [EmbedManager.error('Errore', 'Questo utente non è silenziato vocalmente né in timeout.')] });
         const bot = guild.members.me;
         if (!bot.permissions.has(PermissionsBitField.Flags.ModerateMembers))
           return message.reply({ embeds: [EmbedManager.error('Permessi', 'Manca "Modera Membri".')] });
@@ -2303,7 +2411,6 @@ async function handlePrefixCommand(message) {
           return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso togliere il timeout a questo utente.')] });
         if (!outranks(member, m, guild))
           return message.reply({ embeds: [EmbedManager.error('Errore', 'Non puoi togliere il timeout a un utente con ruolo uguale o superiore al tuo.')] });
-        const reason = args.slice(1).join(' ') || 'Nessun motivo specificato';
         try { await m.timeout(null, reason); }
         catch { return message.reply({ embeds: [EmbedManager.error('Errore', 'Non posso togliere il timeout a questo utente.')] }); }
         await ModLogModule.logUserAction(guild, {
@@ -3088,6 +3195,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on(Events.MessageCreate, handlePrefixCommand);
 client.on(Events.GuildMemberAdd, handleGuildMemberAdd);
+client.on(Events.GuildMemberUpdate, handleGuildMemberUpdate);
 client.on(Events.VoiceStateUpdate, handleVoiceStateUpdate);
 
 process.on('unhandledRejection', (err) => log.err('unhandledRejection', err));
