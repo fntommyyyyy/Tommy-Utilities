@@ -21,7 +21,6 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
-const { formatDuration } = require('./lib/bot-utils');
 
 // IMPORT LOBBY
 const { mountLobbies, renderLobbiesContent } = require('./lobbies');
@@ -661,6 +660,9 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   // ==================== PUBBLICI ====================
   app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: Math.floor((Date.now() - botStartTime) / 1000), guilds: client.guilds.cache.size, ping: client.ws.ping, timestamp: new Date().toISOString() });
+  });
+  app.get('/', (req, res) => {
+    res.json({ message: 'Bot Dashboard', version: '5.4.4', loggedIn: !!req.session.user });
   });
 
   // ==================== OAUTH ====================
@@ -1736,14 +1738,10 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
       await logMod(guild, {
         type: data.action === 'add' ? 'Ruolo Aggiunto' : 'Ruolo Rimosso',
-        title: 'Member Role Update',
+        title: data.action === 'add' ? 'Ruolo assegnato' : 'Ruolo rimosso',
         targetId: member.id,
         target: `${member.user.username} (${member.id})`,
         moderator: dashMod(req),
-        moderatorId: req.session.user.id,
-        roleChanges: data.action === 'add'
-          ? { added: [{ id: role.id, name: role.name }], removed: [] }
-          : { added: [], removed: [{ id: role.id, name: role.name }] },
         reason: role.name
       });
       res.json({ ok: true });
@@ -1885,7 +1883,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
   };
 
   app.get('/dashboard', requireAuth, pageHandler('dashboard'));
-  const publicResourcesHandler = async (req, res) => {
+  app.get('/resources', async (req, res) => {
     let user = null;
     let security = { isPublicResources: true };
     if (req.session.user) {
@@ -1903,9 +1901,7 @@ function createWebServer({ storage, client, log, botStartTime, buildTranscriptHt
       }
     }
     res.send(renderLayout(user, 'resources', {}, security));
-  };
-  app.get('/', publicResourcesHandler);
-  app.get('/resources', (req, res) => res.redirect('/'));
+  });
   app.get('/modlogs', requireAuth, pageHandler('modlogs'));
   app.get('/notes', requireAuth, pageHandler('notes'));
   app.get('/tickets', requireAuth, pageHandler('tickets'));
@@ -1990,7 +1986,7 @@ function renderLayout(user, page, params = {}, security = {}) {
       { href: '/dashboard', page: 'dashboard', feature: 'dashboard', icon: '◈', label: 'Dashboard' },
       { href: '/charts', page: 'charts', feature: 'analytics', icon: '📈', label: 'Grafici' },
       { href: '/top', page: 'top', feature: 'analytics', icon: '🏆', label: 'Top' },
-      { href: '/', page: 'resources', feature: 'resources', icon: '🔗', label: 'Resources' }
+      { href: '/resources', page: 'resources', feature: 'resources', icon: '🔗', label: 'Resources' }
     ] },
     { label: 'Moderazione', items: [
       { href: '/search', page: 'search', feature: 'moderation', icon: '🔎', label: 'Ricerca' },
@@ -2475,6 +2471,13 @@ function makeEmbed(title, description, color) {
     .setDescription(String(description).slice(0, 4096))
     .setColor(color)
     .setTimestamp();
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}g`;
 }
 
 // ---------- DASHBOARD ----------
@@ -3267,7 +3270,7 @@ function renderModlogsContent() {
   return `
   <div class="section">
     <div class="tool-heading">
-      <div><h2>📋 Mod Logs</h2><p class="tool-subtitle">Azioni di moderazione e modifiche ai membri, con filtri rapidi e ricerca nei dettagli.</p></div>
+      <div><h2>📋 Mod Logs</h2><p class="tool-subtitle">Registro delle azioni di moderazione, con filtri rapidi e ricerca nei dettagli.</p></div>
       <div class="export-bar"><button class="secondary small" onclick="loadLogs(true)">↻ Aggiorna</button><a href="/api/export/logs.csv">📥 Esporta CSV</a></div>
     </div>
     <div class="tool-stats">
@@ -3281,13 +3284,6 @@ function renderModlogsContent() {
         <option value="Ban">Ban</option>
         <option value="Warn">Warn</option>
         <option value="Timeout">Timeout</option>
-        <option value="Ingresso">Ingresso</option>
-        <option value="Uscita">Uscita</option>
-        <option value="Unban">Unban</option>
-        <option value="Utente Modificato">Profilo utente</option>
-        <option value="Ruoli Modificati">Ruoli modificati</option>
-        <option value="Spostamento Vocale">Spostamento vocale</option>
-        <option value="Disconnessione Vocale">Disconnessione vocale</option>
         <option value="Clear">Clear</option>
         <option value="Purge">Purge</option>
         <option value="Lock">Lock</option>
