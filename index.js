@@ -355,17 +355,17 @@ const ModLogModule = {
         return;
       }
 
+      const eventDate = new Date();
+      const formattedDate = `${eventDate.toLocaleDateString('it-IT', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric'
+      })} ${eventDate.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })}`;
       const details = [
         logData.moderator && `▶ Responsible: ${logData.moderator}`,
         logData.target && `▶ Target: ${logData.target}`,
-        `▶ ${new Date().toLocaleString('it-IT', {
-          weekday: 'long',
-          day: 'numeric',
-          month: 'long',
-          year: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit'
-        })}`,
+        `▶ ${formattedDate}`,
         logData.changes && `Changes\n${logData.changes}`,
         logData.user && `▶ User: ${logData.user}`,
         logData.channel && `▶ Channel: ${logData.channel}`,
@@ -836,11 +836,11 @@ async function handleVoiceStateUpdate(oldState, newState) {
   const auditChanges = {};
 
   if (oldState.serverMute !== newState.serverMute) {
-    changes.push(`${newState.serverMute ? '✅ Server Mute' : '❌ Server Mute'}:\n> ${oldState.serverMute ? 'On' : 'Off'} → ${newState.serverMute ? 'On' : 'Off'}`);
+    changes.push(`▶ Mute\n  ${oldState.serverMute ? 'Yes' : 'No'} ▶ ${newState.serverMute ? 'Yes' : 'No'}`);
     auditChanges.mute = newState.serverMute;
   }
   if (oldState.serverDeaf !== newState.serverDeaf) {
-    changes.push(`${newState.serverDeaf ? '✅ Server Deaf' : '❌ Server Deaf'}:\n> ${oldState.serverDeaf ? 'On' : 'Off'} → ${newState.serverDeaf ? 'On' : 'Off'}`);
+    changes.push(`▶ Deaf\n  ${oldState.serverDeaf ? 'Yes' : 'No'} ▶ ${newState.serverDeaf ? 'Yes' : 'No'}`);
     auditChanges.deaf = newState.serverDeaf;
   }
   if (changes.length === 0) return;
@@ -858,7 +858,7 @@ async function handleVoiceStateUpdate(oldState, newState) {
 
   await ModLogModule.logUserAction(newState.guild || oldState.guild, {
     type: actionTypes.join(' / '),
-    title: 'Member Voice Update',
+    title: 'Member Update',
     targetId,
     target: member ? `<@${targetId}> (\`${targetId}\`)` : targetId,
     moderator: moderator ? `<@${moderator.id}> (\`${moderator.id}\`)` : null,
@@ -924,10 +924,10 @@ async function handleGuildMemberUpdate(oldMember, newMember) {
 
   const changes = [];
   if (addedRoles.size > 0) {
-    changes.push(`✅ Additions:\n${addedRoles.map(role => `> ${role}`).join('\n')}`);
+    changes.push(`✅ Additions:\n${addedRoles.map(role => `▶ ${role}`).join('\n')}`);
   }
   if (removedRoles.size > 0) {
-    changes.push(`❌ Removals:\n${removedRoles.map(role => `> ${role}`).join('\n')}`);
+    changes.push(`❌ Removals:\n${removedRoles.map(role => `▶ ${role}`).join('\n')}`);
   }
 
   const moderator = await findRoleUpdateModerator(
