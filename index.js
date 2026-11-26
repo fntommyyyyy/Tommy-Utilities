@@ -336,9 +336,23 @@ const ModLogModule = {
     try {
       if (!guild) return;
       const config = storage.getGuildConfig(guild.id);
-      const channelId = config.log_channel_id || MOD_LOG_CHANNEL_ID;
-      const ch = guild.channels.cache.get(channelId);
-      if (!ch) return;
+      const channelId = config?.log_channel_id || MOD_LOG_CHANNEL_ID;
+      if (!channelId) {
+        log.warn(`Canale Mod Logs non configurato per il server ${guild.id}`);
+        return;
+      }
+
+      let ch = guild.channels.cache.get(channelId);
+      if (!ch) {
+        ch = await guild.channels.fetch(channelId).catch(err => {
+          log.warn(`Canale Mod Logs ${channelId} non trovato nel server ${guild.id}: ${err.message}`);
+          return null;
+        });
+      }
+      if (!ch?.isTextBased()) {
+        log.warn(`Canale Mod Logs ${channelId} non disponibile o non testuale nel server ${guild.id}`);
+        return;
+      }
 
       const details = [
         logData.moderator && `▶ Responsible: ${logData.moderator}`,
@@ -347,6 +361,7 @@ const ModLogModule = {
         logData.channel && `▶ Channel: ${logData.channel}`,
         logData.duration && `▶ Duration: ${logData.duration}`,
         logData.reason && `▶ Reason: ${logData.reason}`,
+        logData.changes && `Changes\n${logData.changes}`,
         `▶ ${new Date().toLocaleString('it-IT', {
           weekday: 'long',
           day: 'numeric',
@@ -813,6 +828,36 @@ async function handleGuildMemberAdd(member) {
   } catch (err) {
     log.err('handleGuildMemberAdd welcome', err);
   }
+}
+
+async function handleVoiceStateUpdate(oldState, newState) {
+  const changes = [];
+
+  if (oldState.serverMute !== newState.serverMute) {
+    changes.push(`✅ Server mute: ${oldState.serverMute ? 'On' : 'Off'} → ${newState.serverMute ? 'On' : 'Off'}`);
+  }
+  if (oldState.serverDeaf !== newState.serverDeaf) {
+    changes.push(`✅ Server deaf: ${oldState.serverDeaf ? 'On' : 'Off'} → ${newState.serverDeaf ? 'On' : 'Off'}`);
+  }
+  if (changes.length === 0) return;
+
+  const member = newState.member || oldState.member;
+  const targetId = newState.id || oldState.id;
+  const actionTypes = [];
+  if (oldState.serverMute !== newState.serverMute) {
+    actionTypes.push(newState.serverMute ? 'Voice Mute' : 'Voice Unmute');
+  }
+  if (oldState.serverDeaf !== newState.serverDeaf) {
+    actionTypes.push(newState.serverDeaf ? 'Voice Deafen' : 'Voice Undeafen');
+  }
+
+  await ModLogModule.logUserAction(newState.guild || oldState.guild, {
+    type: actionTypes.join(' / '),
+    title: 'Member Voice Update',
+    targetId,
+    target: member ? `${member.user.tag} (${targetId})` : targetId,
+    changes: changes.join('\n')
+  });
 }
 
 async function addBlacklist(source, targetUser, reason, moderator, isSlash) {
@@ -1939,12 +1984,10 @@ async function handlePrefixCommand(message) {
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
       await message.delete().catch(err => log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`));
     }
-    const response = embedTextPayload({
+    return channel.send({
       content: custom,
       allowedMentions: { parse: ['users', 'everyone'], repliedUser: false }
-    }, `Comando: ${commandName}`);
-    response.embeds = [EmbedManager.info(`Comando: ${commandName}`, custom)];
-    return channel.send(response).catch(err => log.err('custom command send', err));
+    }).catch(err => log.err('custom command send', err));
   }
 
   const cd = checkCooldown(member.id, commandName);
@@ -3045,6 +3088,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on(Events.MessageCreate, handlePrefixCommand);
 client.on(Events.GuildMemberAdd, handleGuildMemberAdd);
+client.on(Events.VoiceStateUpdate, handleVoiceStateUpdate);
 
 process.on('unhandledRejection', (err) => log.err('unhandledRejection', err));
 process.on('uncaughtException', (err) => log.err('uncaughtException', err));
