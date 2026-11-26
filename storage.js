@@ -1,10 +1,9 @@
 const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
-const { createRotatingBackup } = require('./lib/sqlite-backup');
 
 class StorageService {
-  constructor(dbPath, logger = null, backupOptions = {}) {
+  constructor(dbPath) {
     let finalPath;
     if (dbPath) {
       finalPath = path.isAbsolute(dbPath)
@@ -18,42 +17,18 @@ class StorageService {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
     this.dbPath = finalPath;
-    this.logger = logger || {
-      info: (...args) => console.log(...args),
-      warn: (...args) => console.warn(...args),
-      err: (...args) => console.error(...args)
-    };
-    this.backupDirectory = backupOptions.directory
-      ? path.isAbsolute(backupOptions.directory)
-        ? backupOptions.directory
-        : path.resolve(__dirname, backupOptions.directory)
-      : path.join(dir, 'backups');
-    this.backupRetention = backupOptions.retention || 7;
-    this.backupInProgress = null;
     this.db = new Database(finalPath);
-    try {
-      this.db.pragma('journal_mode = WAL');
-      this.db.pragma('synchronous = NORMAL');
-      this.db.pragma('foreign_keys = ON');
-      this.db.pragma('busy_timeout = 5000');
-      this._migrate();
-      this._prepare();
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 5000');
+    this._migrate();
+    this._prepare();
 
-      try { this._trimLogs.run(); }
-      catch (err) { this.logger.warn?.(`Pulizia mod_logs non riuscita: ${err.message}`); }
-    } catch (err) {
-      try { if (this.db.open) this.db.close(); }
-      catch (closeError) { this.logger.warn?.(`Chiusura database dopo errore di inizializzazione fallita: ${closeError.message}`); }
-      throw err;
-    }
+    try { this._trimLogs.run(); } catch {}
   }
 
   _migrate() {
-    const migrate = this.db.transaction(() => this._applyMigrations());
-    migrate();
-  }
-
-  _applyMigrations() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS custom_commands (
         name TEXT PRIMARY KEY,
@@ -271,51 +246,37 @@ class StorageService {
       );
     `);
 
+    this.db.exec('DROP TABLE IF EXISTS antinuke_config; DROP TABLE IF EXISTS quarantine_roles;');
+
     // MIGRAZIONE AUTOMATICA per lobby_meta (aggiunge colonne mancanti se la tabella esiste già)
-    const tableInfo = this.db.prepare("PRAGMA table_info(lobby_meta)").all();
-    const existingCols = tableInfo.map(c => c.name);
-    const newCols = [
-      'reg_channel_id TEXT',
-      'dropmap_channel_id TEXT',
-      'code_channel_id TEXT',
-      'chat_channel_id TEXT',
-      'staff_channel_id TEXT',
-      'unreg_channel_id TEXT',
-      'fills_channel_id TEXT'
-    ];
-    for (const colDef of newCols) {
-      const colName = colDef.split(' ')[0];
-      if (!existingCols.includes(colName)) {
-        this.db.exec(`ALTER TABLE lobby_meta ADD COLUMN ${colDef}`);
-        this.logger.info?.(`Aggiunta colonna ${colName} a lobby_meta`);
+    try {
+      const tableInfo = this.db.prepare("PRAGMA table_info(lobby_meta)").all();
+      const existingCols = tableInfo.map(c => c.name);
+      const newCols = [
+        'reg_channel_id TEXT',
+        'dropmap_channel_id TEXT',
+        'code_channel_id TEXT',
+        'chat_channel_id TEXT',
+        'staff_channel_id TEXT',
+        'unreg_channel_id TEXT',
+        'fills_channel_id TEXT'
+      ];
+      for (const colDef of newCols) {
+        const colName = colDef.split(' ')[0];
+        if (!existingCols.includes(colName)) {
+          this.db.exec(`ALTER TABLE lobby_meta ADD COLUMN ${colDef}`);
+          console.log(`✅ Aggiunta colonna ${colName} a lobby_meta`);
+        }
       }
+    } catch (err) {
+      console.error('❌ Migrazione lobby_meta fallita:', err);
     }
 
     this._ensureColumn('mod_logs', 'guild_id', 'TEXT');
     this._ensureColumn('ticket_transcripts', 'guild_id', 'TEXT');
     this._ensureColumn('public_resource_guild_overrides', 'invite_url', 'TEXT');
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_mod_logs_guild ON mod_logs(guild_id)');
-    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tr_guild ON ticket_transcripts(guild_id)');
-  }
-
-  async backup() {
-    if (this.backupInProgress) return this.backupInProgress;
-
-    this.backupInProgress = this._createBackup();
-    try {
-      return await this.backupInProgress;
-    } finally {
-      this.backupInProgress = null;
-    }
-  }
-
-  async _createBackup() {
-    return createRotatingBackup({
-      backup: filePath => this.db.backup(filePath),
-      directory: this.backupDirectory,
-      retention: this.backupRetention,
-      logger: this.logger
-    });
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_mod_logs_guild ON mod_logs(guild_id)'); } catch {}
+    try { this.db.exec('CREATE INDEX IF NOT EXISTS idx_tr_guild ON ticket_transcripts(guild_id)'); } catch {}
   }
 
   _ensureColumn(table, column, type) {
@@ -785,13 +746,9 @@ class StorageService {
   }
 
   // ==================== CLOSE ====================
-  async close() {
-    if (this.backupInProgress) {
-      try { await this.backupInProgress; }
-      catch (err) { this.logger.err?.('Backup SQLite in corso fallito durante la chiusura', err); }
-    }
+  close() {
     try { if (this.db && this.db.open) this.db.close(); }
-    catch (err) { this.logger.err?.('Chiusura database fallita', err); }
+    catch (err) { console.error('❌ close error:', err); }
   }
 }
 
