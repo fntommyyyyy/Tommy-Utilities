@@ -21,6 +21,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { doubleCsrf } = require('csrf-csrf');
 const { z } = require('zod');
+const { formatDuration } = require('./lib/bot-utils');
 
 // IMPORT LOBBY
 const { mountLobbies, renderLobbiesContent } = require('./lobbies');
@@ -2474,13 +2475,6 @@ function makeEmbed(title, description, color) {
     .setDescription(String(description).slice(0, 4096))
     .setColor(color)
     .setTimestamp();
-}
-
-function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}g`;
 }
 
 // ---------- DASHBOARD ----------
