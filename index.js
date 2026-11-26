@@ -340,22 +340,27 @@ const ModLogModule = {
       const ch = guild.channels.cache.get(channelId);
       if (!ch) return;
 
-      const fields = [
-        { name: 'Type', value: logData.type || 'N/A', inline: true },
-        logData.target && { name: 'Target', value: logData.target, inline: true },
-        logData.moderator && { name: 'Moderator', value: logData.moderator, inline: true },
-        logData.user && { name: 'User', value: logData.user, inline: true },
-        logData.channel && { name: 'Channel', value: logData.channel, inline: true },
-        logData.duration && { name: 'Duration', value: logData.duration, inline: true },
-        logData.reason && { name: 'Reason', value: logData.reason, inline: false },
-        { name: 'Date', value: new Date().toLocaleString('it-IT'), inline: false }
+      const details = [
+        logData.moderator && `▶ Responsible: ${logData.moderator}`,
+        logData.target && `▶ Target: ${logData.target}`,
+        logData.user && `▶ User: ${logData.user}`,
+        logData.channel && `▶ Channel: ${logData.channel}`,
+        logData.duration && `▶ Duration: ${logData.duration}`,
+        logData.reason && `▶ Reason: ${logData.reason}`,
+        `▶ ${new Date().toLocaleString('it-IT', {
+          weekday: 'long',
+          day: 'numeric',
+          month: 'long',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit'
+        })}`
       ].filter(Boolean);
 
       const embed = EmbedManager.createEmbed({
-        title: logData.title || 'Azione Mod',
-        color: 0x5865F2,
-        fields,
-        timestamp: true
+        title: logData.title || logData.type || 'Azione Mod',
+        description: details.join('\n'),
+        color: 0xF4900C
       });
 
       await ch.send({ embeds: [embed] }).catch(err => log.warn(`Log send fallito: ${err.message}`));
