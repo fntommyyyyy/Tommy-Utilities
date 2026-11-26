@@ -4,7 +4,6 @@ const {
   GatewayIntentBits,
   Partials,
   Events,
-  AuditLogEvent,
   PermissionsBitField,
   ChannelType,
   ActionRowBuilder,
@@ -20,29 +19,74 @@ const StorageService = require('./storage');
 const { mountLobbies, renderLobbiesContent, handleLobbyCommand, handleLobbyPrefix, lobbyCommandBuilder, handleLobbyButton } = require('./lobbies');
 const { createAdvancedLobby, handleAdvancedLobbyButton } = require('./lobbies-advanced');
 const { createWebServer } = require('./web');
-const { loadBotConfig } = require('./config');
-const { formatDuration, parseDuration, hoursAndMinutesToMs, getAuditRoleChanges } = require('./lib/bot-utils');
-const { createLogger } = require('./lib/logger');
 
 // ==================== VALIDAZIONE ENV ====================
-const {
-  token: TOKEN,
-  clientId: CLIENT_ID,
-  modLogChannelId: MOD_LOG_CHANNEL_ID,
-  blacklistAdminServers: BLACKLIST_ADMIN_SERVERS,
-  guildId: GUILD_ID,
-  dbPath: DB_PATH,
-  dbBackupDir: DB_BACKUP_DIR,
-  dbBackupRetention: DB_BACKUP_RETENTION
-} = loadBotConfig(process.env);
+const TOKEN = (process.env.DISCORD_TOKEN || process.env.TOKEN || '').trim();
+const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
+const MOD_LOG_CHANNEL_ID = (process.env.MOD_LOG_CHANNEL_ID || '').trim();
+const BLACKLIST_ADMIN_SERVERS = (process.env.BLACKLIST_ADMIN_SERVERS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const GUILD_ID = (process.env.GUILD_ID || '').trim();
+
+if (!TOKEN) throw new Error('TOKEN mancante nel file .env');
+if (!CLIENT_ID) throw new Error('CLIENT_ID mancante nel file .env');
+if (!MOD_LOG_CHANNEL_ID) throw new Error('MOD_LOG_CHANNEL_ID mancante nel file .env');
 
 // ==================== LOGGER ====================
-const log = createLogger();
+const log = {
+  info: (msg) => console.log(`\x1b[36m[INFO]\x1b[0m ${msg}`),
+  ok: (msg) => console.log(`\x1b[32m[OK]\x1b[0m ${msg}`),
+  warn: (msg) => console.log(`\x1b[33m[WARN]\x1b[0m ${msg}`),
+  err: (msg, err) => console.error(`\x1b[31m[ERR]\x1b[0m ${msg}`, err ?? '')
+};
 
 // ==================== UTILITY ====================
 function formatDate(iso) {
   if (!iso) return 'N/A';
   return new Date(iso).toLocaleString('it-IT');
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}g`;
+}
+
+function parseDuration(input) {
+  if (!input) return null;
+  const str = String(input).trim().toLowerCase();
+  const clock = str.match(/^(\d{1,3}):(\d{1,2})$/);
+  if (clock) {
+    const hours = parseInt(clock[1], 10);
+    const minutes = parseInt(clock[2], 10);
+    if (minutes > 59 || (hours === 0 && minutes === 0)) return null;
+    return (hours * 3600 + minutes * 60) * 1000;
+  }
+  const matches = [...str.matchAll(/(\d+)\s*(s|m|h|d)/gi)];
+  if (!matches.length) return null;
+  const consumed = matches.map(m => m[0]).join('').replace(/\s+/g, '');
+  if (consumed !== str.replace(/\s+/g, '')) return null;
+  let ms = 0;
+  const seen = new Set();
+  const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+  for (const m of matches) {
+    const unit = m[2].toLowerCase();
+    if (seen.has(unit)) return null;
+    seen.add(unit);
+    const n = parseInt(m[1], 10);
+    if (!n || n <= 0) return null;
+    ms += n * multipliers[unit];
+  }
+  return ms || null;
+}
+
+function hoursAndMinutesToMs(hours, minutes) {
+  const h = Number(hours) || 0;
+  const m = Number(minutes) || 0;
+  if (!Number.isInteger(h) || !Number.isInteger(m)) return null;
+  if (h < 0 || m < 0 || m > 59 || (h === 0 && m === 0)) return null;
+  return (h * 3600 + m * 60) * 1000;
 }
 
 function getRoles(member, guild) {
@@ -222,10 +266,7 @@ class EmbedManager {
 }
 
 let clientRef = null;
-const storage = new StorageService(DB_PATH, log, {
-  directory: DB_BACKUP_DIR,
-  retention: DB_BACKUP_RETENTION
-});
+const storage = new StorageService(process.env.DB_PATH || './data/bot.db');
 const botStartTime = Date.now();
 
 // ==================== GENERA TRANSCRIPT ====================
@@ -299,19 +340,7 @@ const ModLogModule = {
       const ch = guild.channels.cache.get(channelId);
       if (!ch) return;
 
-      const roleChanges = logData.roleChanges;
-      const roleChangeSections = roleChanges && [
-        roleChanges.added.length && `✅ **Additions:**\n　▶ ${roleChanges.added.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n　▶ ')}`,
-        roleChanges.removed.length && `❌ **Removals:**\n　▶ ${roleChanges.removed.map(role => role.id ? `<@&${role.id}>` : role.name).join('\n　▶ ')}`
-      ].filter(Boolean).join('\n\n');
-      const roleUpdateDescription = roleChanges && [
-        `▶ **Responsible:** ${logData.moderatorId ? `<@${logData.moderatorId}> \`${logData.moderatorId}\`` : logData.moderator || 'Unknown'}`,
-        `▶ **Target:** <@${logData.targetId}> \`${logData.targetId}\``,
-        `▶ <t:${Math.floor((logData.eventTimestamp || Date.now()) / 1000)}:F>`,
-        '**Changes**',
-        roleChangeSections || 'Nessun ruolo modificato.'
-      ].join('\n');
-      const fields = roleChanges ? [] : [
+      const fields = [
         { name: 'Type', value: logData.type || 'N/A', inline: true },
         logData.target && { name: 'Target', value: logData.target, inline: true },
         logData.moderator && { name: 'Moderator', value: logData.moderator, inline: true },
@@ -324,10 +353,9 @@ const ModLogModule = {
 
       const embed = EmbedManager.createEmbed({
         title: logData.title || 'Azione Mod',
-        description: roleUpdateDescription,
-        color: roleChanges ? 0xF47B20 : 0x5865F2,
+        color: 0x5865F2,
         fields,
-        timestamp: !roleChanges
+        timestamp: true
       });
 
       await ch.send({ embeds: [embed] }).catch(err => log.warn(`Log send fallito: ${err.message}`));
@@ -737,153 +765,7 @@ async function sendWelcome(member) {
   }
 }
 
-const recentMemberAuditActions = new Map();
-const processedMemberAuditEntries = new Map();
-const auditLogWarnings = new Set();
-const MEMBER_AUDIT_ACTIONS = new Map([
-  [AuditLogEvent.MemberKick, { type: 'Kick', title: 'Utente espulso' }],
-  [AuditLogEvent.MemberBanAdd, { type: 'Ban', title: 'Utente bannato' }],
-  [AuditLogEvent.MemberBanRemove, { type: 'Unban', title: 'Utente sbannato' }],
-  [AuditLogEvent.MemberUpdate, { type: 'Utente Modificato', title: 'Profilo utente modificato' }],
-  [AuditLogEvent.MemberRoleUpdate, { type: 'Ruoli Modificati', title: 'Ruoli utente modificati' }],
-  [AuditLogEvent.MemberMove, { type: 'Spostamento Vocale', title: 'Utente spostato in vocale' }],
-  [AuditLogEvent.MemberDisconnect, { type: 'Disconnessione Vocale', title: 'Utente disconnesso dal vocale' }]
-]);
-
-function rememberMemberAuditAction(guildId, targetId, action) {
-  const now = Date.now();
-  for (const [key, record] of recentMemberAuditActions) {
-    if (now - record.timestamp > 15000) recentMemberAuditActions.delete(key);
-  }
-  recentMemberAuditActions.set(`${guildId}:${targetId}`, { action, timestamp: now });
-}
-
-function describeAuditChanges(entry) {
-  const labels = {
-    nick: 'Nickname',
-    roles: 'Ruoli',
-    communication_disabled_until: 'Timeout',
-    deaf: 'Audio disattivato',
-    mute: 'Microfono disattivato',
-    channel_id: 'Canale vocale'
-  };
-  const formatValue = value => {
-    if (value == null) return 'nessuno';
-    if (Array.isArray(value)) {
-      return value.map(item => item?.name || item?.id || String(item)).join(', ') || 'nessuno';
-    }
-    if (typeof value === 'object') return value.name || value.id || 'modificato';
-    return String(value);
-  };
-  return (entry.changes || []).map(change => {
-    const key = change.key || 'Dettaglio';
-    const oldValue = change.old ?? change.old_value;
-    const newValue = change.new ?? change.new_value;
-    if (oldValue === undefined && newValue === undefined) return null;
-    return `${labels[key] || key}: ${formatValue(oldValue)} → ${formatValue(newValue)}`;
-  }).filter(Boolean).join('; ').slice(0, 1000);
-}
-
-async function findRecentMemberAuditEntry(guild, targetId) {
-  try {
-    const entries = [];
-    for (const action of [AuditLogEvent.MemberKick, AuditLogEvent.MemberBanAdd]) {
-      const logs = await guild.fetchAuditLogs({ type: action, limit: 5 });
-      entries.push(...logs.entries.values());
-    }
-    return entries
-      .filter(entry => entry.targetId === targetId && Date.now() - entry.createdTimestamp < 15000)
-      .sort((a, b) => b.createdTimestamp - a.createdTimestamp)[0] || null;
-  } catch (err) {
-    if (!auditLogWarnings.has(guild.id)) {
-      auditLogWarnings.add(guild.id);
-      log.warn(`Lettura audit log non riuscita per ${guild.id}: ${err.message}`);
-    }
-    return null;
-  }
-}
-
-async function handleGuildAuditLogEntryCreate(entry, guild) {
-  const action = MEMBER_AUDIT_ACTIONS.get(entry.action);
-  const targetId = entry.targetId || entry.target?.id;
-  if (!action || !targetId) return;
-
-  const now = Date.now();
-  for (const [id, timestamp] of processedMemberAuditEntries) {
-    if (now - timestamp > 60000) processedMemberAuditEntries.delete(id);
-  }
-  if (processedMemberAuditEntries.has(entry.id)) return;
-  processedMemberAuditEntries.set(entry.id, now);
-
-  if (entry.action === AuditLogEvent.MemberKick || entry.action === AuditLogEvent.MemberBanAdd) {
-    rememberMemberAuditAction(guild.id, targetId, entry.action);
-  }
-  if (entry.executor?.id === client.user?.id) return;
-
-  const targetName = entry.target?.user?.username || entry.target?.username || entry.target?.tag || targetId;
-  const moderatorId = entry.executorId || entry.executor?.id || null;
-  const moderator = moderatorId
-    ? `${entry.executor?.tag || entry.executor?.username || `<@${moderatorId}>`} (${moderatorId})`
-    : 'Sistema Discord';
-  const details = describeAuditChanges(entry);
-  const isRoleUpdate = entry.action === AuditLogEvent.MemberRoleUpdate;
-  await ModLogModule.logUserAction(guild, {
-    type: action.type,
-    title: isRoleUpdate ? 'Member Role Update' : action.title,
-    targetId,
-    target: `${targetName} (${targetId})`,
-    moderator,
-    moderatorId,
-    eventTimestamp: entry.createdTimestamp,
-    roleChanges: isRoleUpdate ? getAuditRoleChanges(entry) : undefined,
-    reason: entry.reason || details || 'Azione registrata nei log di Discord'
-  });
-}
-
-async function handleGuildMemberRemove(member) {
-  await new Promise(resolve => setTimeout(resolve, 1200));
-  const key = `${member.guild.id}:${member.id}`;
-  const recentAction = recentMemberAuditActions.get(key);
-  if (recentAction && Date.now() - recentAction.timestamp < 15000) {
-    recentMemberAuditActions.delete(key);
-    return;
-  }
-
-  const auditEntry = await findRecentMemberAuditEntry(member.guild, member.id);
-  if (auditEntry) {
-    await handleGuildAuditLogEntryCreate(auditEntry, member.guild);
-    return;
-  }
-
-  const cutoff = new Date(Date.now() - 15000).toISOString();
-  const alreadyLogged = storage.db.prepare(`
-    SELECT 1 FROM mod_logs
-    WHERE guild_id = ? AND target_id = ? AND timestamp >= ?
-      AND type IN ('Kick', 'Kick (dashboard)', 'Ban', 'Ban (dashboard)', 'Blacklist Kick')
-    LIMIT 1
-  `).get(member.guild.id, member.id, cutoff);
-  if (alreadyLogged) return;
-
-  await ModLogModule.logUserAction(member.guild, {
-    type: 'Uscita',
-    title: 'Utente uscito dal server',
-    targetId: member.id,
-    target: `${member.user.username} (${member.id})`,
-    moderator: 'Uscita volontaria',
-    reason: 'Il membro ha lasciato il server'
-  });
-}
-
 async function handleGuildMemberAdd(member) {
-  await ModLogModule.logUserAction(member.guild, {
-    type: 'Ingresso',
-    title: 'Utente entrato nel server',
-    targetId: member.user.id,
-    target: `${member.user.username} (${member.user.id})`,
-    moderator: 'Ingresso autonomo',
-    reason: 'Nuovo membro nel server'
-  });
-
   if (storage.isBlacklisted(member.user.id)) {
     const entry = storage.getBlacklistEntry(member.user.id);
     try {
@@ -914,16 +796,6 @@ async function handleGuildMemberAdd(member) {
         if (botMember.permissions.has(PermissionsBitField.Flags.ManageRoles) &&
             role.position < botMember.roles.highest.position) {
           await member.roles.add(role, 'Auto-role all\'ingresso');
-          await ModLogModule.logUserAction(member.guild, {
-            type: 'Ruolo Aggiunto',
-            title: 'Member Role Update',
-            targetId: member.user.id,
-            target: `${member.user.username} (${member.user.id})`,
-            moderator: 'Sistema Automatico',
-            moderatorId: client.user.id,
-            roleChanges: { added: [{ id: role.id, name: role.name }], removed: [] },
-            reason: role.name
-          });
         }
       }
     }
@@ -1716,16 +1588,6 @@ const CommandLogic = {
       return { success: false, message: `❌ L'utente ha già il ruolo ${role.name}!` };
 
     await member.roles.add(role);
-    await ModLogModule.logUserAction(guild, {
-      type: 'Ruolo Aggiunto',
-      title: 'Member Role Update',
-      targetId: member.id,
-      target: `${member.user.tag} (${member.id})`,
-      moderator: `${actorName(executor)} (${executor.id})`,
-      moderatorId: executor.id,
-      roleChanges: { added: [{ id: role.id, name: role.name }], removed: [] },
-      reason: role.name
-    });
     return { success: true, message: `✅ Ruolo **${role.name}** assegnato a ${member.user.tag}!` };
   },
 
@@ -1754,16 +1616,6 @@ const CommandLogic = {
       return { success: false, message: `❌ L'utente non ha il ruolo ${role.name}!` };
 
     await member.roles.remove(role);
-    await ModLogModule.logUserAction(guild, {
-      type: 'Ruolo Rimosso',
-      title: 'Member Role Update',
-      targetId: member.id,
-      target: `${member.user.tag} (${member.id})`,
-      moderator: `${actorName(executor)} (${executor.id})`,
-      moderatorId: executor.id,
-      roleChanges: { added: [], removed: [{ id: role.id, name: role.name }] },
-      reason: role.name
-    });
     return { success: true, message: `✅ Ruolo **${role.name}** rimosso da ${member.user.tag}!` };
   },
 
@@ -2082,10 +1934,12 @@ async function handlePrefixCommand(message) {
     if (channel.permissionsFor(guild.members.me)?.has(PermissionsBitField.Flags.ManageMessages)) {
       await message.delete().catch(err => log.warn(`Impossibile cancellare messaggio custom command: ${err.message}`));
     }
-    return channel.send({
+    const response = embedTextPayload({
       content: custom,
       allowedMentions: { parse: ['users', 'everyone'], repliedUser: false }
-    }).catch(err => log.err('custom command send', err));
+    }, `Comando: ${commandName}`);
+    response.embeds = [EmbedManager.info(`Comando: ${commandName}`, custom)];
+    return channel.send(response).catch(err => log.err('custom command send', err));
   }
 
   const cd = checkCooldown(member.id, commandName);
@@ -3186,12 +3040,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on(Events.MessageCreate, handlePrefixCommand);
 client.on(Events.GuildMemberAdd, handleGuildMemberAdd);
-client.on(Events.GuildMemberRemove, member => {
-  handleGuildMemberRemove(member).catch(err => log.err('guildMemberRemove mod log', err));
-});
-client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
-  handleGuildAuditLogEntryCreate(entry, guild).catch(err => log.err('guildAuditLogEntryCreate mod log', err));
-});
 
 process.on('unhandledRejection', (err) => log.err('unhandledRejection', err));
 process.on('uncaughtException', (err) => log.err('uncaughtException', err));
@@ -3247,12 +3095,6 @@ let webServer = null;
 
 (async () => {
   try {
-    try {
-      await storage.backup();
-    } catch (backupError) {
-      log.err('Backup SQLite iniziale fallito; il bot continua senza interrompere il servizio', backupError);
-    }
-
     await client.login(TOKEN);
     log.ok('✅ Bot online');
 
@@ -3272,21 +3114,14 @@ let webServer = null;
   }
 })();
 
-const databaseBackupTimer = setInterval(() => {
-  storage.backup().catch(err => log.err('Backup SQLite pianificato fallito', err));
-}, 60 * 60 * 1000);
-databaseBackupTimer.unref?.();
-
 // ==================== SHUTDOWN (SIGINT + SIGTERM) ====================
 let shuttingDown = false;
-async function shutdown(signal) {
+function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  clearInterval(databaseBackupTimer);
   log.warn(`Shutdown (${signal})...`);
   try { if (webServer) webServer.close(); } catch {}
-  try { if (typeof storage.close === 'function') await storage.close(); }
-  catch (err) { log.err('Chiusura database fallita', err); }
+  try { if (typeof storage.close === 'function') storage.close(); } catch {}
   try { client.destroy(); } catch {}
   setTimeout(() => process.exit(0), 500);
 }
